@@ -392,6 +392,41 @@ func TestLogTaskConsumptionWithoutSnapshotKeepsRatioMode(t *testing.T) {
 	}, other["content_parts"])
 }
 
+func TestDurableTaskConsumptionRetainsBillingAudit(t *testing.T) {
+	truncate(t)
+	const userID, channelID = 44, 44
+	seedUser(t, userID, 10_000)
+	seedChannel(t, channelID)
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "frozen-model",
+		PriceData:       types.PriceData{ModelPrice: 0.02, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}},
+		QuotaClamp:      &common.QuotaClamp{Op: "QuotaRound", Kind: common.QuotaClampOverflow, Original: math.Inf(1), Clamped: common.MaxQuota},
+	}
+	encoded, err := common.Marshal(TaskBillingContextFromRelayInfo(info))
+	require.NoError(t, err, "nonfinite audit inputs must survive durable JSON storage")
+	task := makeTask(userID, channelID, 100, 0, BillingSourceWallet, 0)
+	task.PrivateData.DurableBilling = true
+	task.PrivateData.BillingContext = &model.TaskBillingContext{}
+	require.NoError(t, common.Unmarshal(encoded, task.PrivateData.BillingContext))
+	LogDurableTaskConsumption(t.Context(), task)
+	var log model.Log
+	require.NoError(t, model.LOG_DB.Where("user_id = ? AND type = ?", userID, model.LogTypeConsume).Order("id DESC").First(&log).Error)
+	assert.Equal(t, "frozen-model", log.ModelName)
+	assert.Equal(t, 100, log.Quota)
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+	assert.NotContains(t, other, "quota_saturation")
+	admin, ok := other["admin_info"].(map[string]any)
+	require.True(t, ok)
+	saturation, ok := admin["quota_saturation"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "+Inf", saturation["original"])
+	assert.Equal(t, "overflow", saturation["kind"])
+	var user model.User
+	require.NoError(t, model.DB.First(&user, userID).Error)
+	assert.Zero(t, user.UsedQuota, "logging must not account for durable settlement a second time")
+}
+
 // Task logs distinguish jobs the client polls from requests whose HTTP call
 // returned the deliverable itself, and flag results the gateway did not keep.
 func TestLogTaskConsumptionMarksInlineResultsAndDiscardedArtifacts(t *testing.T) {

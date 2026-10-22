@@ -1,22 +1,48 @@
 package router
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"image"
+	"image/png"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/controller"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+type unreadAssetUploadBody struct {
+	reads int
+}
+
+func (b *unreadAssetUploadBody) Read([]byte) (int, error) {
+	b.reads++
+	return 0, io.EOF
+}
+
+func (*unreadAssetUploadBody) Close() error { return nil }
 
 // accessTokenExemptRoutes are /api routes that never reach dashboard
 // authentication, so a personal access token has no rule to satisfy there.
@@ -70,13 +96,18 @@ var accessTokenExemptRoutes = []string{
 	// API key authentication (TokenAuthReadOnly).
 	"GET /api/usage/token/",
 	"GET /api/log/token",
+	"POST /api/v3/contents/generations/tasks",
+	"GET /api/v3/contents/generations/tasks/:task_id",
 }
 
 // accessTokenHelperRoutes are declared through handlePermissionRoute outside
 // channelPermissionRoutes.
 var accessTokenHelperRoutes = map[string]authz.Permission{
-	"GET /api/task_plugin_options": authz.TaskPluginBind,
-	"GET /api/audit":               authz.AuditRead,
+	"POST /api/asset-reconciliation/assets/:id/providers/:space_id": authz.ChannelSensitiveWrite,
+	"POST /api/asset-reconciliation/tasks/:task_id":                 authz.ChannelSensitiveWrite,
+	"GET /api/channel/:id/assets":                                   authz.ChannelRead,
+	"POST /api/channel/:id/assets/cleanup":                          authz.ChannelSensitiveWrite,
+	"POST /api/asset-reconciliation/channels/:id":                   authz.ChannelSensitiveWrite,
 }
 
 func newAccessTokenScopeTestEngine(t *testing.T) *gin.Engine {
@@ -86,6 +117,8 @@ func newAccessTokenScopeTestEngine(t *testing.T) *gin.Engine {
 	// A permission route that is also in the static table panics here.
 	require.NotPanics(t, func() {
 		SetApiRouter(engine)
+		SetAssetRouter(engine)
+		SetArkVideoRouter(engine)
 		SetDashboardRouter(engine)
 		SetRelayRouter(engine)
 		SetTaskPluginProtocolRouter(engine)
@@ -141,6 +174,174 @@ func TestAccessTokenRouteRulesCoverEveryDashboardRoute(t *testing.T) {
 		assert.Equal(t, "scope", rule.Kind(), key)
 		assert.Equal(t, service.AccessTokenScopeOf(permission), rule.Scope(), key)
 	}
+}
+
+func TestLocalAssetContentRouteUsesSignedAccess(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	require.NoError(t, i18n.Init())
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Asset{}, &model.Task{}, &model.TaskAssetUse{}))
+	previousDB, previousEnabled, previousMaster := model.DB, common.AssetLibraryEnabled, common.IsMasterNode
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	previousPublicAddress := system_setting.TaskPublicAddress
+	model.DB, common.AssetLibraryEnabled, common.IsMasterNode = db, true, true
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, previousLog)
+	system_setting.TaskPublicAddress = "https://assets.example.com"
+	t.Cleanup(func() {
+		model.DB, common.AssetLibraryEnabled, common.IsMasterNode = previousDB, previousEnabled, previousMaster
+		common.SetDatabaseTypes(previousMain, previousLog)
+		system_setting.TaskPublicAddress = previousPublicAddress
+		require.NoError(t, sqlDB.Close())
+	})
+	t.Setenv("ASSET_STORAGE", "local")
+	t.Setenv("ASSET_LOCAL_DIR", t.TempDir())
+	store, err := service.GetAssetStore()
+	require.NoError(t, err)
+	user := model.User{Username: "asset-content-owner", AffCode: "asset-content-owner"}
+	require.NoError(t, db.Create(&user).Error)
+	var source bytes.Buffer
+	require.NoError(t, png.Encode(&source, image.NewRGBA(image.Rect(0, 0, 2, 2))))
+	asset, err := service.CreateAsset(t.Context(), user.Id, "original.png", bytes.NewReader(source.Bytes()), store)
+	require.NoError(t, err)
+	signedURL, err := store.Presign(t.Context(), asset.ObjectKey)
+	require.NoError(t, err)
+	parsed, err := url.Parse(signedURL)
+	require.NoError(t, err)
+
+	engine := gin.New()
+	middleware.SetUpLogger(engine)
+	SetAssetRouter(engine)
+	for _, tc := range []struct {
+		name       string
+		method     string
+		rangeValue string
+		wantStatus int
+		wantBody   []byte
+	}{
+		{"download", http.MethodGet, "", http.StatusOK, source.Bytes()},
+		{"repeat download", http.MethodGet, "", http.StatusOK, source.Bytes()},
+		{"head", http.MethodHead, "", http.StatusOK, nil},
+		{"range", http.MethodGet, "bytes=0-7", http.StatusPartialContent, source.Bytes()[:8]},
+		{"unsatisfiable range", http.MethodGet, "bytes=10000-", http.StatusRequestedRangeNotSatisfiable, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(tc.method, parsed.RequestURI(), nil)
+			request.Header.Set("Range", tc.rangeValue)
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			assert.Equal(t, tc.wantStatus, response.Code)
+			assert.Equal(t, "private, no-store", response.Header().Get("Cache-Control"))
+			assert.Equal(t, "nosniff", response.Header().Get("X-Content-Type-Options"))
+			if tc.wantStatus < 400 {
+				assert.Equal(t, "image/png", response.Header().Get("Content-Type"))
+				assert.Equal(t, tc.wantBody, response.Body.Bytes())
+			}
+			if tc.method == http.MethodHead {
+				assert.Equal(t, strconv.Itoa(source.Len()), response.Header().Get("Content-Length"))
+			}
+			if tc.wantStatus == http.StatusPartialContent {
+				assert.Equal(t, "bytes 0-7/"+strconv.Itoa(source.Len()), response.Header().Get("Content-Range"))
+			}
+		})
+	}
+
+	t.Run("slave cannot access local storage", func(t *testing.T) {
+		previous := common.IsMasterNode
+		common.IsMasterNode = false
+		t.Cleanup(func() { common.IsMasterNode = previous })
+		directory := filepath.Join(t.TempDir(), "must-not-exist")
+		t.Setenv("ASSET_LOCAL_DIR", directory)
+		var before int64
+		require.NoError(t, db.Model(&model.Asset{}).Count(&before).Error)
+		uploads := gin.New()
+		// These handlers receive the identity supplied by authentication. This
+		// case tests storage rejection, not API key or browser authentication.
+		for _, path := range []string{"/v1/assets", "/api/assets"} {
+			uploads.POST(path, func(c *gin.Context) {
+				c.Set("id", user.Id)
+				controller.CreateAsset(c)
+			})
+			body := &unreadAssetUploadBody{}
+			request := httptest.NewRequest(http.MethodPost, path, body)
+			request.Header.Set("Content-Type", "multipart/form-data; boundary=unread")
+			response := httptest.NewRecorder()
+			uploads.ServeHTTP(response, request)
+			assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "asset_storage_unavailable")
+			assert.Zero(t, body.reads, "a slave must reject before parsing the upload")
+		}
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, httptest.NewRequest(method, parsed.RequestURI(), nil))
+			assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+		}
+		var after int64
+		require.NoError(t, db.Model(&model.Asset{}).Count(&after).Error)
+		assert.Equal(t, before, after)
+		_, err := os.Stat(directory)
+		require.ErrorIs(t, err, os.ErrNotExist)
+	})
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		query  string
+	}{
+		{"missing capability", http.MethodGet, "expires=" + parsed.Query().Get("expires")},
+		{"tampered capability", http.MethodGet, "expires=" + parsed.Query().Get("expires") + "&access=" + strings.Repeat("A", 43)},
+		{"expired capability", http.MethodGet, "expires=1&access=" + parsed.Query().Get("access")},
+		{"duplicate capability", http.MethodGet, parsed.RawQuery + "&access=" + parsed.Query().Get("access")},
+		{"duplicate expiry", http.MethodGet, parsed.RawQuery + "&expires=" + parsed.Query().Get("expires")},
+		{"malformed query", http.MethodGet, parsed.RawQuery + "&bad=%zz"},
+		{"unexpected parameter", http.MethodGet, parsed.RawQuery + "&extra=yes"},
+		{"unsupported method", http.MethodPost, parsed.RawQuery},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(tc.method, parsed.Path+"?"+tc.query, nil)
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			assert.Equal(t, http.StatusNotFound, response.Code)
+			assert.NotContains(t, response.Body.String(), parsed.Query().Get("access"))
+		})
+	}
+
+	// Deletion prevents fresh access, but an accepted consumer retains its source.
+	require.NoError(t, model.DeleteUserAsset(t.Context(), user.Id, asset.ID))
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil))
+	assert.Equal(t, http.StatusNotFound, response.Code)
+	task := model.Task{TaskID: "task_asset_content", UserId: user.Id, Status: model.TaskStatusSubmitted, CreatedAt: time.Now().Unix()}
+	require.NoError(t, db.Create(&task).Error)
+	require.NoError(t, db.Create(&model.TaskAssetUse{TaskID: task.TaskID, AssetID: asset.ID}).Error)
+	response = httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil))
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, source.Bytes(), response.Body.Bytes())
+	require.NoError(t, db.Model(&task).Update("status", model.TaskStatusSuccess).Error)
+	response = httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil))
+	assert.Equal(t, http.StatusNotFound, response.Code)
+
+	// Exhausted invalid-access budgets are rejected before any storage access,
+	// even if the configured local directory no longer exists.
+	request := httptest.NewRequest(http.MethodGet, parsed.RequestURI(), nil)
+	request.RemoteAddr = "198.51.100.77:1234"
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Request = request
+	for range system_setting.LoadTaskArtifactAccessLimits().InvalidRatePerMinute {
+		require.True(t, middleware.AllowInvalidContentAccessAttempt(context))
+	}
+	missingDirectory := filepath.Join(t.TempDir(), "missing")
+	t.Setenv("ASSET_LOCAL_DIR", missingDirectory)
+	response = httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusTooManyRequests, response.Code)
+	_, err = os.Stat(missingDirectory)
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func TestAccessTokenCatalogCoversEveryPermission(t *testing.T) {

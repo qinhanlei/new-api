@@ -88,8 +88,47 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 		Group:     info.UsingGroup,
 		Other:     other,
 	})
-	model.UpdateUserUsedQuotaAndRequestCount(info.UserId, info.PriceData.Quota)
-	model.UpdateChannelUsedQuota(info.ChannelId, info.PriceData.Quota)
+	if !task.PrivateData.DurableBilling {
+		model.UpdateUserUsedQuotaAndRequestCount(info.UserId, info.PriceData.Quota)
+		model.UpdateChannelUsedQuota(info.ChannelId, info.PriceData.Quota)
+	}
+}
+
+// TaskBillingContextFromRelayInfo freezes the pricing and audit information
+// needed after a durable task outlives its submitting request.
+func TaskBillingContextFromRelayInfo(info *relaycommon.RelayInfo) *model.TaskBillingContext {
+	billing := &model.TaskBillingContext{ModelPrice: info.PriceData.ModelPrice, GroupRatio: info.PriceData.GroupRatioInfo.GroupRatio,
+		ModelRatio: info.PriceData.ModelRatio, OtherRatios: info.PriceData.OtherRatios(), OriginModelName: info.OriginModelName,
+		PerCallBilling: info.PriceData.UsePrice || common.StringsContains(constant.TaskPricePatches, info.OriginModelName), TieredSnapshot: info.TieredBillingSnapshot}
+	if clamp := info.QuotaClamp; clamp != nil {
+		billing.QuotaSaturation = clamp.AuditMap()
+		if math.IsNaN(clamp.Original) || math.IsInf(clamp.Original, 0) {
+			billing.QuotaSaturation["original"] = fmt.Sprint(clamp.Original)
+		}
+	}
+	return billing
+}
+
+// LogDurableTaskConsumption records an accepted job after its durable
+// settlement, including recovery that no longer has the original relay context.
+func LogDurableTaskConsumption(ctx context.Context, task *model.Task) {
+	other := taskBillingOther(task)
+	if billing := task.PrivateData.BillingContext; billing != nil && billing.QuotaSaturation != nil {
+		other.SetAdmin("quota_saturation", billing.QuotaSaturation)
+		logger.LogWarn(ctx, common.LogText("quota saturation on task %s: %v", task.TaskID, billing.QuotaSaturation))
+	}
+	if execution := task.PrivateData.Execution; execution != nil {
+		other.SetPublic("request_path", execution.RequestPath)
+	}
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		other.SetPublic("task_sync", true)
+	}
+	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
+		UserId: task.UserId, LogType: model.LogTypeConsume,
+		Content:   []*common.Message{common.NewMessage("Action {{action}}", map[string]any{"action": task.Action})},
+		ChannelId: task.ChannelId, ModelName: taskModelName(task), Quota: task.Quota,
+		TokenId: task.PrivateData.TokenId, Group: task.Group, Other: other, NodeName: task.PrivateData.NodeName,
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +300,9 @@ func taskModelName(task *model.Task) string {
 // 当异步任务失败时，退还资金与令牌额度，并回减用户和渠道用量。
 // 返回资金来源是否已成功退还；失败时保留 quota，供显式重试或人工对账。
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
+	if task.PrivateData.DurableBilling {
+		return refundDurableTaskQuota(ctx, task, reason)
+	}
 	quota := task.Quota
 	if quota == 0 {
 		return true
@@ -308,6 +350,10 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 // reason 写入日志内容（例如按 token 重算或 adaptor 调整）。
 // clamps 可选：若计算 actualQuota 时发生额度饱和，将其记入日志 admin_info（仅管理员可见）。
 func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int, reason *common.Message, clamps ...*common.QuotaClamp) {
+	if task.PrivateData.DurableBilling {
+		recalculateDurableTaskQuota(ctx, task, actualQuota, reason, clamps...)
+		return
+	}
 	if actualQuota < 0 {
 		return
 	}
@@ -380,8 +426,16 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 // 当任务成功且返回了 totalTokens 时，根据模型倍率和分组倍率重新计算实际扣费额度，
 // 与预扣费的差额进行补扣或退还。支持钱包和订阅计费来源。
 func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTokens int) bool {
+	quota, reason, clamp, ok := taskQuotaByTokens(task, totalTokens)
+	if ok {
+		RecalculateTaskQuota(ctx, task, quota, reason, clamp)
+	}
+	return ok
+}
+
+func taskQuotaByTokens(task *model.Task, totalTokens int) (int, *common.Message, *common.QuotaClamp, bool) {
 	if totalTokens <= 0 {
-		return false
+		return 0, nil, nil, false
 	}
 
 	modelName := taskModelName(task)
@@ -390,7 +444,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	modelRatio, hasRatioSetting, _ := ratio_setting.GetModelRatio(modelName)
 	// 只有配置了倍率(非固定价格)时才按 token 重新计费
 	if !hasRatioSetting || modelRatio <= 0 {
-		return false
+		return 0, nil, nil, false
 	}
 
 	// 获取用户和组的倍率信息
@@ -402,7 +456,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		}
 	}
 	if group == "" {
-		return false
+		return 0, nil, nil, false
 	}
 
 	groupRatio := ratio_setting.GetGroupRatio(group)
@@ -430,8 +484,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		"group_ratio":      fmt.Sprintf("%.2f", finalGroupRatio),
 		"other_multiplier": fmt.Sprintf("%.4f", otherMultiplier),
 	})
-	RecalculateTaskQuota(ctx, task, actualQuota, reason, clamp)
-	return true
+	return actualQuota, reason, clamp, true
 }
 
 // EvaluateTaskCompletionUsage evaluates actual facts against the frozen task

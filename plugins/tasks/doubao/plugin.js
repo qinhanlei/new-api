@@ -303,7 +303,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation and Seedream image generation",
     zh: "火山引擎豆包 Seedance 视频生成与 Seedream 图片生成",
   },
-  version: "1.3.0",
+  version: "1.4.0",
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
   models: Object.keys(VIDEO_MODELS).concat(Object.keys(IMAGE_MODELS)),
@@ -343,6 +343,42 @@ function objectValue(value, name) {
   if (value === undefined || value === null) return {};
   if (typeof value !== "object" || Array.isArray(value)) throw new Error(name + " must be an object");
   return value;
+}
+
+function videoIntent(model, requestBody) {
+  const content = ((requestBody.metadata || {}).content || []).slice();
+  for (const url of requestBody.images || []) content.push({type: "image_url", image_url: {url}});
+  const assetRefs = [];
+  for (const item of content) {
+    if (!item || !["image_url", "video_url", "audio_url"].includes(item.type)) continue;
+    const url = item[item.type] && item[item.type].url;
+    if (typeof url === "string" && url.startsWith("asset://na_asset_")) {
+      const id = url.slice(8);
+      if (!assetRefs.includes(id)) assetRefs.push(id);
+    }
+  }
+  const intent = {kind: "submit", model, requestBody,
+    action: content.some(item => item && item.type !== "text") ? "image_to_video" : "text_to_video"};
+  const origins = draftTaskIds(content);
+  if (origins.length) intent.originTaskIds = origins;
+  if (assetRefs.length) intent.assetRefs = assetRefs;
+  return intent;
+}
+
+function resolveAssetContent(content, ctx) {
+  return content.map(item => {
+    if (!item || !["image_url", "video_url", "audio_url"].includes(item.type)) return item;
+    const source = item[item.type];
+    const url = source && source.url;
+    if (typeof url !== "string" || !url.startsWith("asset://")) return item;
+    if (!url.startsWith("asset://na_asset_")) {
+      if (ctx.managedAssets) throw new Error("Use a managed asset ID for this channel");
+      return item;
+    }
+    const asset = (ctx.resolvedAssets || {})[url.slice(8)];
+    if (!asset || asset.type + "_url" !== item.type) throw new Error("Asset is unavailable or its media type does not match the reference");
+    return Object.assign({}, item, {[item.type]: Object.assign({}, source, {url: asset.reference})});
+  });
 }
 
 function draftTaskIds(content) {
@@ -752,10 +788,7 @@ export const native = {
     };
     const seconds = Number(body.duration);
     if (Number.isFinite(seconds) && seconds > 0) requestBody.seconds = seconds;
-    const intent = { kind: "submit", model: model, action: hasReference ? "image_to_video" : "text_to_video", requestBody: requestBody };
-    const originTaskIds = draftTaskIds(content);
-    if (originTaskIds.length) intent.originTaskIds = originTaskIds;
-    return intent;
+    return videoIntent(model, requestBody);
   },
   taskCreated: function (ctx, task) {
     const data = task.data && typeof task.data === "object" && !Array.isArray(task.data) ? task.data : {};
@@ -813,7 +846,7 @@ export function buildSubmitRequest(ctx) {
   body.content = imageContent.concat(metadataContent).filter((item) => item && item.type !== "text");
   const hasReference = body.content.length > 0;
   if (trimmed(req.prompt) || !hasReference) body.content.push({ type: "text", text: req.prompt || "" });
-  if (Array.isArray(body.content)) body.content = rewriteDraftTaskContent(body.content, ctx.originTasks);
+  if (Array.isArray(body.content)) body.content = resolveAssetContent(rewriteDraftTaskContent(body.content, ctx.originTasks), ctx);
   // -1 lets the model pick the length; extractUsage reserves the longest one.
   const seconds = Number.parseInt(req.seconds || "", 10);
   if (seconds > 0 || seconds === -1) body.duration = seconds;
@@ -1025,10 +1058,7 @@ export const protocols = {
       if (Object.prototype.hasOwnProperty.call(req, "seconds")) requestBody.seconds = req.seconds;
       else if (Object.prototype.hasOwnProperty.call(req, "duration")) requestBody.seconds = req.duration;
       if (Object.prototype.hasOwnProperty.call(req, "size")) requestBody.size = req.size;
-      const intent = { kind: "submit", model: model, action: images.length ? "image_to_video" : "text_to_video", requestBody: requestBody };
-      const originTaskIds = draftTaskIds(metadata.content);
-      if (originTaskIds.length) intent.originTaskIds = originTaskIds;
-      return intent;
+      return videoIntent(model, requestBody);
     },
     renderEvents: function (ctx, task, previousState) {
       const status = String(task.status || "UNKNOWN").toUpperCase();
@@ -1165,12 +1195,7 @@ protocols.openai_video = {
       const requestBody = Object.assign({}, req, { model: ctx.model });
       // buildSubmitRequest reads seconds; duration is accepted as its alias.
       if (seconds !== undefined) requestBody.seconds = seconds;
-      return {
-        kind: "submit",
-        model: ctx.model,
-        action: req.input_reference || req.image ? "image_to_video" : "text_to_video",
-        requestBody: requestBody,
-      };
+      return videoIntent(ctx.model, requestBody);
     }
     const first = function (name) {
       const values = (ctx.body.fields || {})[name] || [];
@@ -1198,12 +1223,7 @@ protocols.openai_video = {
     const seconds = req.seconds === undefined ? req.duration : req.seconds;
     if (seconds !== undefined && Number(seconds) !== -1 && (!Number.isFinite(Number(seconds)) || Number(seconds) <= 0 || Number(seconds) > 3600))
       throw new Error("seconds must be -1 or between 1 and 3600");
-    return {
-      kind: "submit",
-      model: ctx.model,
-      action: req.input_reference || req.image ? "image_to_video" : "text_to_video",
-      requestBody: Object.assign({}, req, { model: ctx.model }),
-    };
+    return videoIntent(ctx.model, Object.assign({}, req, { model: ctx.model }));
   },
   render: function (ctx, task) {
     return legacyRenderers.openai_video(task);

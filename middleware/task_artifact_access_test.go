@@ -152,6 +152,93 @@ func TestSetUpLoggerNeverWritesTaskArtifactAccess(t *testing.T) {
 	assert.False(t, strings.Contains(output.String(), "never-log-this"))
 }
 
+func TestLocalAssetContentAccessQueryValidationAndRedaction(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousWriter := gin.DefaultWriter
+	var output bytes.Buffer
+	gin.DefaultWriter = &output
+	t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		valid bool
+	}{
+		{"valid", "expires=1800000000&access=secret-capability", true},
+		{"encoded key", "expires=1800000000&%61ccess=secret-capability", true},
+		{"missing capability", "expires=1800000000", false},
+		{"empty capability", "expires=1800000000&access=", false},
+		{"missing expiry", "access=secret-capability", false},
+		{"duplicate capability", "expires=1800000000&access=secret-capability&access=other", false},
+		{"duplicate expiry", "expires=1800000000&expires=1800000001&access=secret-capability", false},
+		{"extra query", "expires=1800000000&access=secret-capability&extra=yes", false},
+		{"malformed escape", "expires=%zz&access=secret-capability", false},
+		{"malformed separator", "expires=1800000000;extra=yes&access=secret-capability", false},
+		{"malformed capability", "expires=1800000000&access=secret-capability%zz", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, logger := range []bool{false, true} {
+				router := gin.New()
+				if logger {
+					SetUpLogger(router)
+				}
+				router.GET("/v1/assets/:id/content", func(c *gin.Context) {
+					expires, access := LocalAssetContentAccessQuery(c)
+					if tc.valid {
+						assert.Equal(t, "1800000000", expires)
+						assert.Equal(t, "secret-capability", access)
+					} else {
+						assert.Empty(t, expires)
+						assert.Empty(t, access)
+					}
+					assert.NotContains(t, c.Request.URL.RawQuery, "secret-capability")
+					assert.NotContains(t, c.Request.RequestURI, "secret-capability")
+					c.Status(http.StatusNoContent)
+				})
+				request := httptest.NewRequest(http.MethodGet, "/v1/assets/na_asset_test/content?"+tc.query, nil)
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				assert.Equal(t, http.StatusNoContent, response.Code)
+			}
+		})
+	}
+	assert.NotContains(t, output.String(), "secret-capability")
+}
+
+func TestLocalAssetContentSharesAnonymousArtifactLimits(t *testing.T) {
+	previousLimiter := taskArtifactAnonymousLimiter
+	taskArtifactAnonymousLimiter = newTaskArtifactAccessLimiter(system_setting.TaskArtifactAccessLimits{
+		InvalidRatePerMinute: 1,
+		GlobalConcurrency:    1,
+		IPConcurrency:        1,
+		ObjectConcurrency:    1,
+	})
+	t.Cleanup(func() { taskArtifactAnonymousLimiter = previousLimiter })
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/assets/na_asset_test/content", nil)
+	c.Request.RemoteAddr = "192.0.2.1:1234"
+
+	releaseArtifact, ok := taskArtifactAnonymousLimiter.acquire("192.0.2.2", "task-1", "video")
+	require.True(t, ok)
+	_, ok = AcquireAnonymousContentAccess(c, "na_asset_test", "source")
+	assert.False(t, ok, "asset downloads share the global task artifact budget")
+	releaseArtifact()
+
+	releaseAsset, ok := AcquireAnonymousContentAccess(c, "na_asset_test", "source")
+	require.True(t, ok)
+	releaseAsset()
+	releaseAsset()
+	releaseAsset, ok = AcquireAnonymousContentAccess(c, "na_asset_test", "source")
+	require.True(t, ok, "release is idempotent and restores concurrency")
+	releaseAsset()
+
+	assert.True(t, AllowInvalidContentAccessAttempt(c))
+	assert.False(t, taskArtifactAnonymousLimiter.invalidAttempt(time.Now(), "192.0.2.1"), "invalid capabilities share the existing per-IP budget")
+	_, ok = AcquireAnonymousContentAccess(c, "na_asset_test", "source")
+	assert.False(t, ok, "exhausted invalid-access budget blocks before opening storage")
+	assert.False(t, taskArtifactAnonymousLimiter.invalidRateExceeded(time.Now().Add(taskArtifactAccessRateWindow), "192.0.2.1"), "the failed-access budget expires after its window")
+}
+
 func urlQueryEscape(value string) string {
 	replacer := strings.NewReplacer("+", "%2B", "=", "%3D")
 	return replacer.Replace(value)

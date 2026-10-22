@@ -323,6 +323,17 @@ func is64BitIntegerType(dbType common.DatabaseType, dataType string) bool {
 }
 
 func migrateDB() error {
+	// Unreleased manual asset spaces cannot be assigned to an account safely
+	// during startup. Preserve them for an explicit migration before upgrading.
+	if DB.Migrator().HasTable(&AssetSpace{}) && !DB.Migrator().HasColumn(&AssetSpace{}, "channel_id") {
+		var count int64
+		if err := DB.Model(&AssetSpace{}).Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("existing asset spaces require migration to channel ownership before upgrading")
+		}
+	}
 	if err := migrateTokenKeyUniqueness(DB); err != nil {
 		return err
 	}
@@ -356,6 +367,7 @@ func migrateDB() error {
 		&TopUp{},
 		&QuotaData{},
 		&Task{},
+		&Asset{}, &AssetSpace{}, &AssetReplica{}, &TaskSubmission{}, &TaskAssetUse{}, &TaskReservation{},
 		&TaskPlugin{},
 		&Model{},
 		&Vendor{},

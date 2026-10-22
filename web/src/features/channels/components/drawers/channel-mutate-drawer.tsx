@@ -206,6 +206,7 @@ import {
   nextTaskPluginBaseUrl,
 } from '../../lib/task-plugin-base-url'
 import type { Channel } from '../../types'
+import { ChannelAssetSettings } from '../channel-asset-settings'
 import { ChannelPluginExtensions } from '../channel-plugin-extensions'
 import { ChannelQuickOptions } from '../channel-quick-options'
 import { ChannelTypeLogo } from '../channel-type-badge'
@@ -297,6 +298,11 @@ const SENSITIVE_FORM_FIELDS = [
   'aws_api_type',
   'azure_responses_version',
   'force_format',
+  'asset_endpoint',
+  'asset_project',
+  'asset_auth_mode',
+  'asset_access_key',
+  'asset_secret_key',
   'thinking_to_content',
   'proxy',
   'http_protocol',
@@ -4712,6 +4718,11 @@ export function ChannelMutateDrawer({
           <>
             {basicSection}
             {connectionSection}
+            <ChannelAssetSettings
+              channelId={channelId}
+              channelEnabled={currentRow?.status === 1}
+              disabled={sensitiveLocked || isSubmitting}
+            />
           </>
         }
         models={modelsSection}

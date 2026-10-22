@@ -105,7 +105,7 @@ func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResul
 // persistUserQuotaDelta 把已在缓存侧预扣成功的增量落库；批量模式下入队，
 // 直写模式下要求行存在（用户已删除时报错，交由调用方补偿缓存）。
 func persistUserQuotaDelta(id int, delta int) error {
-	if common.BatchUpdateEnabled {
+	if common.BatchUpdateEnabled && !common.AssetLibraryEnabled {
 		addNewRecord(BatchUpdateTypeUserQuota, id, delta)
 		return nil
 	}
@@ -120,7 +120,7 @@ func persistUserQuotaDelta(id int, delta int) error {
 }
 
 func persistTokenQuotaDelta(id int, delta int) error {
-	if common.BatchUpdateEnabled {
+	if common.BatchUpdateEnabled && !common.AssetLibraryEnabled {
 		addNewRecord(BatchUpdateTypeTokenQuota, id, delta)
 		return nil
 	}
@@ -168,7 +168,7 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 	if quota == 0 {
 		return true, nil
 	}
-	if !common.RedisEnabled {
+	if !common.RedisEnabled || common.AssetLibraryEnabled {
 		return reserveUserQuotaDB(id, quota)
 	}
 
@@ -209,7 +209,7 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 	if unlimited {
 		return true, DecreaseTokenQuota(id, key, quota)
 	}
-	if !common.RedisEnabled {
+	if !common.RedisEnabled || common.AssetLibraryEnabled {
 		return reserveTokenQuotaDB(id, quota)
 	}
 

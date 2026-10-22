@@ -1951,10 +1951,14 @@ func insertTaskPluginRouteTask(t *testing.T, task *model.Task) {
 }
 
 func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
+	previousEnabled := common.AssetLibraryEnabled
+	common.AssetLibraryEnabled = true
+	t.Cleanup(func() { common.AssetLibraryEnabled = previousEnabled })
 	for _, tc := range []struct {
 		name, alpha, beta string
 		wantKeys          []string
 		wantError         string
+		wantAssets        bool
 	}{
 		{name: "first decoder rejects", alpha: `throw new Error("alpha only accepts 720p")`, beta: `return {model:ctx.model,action:"beta",requestBody:{resolution:"1080p"}}`, wantKeys: []string{"decode-beta"}},
 		{name: "second decoder rejects", alpha: `return {model:ctx.model,action:"alpha"}`, beta: `throw new Error("beta rejects")`, wantKeys: []string{"decode-alpha"}},
@@ -1963,6 +1967,10 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 		{name: "duplicate failures are grouped", alpha: `throw new Error("unsupported resolution")`, beta: `throw new Error("unsupported resolution")`, wantError: "decode-alpha, decode-beta: unsupported resolution"},
 		{name: "invalid result is excluded", alpha: `return {kind:"query",model:ctx.model}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
 		{name: "rewritten model is excluded", alpha: `return {model:"another-model"}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
+		{name: "later candidate declares assets", alpha: `return {model:ctx.model}`, beta: `return {model:ctx.model,assetRefs:["na_asset_image"]}`, wantKeys: []string{"decode-beta"}, wantAssets: true},
+		{name: "earlier candidate declares assets", alpha: `return {model:ctx.model,assetRefs:["na_asset_image"]}`, beta: `return {model:ctx.model}`, wantKeys: []string{"decode-alpha"}, wantAssets: true},
+		{name: "different asset sets are excluded", alpha: `return {model:ctx.model,assetRefs:["na_asset_image"]}`, beta: `return {model:ctx.model,assetRefs:["na_asset_other"]}`, wantKeys: []string{"decode-alpha"}, wantAssets: true},
+		{name: "same asset sets remain eligible", alpha: `return {model:ctx.model,assetRefs:["na_asset_image","na_asset_other"]}`, beta: `return {model:ctx.model,assetRefs:["na_asset_other","na_asset_image"]}`, wantKeys: []string{"decode-alpha", "decode-beta"}, wantAssets: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, spec := range []struct{ key, decode string }{{"decode-alpha", tc.alpha}, {"decode-beta", tc.beta}} {
@@ -1981,6 +1989,12 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 				assert.Equal(t, tc.wantKeys[0], c.GetString("task_plugin_key"))
 				assert.Same(t, pinned.Plugin, c.MustGet(jsplugin.ContextKeyPinnedPlugin).(jsplugin.PinnedPlugin).Plugin)
 				assert.Equal(t, tc.wantKeys, service.GetChannelConstraints(c).Filters[0].TaskPluginKeys)
+				if tc.wantAssets {
+					assert.NotEmpty(t, c.GetStringSlice(service.ContextTaskAssetRefs))
+					assert.Contains(t, service.GetChannelConstraints(c).Filters, dto.ChannelFilter{Kind: dto.FilterManagedAssets})
+				} else {
+					assert.Empty(t, c.GetStringSlice(service.ContextTaskAssetRefs))
+				}
 				c.Status(http.StatusNoContent)
 			})
 			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model","resolution":"1080p"}`))

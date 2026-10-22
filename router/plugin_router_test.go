@@ -898,10 +898,12 @@ func TestWebFallbackDoesNotCacheMissingAPIOrAssets(t *testing.T) {
 			assert.NotContains(t, response.Header().Get("Cache-Control"), "604800")
 		})
 	}
-	page := performPluginRequest(outer, http.MethodGet, "/security")
-	assert.Equal(t, http.StatusOK, page.Code)
-	assert.Equal(t, "dashboard", page.Body.String())
-	assert.Equal(t, "no-cache", page.Header().Get("Cache-Control"))
+	for _, path := range []string{"/security", "/assets", "/assets/", "/assets?page=2"} {
+		page := performPluginRequest(outer, http.MethodGet, path)
+		assert.Equal(t, http.StatusOK, page.Code, path)
+		assert.Equal(t, "dashboard", page.Body.String(), path)
+		assert.Equal(t, "no-cache", page.Header().Get("Cache-Control"), path)
+	}
 }
 
 func TestSecurityRoutesDisableCachingBeforeAuthentication(t *testing.T) {

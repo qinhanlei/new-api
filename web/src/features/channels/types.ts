@@ -38,6 +38,7 @@ export const channelSchema = z.object({
   id: z.number(),
   type: z.number(),
   key: z.string(),
+  asset_credentials_configured: z.boolean().optional(),
   openai_organization: z.string().nullish(),
   test_model: z.string().nullish(),
   status: z.number(), // 1: enabled, 0: manual disabled, 2: auto disabled
@@ -75,6 +76,17 @@ export const channelSchema = z.object({
 
 export type Channel = z.infer<typeof channelSchema>
 
+export type ChannelWrite = Partial<Channel> & {
+  asset_credentials?: { access_key?: string; secret_key?: string }
+}
+
+export type ChannelAssetStatus = {
+  id: string
+  channel_id: number
+  status: string
+  error?: string
+}
+
 // ============================================================================
 // Channel Settings Types
 // ============================================================================
@@ -83,6 +95,8 @@ export interface ChannelSettings {
   task_plugin_key?: string
   task_extend_plugin_keys?: string[]
   force_format?: boolean
+  asset_endpoint?: string
+  asset_project?: string
   thinking_to_content?: boolean
   proxy?: string
   pass_through_body_enabled?: boolean
@@ -390,5 +404,5 @@ export interface AddChannelRequest {
   mode: 'single' | 'batch' | 'multi_to_single'
   multi_key_mode?: 'random' | 'polling'
   batch_add_set_key_prefix_2_name?: boolean
-  channel: Partial<Channel>
+  channel: ChannelWrite
 }

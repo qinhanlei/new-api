@@ -42,20 +42,35 @@ func GetTaskPluginUsage(key string) ([]TaskPluginChannelRef, int64, error) {
 // whether the channel changed. A New API gateway channel keeps serving its other
 // plugins and its ordinary traffic.
 func UnbindTaskPlugin(channelID int, key string) (bool, error) {
-	channel, err := GetChannelById(channelID, false)
-	if err != nil {
-		return false, err
-	}
-	setting := channel.GetSetting()
-	if !setting.BindsTaskPlugin(key) {
-		return false, nil
-	}
-	if setting.TaskPluginKey == key {
-		setting.TaskPluginKey = ""
-	}
-	setting.TaskExtendPluginKeys = slices.DeleteFunc(setting.TaskExtendPluginKeys, func(bound string) bool { return bound == key })
-	channel.SetSetting(setting)
-	return true, DB.Model(&Channel{}).Where("id = ?", channelID).Update("setting", channel.Setting).Error
+	changed := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var channel Channel
+		if err := lockForUpdate(tx).First(&channel, channelID).Error; err != nil {
+			return err
+		}
+		setting, err := channel.assetSettings()
+		if err != nil {
+			return err
+		}
+		if !setting.BindsTaskPlugin(key) {
+			return nil
+		}
+		if setting.TaskPluginKey == key {
+			setting.TaskPluginKey = ""
+		}
+		setting.TaskExtendPluginKeys = slices.DeleteFunc(setting.TaskExtendPluginKeys, func(bound string) bool { return bound == key })
+		update := Channel{Id: channelID, ChannelInfo: channel.ChannelInfo}
+		update.SetSetting(setting)
+		if err := update.guardAssetUpdate(tx, &channel, false); err != nil {
+			return err
+		}
+		if err := tx.Model(&channel).Update("setting", update.Setting).Error; err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	})
+	return changed && err == nil, err
 }
 
 // LongText is a string column sized for plugin payloads on every supported

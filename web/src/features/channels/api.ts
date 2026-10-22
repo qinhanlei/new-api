@@ -28,6 +28,8 @@ import type {
   BatchSetTagParams,
   Channel,
   ChannelBalanceResponse,
+  ChannelWrite,
+  ChannelAssetStatus,
   ChannelOpsResponse,
   ChannelTestResponse,
   CopyChannelParams,
@@ -199,7 +201,7 @@ export async function createChannel(
  */
 export async function updateChannel(
   id: number,
-  data: Partial<Channel>
+  data: ChannelWrite
 ): Promise<{ success: boolean; message?: string; data?: Channel }> {
   const res = await api.put(
     '/api/channel/',
@@ -717,4 +719,23 @@ export async function getPrefillGroups(
 }> {
   const res = await api.get('/api/prefill_group', { params: { type } })
   return res.data
+}
+
+export async function getChannelAssets(
+  id: number
+): Promise<ChannelAssetStatus | null> {
+  const response = await api.get<{
+    success: boolean
+    data: ChannelAssetStatus | null
+  }>(`/api/channel/${id}/assets`)
+  return requireServerSuccess(response.data).data
+}
+
+export async function cleanupChannelAssets(id: number): Promise<void> {
+  const response = await api.post(
+    `/api/channel/${id}/assets/cleanup`,
+    {},
+    channelActionConfig()
+  )
+  requireServerSuccess(response.data)
 }

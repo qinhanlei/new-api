@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import {
   Activity,
+  Images,
   Box,
   ClipboardList,
   CreditCard,
@@ -87,6 +88,11 @@ export function useSidebarData(): SidebarData {
             title: t('API Keys'),
             url: '/keys',
             icon: Key,
+          },
+          {
+            title: t('Asset library'),
+            url: '/assets',
+            icon: Images,
           },
           {
             title: t('Usage Logs'),

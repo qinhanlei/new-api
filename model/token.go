@@ -280,7 +280,7 @@ func GetTokenById(id int) (*Token, error) {
 }
 
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
-	if !fromDB && common.RedisEnabled {
+	if !fromDB && common.RedisEnabled && !common.AssetLibraryEnabled {
 		// Try Redis first
 		token, err := cacheGetTokenByKey(key)
 		if err == nil {
@@ -390,7 +390,7 @@ func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
 			}
 		})
 	}
-	if common.BatchUpdateEnabled {
+	if common.BatchUpdateEnabled && !common.AssetLibraryEnabled {
 		addNewRecord(BatchUpdateTypeTokenQuota, tokenId, quota)
 		return nil
 	}
@@ -419,7 +419,7 @@ func DecreaseTokenQuota(id int, key string, quota int) (err error) {
 			}
 		})
 	}
-	if common.BatchUpdateEnabled {
+	if common.BatchUpdateEnabled && !common.AssetLibraryEnabled {
 		addNewRecord(BatchUpdateTypeTokenQuota, id, -quota)
 		return nil
 	}

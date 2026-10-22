@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -9,11 +10,41 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestChannelAssetCredentialsAreWriteOnlyAndPermissionGated(t *testing.T) {
+	setupTaskPluginBindChannelTest(t)
+	channel := model.Channel{Type: constant.ChannelTypeDoubaoVideo, Name: "assets", Key: "inference-key", Models: "seedance", Group: "default", AssetCredentials: &model.ChannelAssetCredentials{AccessKey: "old-ak", SecretKey: "old-sk"}}
+	require.NoError(t, channel.Insert())
+	body := fmt.Sprintf(`{"id":%d,"type":54,"name":"assets","models":"seedance","group":"default","asset_credentials":{"access_key":"new-ak","secret_key":"new-sk"}}`, channel.Id)
+	denied := putUpdateChannel(t, 2, common.RoleAdminUser, body)
+	assert.Contains(t, denied.Body.String(), `"success":false`)
+	unchanged, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	assert.Equal(t, "old-sk", unchanged.AssetCredentials.SecretKey)
+	allowed := putUpdateChannel(t, 1, common.RoleRootUser, body)
+	require.Contains(t, allowed.Body.String(), `"success":true`)
+	assert.Contains(t, allowed.Body.String(), `"asset_credentials_configured":true`)
+	assert.NotContains(t, allowed.Body.String(), "new-ak")
+	assert.NotContains(t, allowed.Body.String(), "new-sk")
+	stored, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	assert.Equal(t, "new-sk", stored.AssetCredentials.SecretKey)
+	var audit []model.AuditLog
+	require.NoError(t, model.LOG_DB.Find(&audit).Error)
+	encoded, err := common.Marshal(audit)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "new-sk")
+	assert.Contains(t, string(encoded), "asset_credentials")
+	cleared := putUpdateChannel(t, 1, common.RoleRootUser, fmt.Sprintf(`{"id":%d,"type":54,"asset_credentials":{}}`, channel.Id))
+	require.Contains(t, cleared.Body.String(), `"success":true`)
+	assert.Contains(t, cleared.Body.String(), `"asset_credentials_configured":false`)
+}
 
 func TestChannelHasSensitiveChanges(t *testing.T) {
 	baseURL := "https://api.example.com"

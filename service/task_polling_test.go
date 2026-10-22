@@ -3,8 +3,12 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -18,8 +22,14 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 type taskPollingFetchAdaptor struct {
@@ -1043,4 +1053,275 @@ func TestUpdateBatchTasksPollClassification(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Optional DSNs are shared with the reservation matrix and must identify scratch
+// databases. A separate prefix isolates these completion fixtures.
+func TestDurableTaskCompletion(t *testing.T) {
+	for _, dialect := range []common.DatabaseType{common.DatabaseTypeSQLite, common.DatabaseTypeMySQL, common.DatabaseTypePostgreSQL} {
+		t.Run(string(dialect), func(t *testing.T) {
+			var driver gorm.Dialector
+			switch dialect {
+			case common.DatabaseTypeSQLite:
+				driver = sqlite.Open(filepath.Join(t.TempDir(), "completion.db") + "?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_txlock=immediate")
+			case common.DatabaseTypeMySQL:
+				dsn := os.Getenv("TASK_RESERVATION_MYSQL_DSN")
+				if dsn == "" {
+					t.Skip("TASK_RESERVATION_MYSQL_DSN is not configured")
+				}
+				driver = mysql.Open(dsn)
+			case common.DatabaseTypePostgreSQL:
+				dsn := os.Getenv("TASK_RESERVATION_POSTGRES_DSN")
+				if dsn == "" {
+					t.Skip("TASK_RESERVATION_POSTGRES_DSN is not configured")
+				}
+				driver = postgres.Open(dsn)
+			}
+			db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "completion_test_"}})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(4)
+			oldDB, oldLogDB := model.DB, model.LOG_DB
+			oldMainType, oldLogType := common.MainDatabaseType(), common.LogDatabaseType()
+			oldEnabled, oldRedis, oldBatch, oldMemory := common.AssetLibraryEnabled, common.RedisEnabled, common.BatchUpdateEnabled, common.MemoryCacheEnabled
+			model.DB, model.LOG_DB = db, db
+			common.SetDatabaseTypes(dialect, dialect)
+			common.AssetLibraryEnabled, common.RedisEnabled, common.BatchUpdateEnabled, common.MemoryCacheEnabled = true, false, false, false
+			tables := []any{&model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}, &model.TaskSubmission{}, &model.TaskReservation{}, &model.Log{}}
+			require.NoError(t, db.Migrator().DropTable(tables...))
+			require.NoError(t, db.AutoMigrate(tables...))
+			t.Cleanup(func() {
+				assert.NoError(t, db.Migrator().DropTable(tables...))
+				model.DB, model.LOG_DB = oldDB, oldLogDB
+				common.SetDatabaseTypes(oldMainType, oldLogType)
+				common.AssetLibraryEnabled, common.RedisEnabled, common.BatchUpdateEnabled, common.MemoryCacheEnabled = oldEnabled, oldRedis, oldBatch, oldMemory
+				assert.NoError(t, sqlDB.Close())
+			})
+			t.Run("pre-submit reservation preserves balances on retries", testDurablePreSubmitReservation)
+			t.Run("atomic terminal intent and crash recovery", testDurableCompletionCrash)
+			t.Run("shortage retries the frozen target after top-up", testDurableCompletionShortage)
+			t.Run("failed refunds survive every terminal path", testDurableCompletionRefund)
+			t.Run("manual refund supersedes pending settlement", testDurableCompletionManualRefund)
+		})
+	}
+}
+
+func testDurablePreSubmitReservation(t *testing.T) {
+	for _, funding := range []struct {
+		name               string
+		wallet, tokenQuota int
+	}{
+		{"wallet shortage", 200, 300},
+		{"token shortage", 300, 200},
+	} {
+		t.Run(funding.name, func(t *testing.T) {
+			user := model.User{Username: common.GetRandomString(24), AffCode: common.GetRandomString(16), Quota: funding.wallet, Status: common.UserStatusEnabled}
+			require.NoError(t, model.DB.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: common.GetRandomString(32), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: funding.tokenQuota}
+			require.NoError(t, model.DB.Create(&token).Error)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+			info := &relaycommon.RelayInfo{
+				UserId: user.Id, TokenId: token.Id,
+				ChannelMeta:   &relaycommon.ChannelMeta{ChannelId: 1},
+				TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: model.GenerateTaskID()},
+			}
+			info.UserSetting.BillingPreference = "wallet_only"
+			require.Nil(t, PreConsumeDurableTaskBilling(c, info, 0))
+			require.NotNil(t, info.Billing, "free durable tasks still need a reservation")
+			for _, tc := range []struct {
+				quota, held int
+				shortage    bool
+			}{
+				{60, 60, false},
+				{60, 60, false},
+				{40, 60, false},
+				{100, 100, false},
+				{250, 100, true},
+			} {
+				apiErr := PreConsumeBilling(c, tc.quota, info)
+				if tc.shortage {
+					require.NotNil(t, apiErr)
+					assert.Equal(t, http.StatusForbidden, apiErr.StatusCode)
+				} else {
+					require.Nil(t, apiErr)
+				}
+				assert.Equal(t, tc.held, info.Billing.GetPreConsumedQuota())
+				assert.Equal(t, funding.wallet-tc.held, getUserQuota(t, user.Id))
+				assert.Equal(t, funding.tokenQuota-tc.held, getTokenRemainQuota(t, token.Id))
+			}
+			info.Billing.Refund(c)
+			require.NoError(t, info.Billing.ReserveBeforeSubmit(150))
+			assert.Zero(t, info.Billing.GetPreConsumedQuota())
+			assert.Equal(t, funding.wallet, getUserQuota(t, user.Id), "a refunded reservation cannot charge again")
+			assert.Equal(t, funding.tokenQuota, getTokenRemainQuota(t, token.Id))
+		})
+	}
+}
+
+func durableCompletionFixture(t *testing.T) (*model.Task, *model.Channel) {
+	t.Helper()
+	user := model.User{Username: common.GetRandomString(24), AffCode: common.GetRandomString(16), Quota: 200, Status: common.UserStatusEnabled, Group: "default"}
+	require.NoError(t, model.DB.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: common.GetRandomString(32), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 200}
+	require.NoError(t, model.DB.Create(&token).Error)
+	channel := model.Channel{Name: "completion-test", Type: 54, Key: "fixture", Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	task := makeTask(user.Id, channel.Id, 60, token.Id, BillingSourceWallet, 0)
+	task.TaskID, task.SubmitTime = model.GenerateTaskID(), time.Now().Unix()
+	task.PrivateData.DurableBilling = true
+	task.PrivateData.UpstreamTaskID = "upstream-" + task.TaskID
+	expr := `tier("actual", u("units"))`
+	task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
+		ExprString: expr, ExprHash: billingexpr.ExprHashString(expr), GroupRatio: 1,
+		QuotaPerUnit: 1, ExprVersion: 1, TaskUsageBilling: true,
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	require.NoError(t, model.DB.Create(&model.TaskSubmission{TaskID: task.TaskID, UserID: user.Id, Phase: model.SubmissionComplete}).Error)
+	_, err := model.ReserveTaskQuota(t.Context(), model.TaskReservationRequest{TaskID: task.TaskID, UserID: user.Id, TokenID: token.Id, ChannelID: channel.Id, Model: "test-model", Preference: "wallet_only", Quota: 60})
+	require.NoError(t, err)
+	_, _, err = model.AdjustTaskQuota(t.Context(), task.TaskID, 60, model.TaskReservationSettle)
+	require.NoError(t, err)
+	return task, &channel
+}
+
+func testDurableCompletionCrash(t *testing.T) {
+	task, _ := durableCompletionFixture(t)
+	from := task.Status
+	task.Status = model.TaskStatusSuccess
+	result := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, UsageFacts: map[string]any{"units": float64(100)}}
+	// An unavailable companion must roll back terminal visibility.
+	require.NoError(t, model.DB.Where("task_id = ?", task.TaskID).Delete(&model.TaskSubmission{}).Error)
+	won, err := updateTaskWithCompletion(t.Context(), nil, task, from, result)
+	require.Error(t, err)
+	assert.False(t, won)
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, from, persisted.Status)
+	require.NoError(t, model.DB.Create(&model.TaskSubmission{TaskID: task.TaskID, UserID: task.UserId, Phase: model.SubmissionComplete}).Error)
+	won, err = updateTaskWithCompletion(t.Context(), nil, task, from, result)
+	require.NoError(t, err)
+	require.True(t, won)
+	var intent model.TaskSubmission
+	require.NoError(t, model.DB.First(&intent, "task_id = ?", task.TaskID).Error)
+	assert.Equal(t, model.SubmissionCompleting, intent.Phase)
+	assert.Equal(t, 140, getUserQuota(t, task.UserId))
+	// Simulate restart after terminal CAS, before any quota adjustment.
+	require.NoError(t, RecoverDurableTaskCompletions(t.Context()))
+	assert.Equal(t, 100, getUserQuota(t, task.UserId))
+	// A second crash after ledger commit, before intent acknowledgement, is safe.
+	require.NoError(t, model.DB.Model(&model.TaskSubmission{}).Where("task_id = ?", task.TaskID).Updates(map[string]any{"phase": intent.Phase, "completion_billing": intent.CompletionBilling}).Error)
+	for range 2 {
+		require.NoError(t, RecoverDurableTaskCompletions(t.Context()))
+	}
+	assert.Equal(t, 100, getUserQuota(t, task.UserId))
+	assert.Equal(t, 100, getTokenRemainQuota(t, task.PrivateData.TokenId))
+	var user model.User
+	require.NoError(t, model.DB.First(&user, task.UserId).Error)
+	assert.Equal(t, 100, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+}
+
+func testDurableCompletionShortage(t *testing.T) {
+	task, channel := durableCompletionFixture(t)
+	result := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Url: "https://result.invalid/video.mp4", UsageFacts: map[string]any{"units": float64(250)}}
+	adaptor := &scriptedPollingAdaptor{parse: result}
+	require.NoError(t, updateVideoSingleTask(t.Context(), adaptor, channel, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), persisted.Status)
+	assert.Equal(t, 60, persisted.Quota)
+	assert.Equal(t, "https://result.invalid/video.mp4", persisted.GetResultURL())
+	var submission model.TaskSubmission
+	require.NoError(t, model.DB.First(&submission, "task_id = ?", task.TaskID).Error)
+	assert.Equal(t, model.SubmissionCompleting, submission.Phase)
+	assert.NotEmpty(t, submission.Error)
+	assert.Greater(t, submission.NextAttempt, time.Now().Unix())
+	assert.Equal(t, 140, getUserQuota(t, task.UserId))
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", task.UserId).Update("quota", gorm.Expr("quota + 100")).Error)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", task.PrivateData.TokenId).Update("remain_quota", gorm.Expr("remain_quota + 100")).Error)
+	// Neither new pricing nor a new provider response may change the saved target.
+	persisted.PrivateData.BillingContext.TieredSnapshot.ExprString = `tier("changed", u("units") * 999)`
+	require.NoError(t, model.DB.Model(&persisted).Update("private_data", persisted.PrivateData).Error)
+	result.UsageFacts["units"] = float64(1)
+	require.NoError(t, model.DB.Model(&submission).Update("next_attempt", 0).Error)
+	for range 2 {
+		require.NoError(t, RecoverDurableTaskCompletions(t.Context()))
+	}
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, 250, persisted.Quota)
+	assert.Equal(t, 50, getUserQuota(t, task.UserId))
+	assert.Equal(t, 50, getTokenRemainQuota(t, task.PrivateData.TokenId))
+	require.NoError(t, model.DB.First(&submission, "task_id = ?", task.TaskID).Error)
+	assert.Equal(t, model.SubmissionComplete, submission.Phase)
+	assert.Empty(t, submission.CompletionBilling)
+	assert.Empty(t, submission.Error)
+}
+
+func testDurableCompletionRefund(t *testing.T) {
+	for _, path := range []string{"single", "batch", "timeout"} {
+		t.Run(path, func(t *testing.T) {
+			task, channel := durableCompletionFixture(t)
+			failFunding := true
+			require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("completion_test_failure", func(tx *gorm.DB) {
+				if failFunding && tx.Statement.Table == model.DB.NamingStrategy.TableName("users") {
+					tx.AddError(errors.New("injected funding update failure"))
+				}
+			}))
+			t.Cleanup(func() { assert.NoError(t, model.DB.Callback().Update().Remove("completion_test_failure")) })
+			switch path {
+			case "single":
+				require.NoError(t, updateVideoSingleTask(t.Context(), &scriptedPollingAdaptor{statusCode: http.StatusNotFound}, channel, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+			case "batch":
+				adaptor := &scriptedBatchPollingAdaptor{results: map[string]*BatchTaskResult{task.GetUpstreamTaskID(): {TaskInfo: relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "provider failed"}}}}
+				require.NoError(t, updateBatchTasks(t.Context(), adaptor, channel.Id, []string{task.GetUpstreamTaskID()}, map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+			case "timeout":
+				oldTimeout := constant.TaskTimeoutMinutes
+				constant.TaskTimeoutMinutes = 1
+				t.Cleanup(func() { constant.TaskTimeoutMinutes = oldTimeout })
+				require.NoError(t, model.DB.Model(task).Update("submit_time", time.Now().Unix()-120).Error)
+				sweepTimedOutTasks(t.Context())
+			}
+			var persisted model.Task
+			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+			assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), persisted.Status)
+			reason := persisted.FailReason
+			assert.NotEmpty(t, reason)
+			assert.Equal(t, 60, persisted.Quota)
+			var submission model.TaskSubmission
+			require.NoError(t, model.DB.First(&submission, "task_id = ?", task.TaskID).Error)
+			assert.Equal(t, model.SubmissionCompleting, submission.Phase)
+			failFunding = false
+			require.NoError(t, model.DB.Model(&submission).Update("next_attempt", 0).Error)
+			for range 2 {
+				require.NoError(t, RecoverDurableTaskCompletions(t.Context()))
+			}
+			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+			assert.Equal(t, reason, persisted.FailReason)
+			assert.Zero(t, persisted.Quota)
+			assert.Equal(t, 200, getUserQuota(t, task.UserId))
+			assert.Equal(t, 200, getTokenRemainQuota(t, task.PrivateData.TokenId))
+		})
+	}
+}
+
+func testDurableCompletionManualRefund(t *testing.T) {
+	task, _ := durableCompletionFixture(t)
+	from := task.Status
+	task.Status = model.TaskStatusSuccess
+	won, err := updateTaskWithCompletion(t.Context(), nil, task, from, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, UsageFacts: map[string]any{"units": float64(250)}})
+	require.NoError(t, err)
+	require.True(t, won)
+	var stale model.TaskSubmission
+	require.NoError(t, model.DB.First(&stale, "task_id = ?", task.TaskID).Error)
+	require.True(t, RefundTaskQuota(t.Context(), task, "administrator refund"))
+	// A worker that already read the previous intent cannot recharge a refund.
+	require.NoError(t, applyDurableTaskCompletion(t.Context(), task, &stale))
+	require.NoError(t, RecoverDurableTaskCompletions(t.Context()))
+	assert.Equal(t, 200, getUserQuota(t, task.UserId))
+	assert.Equal(t, 200, getTokenRemainQuota(t, task.PrivateData.TokenId))
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Zero(t, persisted.Quota)
 }

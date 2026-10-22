@@ -582,6 +582,15 @@ func executeTaskSubmissionWith(
 
 		stage = "submit"
 		result, taskErr = submit(c, relayInfo)
+		if taskErr != nil && taskErr.Code == "asset_task_queued" {
+			if queued, exists := c.Get(service.ContextQueuedAssetTask); exists {
+				if task, ok := queued.(*model.Task); ok {
+					durable = true
+					return &taskSubmissionOutcome{Task: task, RelayInfo: relayInfo}, nil
+				}
+			}
+			return nil, taskErr
+		}
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
@@ -745,6 +754,10 @@ func executeTaskSubmissionWith(
 }
 
 func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
+	if c.GetBool("ark_video") {
+		c.JSON(http.StatusOK, arkTaskView(outcome.Task))
+		return
+	}
 	diagnostics := newTaskPluginSubmitDiagnostics(c)
 	otherRatios := outcome.RelayInfo.PriceData.OtherRatios()
 	if otherRatios == nil {

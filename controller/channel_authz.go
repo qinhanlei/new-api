@@ -9,6 +9,9 @@ func channelHasSensitiveChanges(channel *PatchChannel, origin *model.Channel, re
 	if _, ok := requestData["key"]; ok && channel.Key != "" && channel.Key != origin.Key {
 		return true
 	}
+	if _, ok := requestData["asset_credentials"]; ok && channel.AssetCredentials != nil {
+		return true
+	}
 	if _, ok := requestData["base_url"]; ok && !equalStringPtr(channel.BaseURL, origin.BaseURL) {
 		return true
 	}
@@ -63,6 +66,7 @@ func channelHasSensitiveChanges(channel *PatchChannel, origin *model.Channel, re
 var channelSensitiveFields = map[string]struct{}{
 	"type":                {},
 	"key":                 {},
+	"asset_credentials":   {},
 	"base_url":            {},
 	"openai_organization": {},
 	"header_override":     {},
@@ -82,12 +86,13 @@ var channelOperationalFields = map[string]struct{}{
 // channelReadOnlyFields lists server-managed/accounting fields that the general
 // channel edit endpoint must ignore even if a client sends them.
 var channelReadOnlyFields = map[string]struct{}{
-	"created_time":         {},
-	"test_time":            {},
-	"response_time":        {},
-	"balance":              {},
-	"balance_updated_time": {},
-	"used_quota":           {},
+	"asset_credentials_configured": {},
+	"created_time":                 {},
+	"test_time":                    {},
+	"response_time":                {},
+	"balance":                      {},
+	"balance_updated_time":         {},
+	"used_quota":                   {},
 }
 
 func clearChannelReadOnlyFields(channel *PatchChannel, requestData map[string]any) {

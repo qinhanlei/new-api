@@ -1250,7 +1250,7 @@ func ValidateAccessToken(token string) (*User, error) {
 
 // GetUserQuota gets quota from Redis first, falls back to DB if needed
 func GetUserQuota(id int, fromDB bool) (quota int, err error) {
-	if !fromDB && common.RedisEnabled {
+	if !fromDB && common.RedisEnabled && !common.AssetLibraryEnabled {
 		return getUserQuotaCache(id)
 	}
 	err = DB.Model(&User{}).Where("id = ?", id).Select("quota").Find(&quota).Error
@@ -1344,7 +1344,7 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 	if err := common.ValidateWalletQuota(quota); err != nil {
 		return err
 	}
-	if !db && common.BatchUpdateEnabled {
+	if !db && common.BatchUpdateEnabled && !common.AssetLibraryEnabled {
 		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
 		gopool.Go(func() {
 			if err := cacheIncrUserQuota(id, int64(quota)); err != nil {
@@ -1394,7 +1394,7 @@ func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 			common.SysLog(common.LogText("failed to decrease user quota: %s", err.Error()))
 		}
 	})
-	if !db && common.BatchUpdateEnabled {
+	if !db && common.BatchUpdateEnabled && !common.AssetLibraryEnabled {
 		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
 		return nil
 	}

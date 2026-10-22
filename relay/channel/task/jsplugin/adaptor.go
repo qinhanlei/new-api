@@ -138,6 +138,9 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 					if _, forbidden := resolved["renderer"]; forbidden {
 						return service.TaskErrorWrapperLocal(fmt.Errorf("decoder must not return renderer"), "plugin_request_invalid", http.StatusBadRequest)
 					}
+					if err := service.SetTaskAssetIntent(c, resolved["assetRefs"]); err != nil {
+						return service.TaskErrorWrapperLocal(err, "invalid_asset_reference", http.StatusBadRequest)
+					}
 					if body, present := resolved["requestBody"]; present {
 						c.Set("task_request", body)
 					}
@@ -159,10 +162,13 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 	}
 	request, hasRequest := c.Get("task_request")
 	hasUsageProfiles := len(a.plugin.Meta.UsageProfiles) > 0
-	if hasRequest && !hasUsageProfiles {
-		if err := a.validateResolvedUsageRequest(request); err != nil {
+	if hasRequest && (!hasUsageProfiles || len(c.GetStringSlice(service.ContextTaskAssetRefs)) > 0) {
+		if err := a.validateResolvedUsageRequest(request, info.UpstreamModelName, info.OriginModelName); err != nil {
 			return service.TaskErrorWrapperLocal(err, "plugin_usage_invalid", http.StatusBadRequest)
 		}
+	}
+	if taskErr := service.PrepareTaskAssets(c, info); taskErr != nil {
+		return taskErr
 	}
 	if _, err := a.buildSubmit(c, info); err != nil {
 		// utils.fetch failures in the build hook name the host fetched: the
@@ -1634,6 +1640,12 @@ func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo)
 		ctx["originTasks"] = originTasks
 	}
 	ctx["publicTaskId"] = info.PublicTaskID
+	if c != nil {
+		if assets, exists := c.Get(service.ContextResolvedAssets); exists {
+			ctx["resolvedAssets"] = assets
+		}
+		ctx["managedAssets"] = common.AssetLibraryEnabled
+	}
 	ctx["model"] = info.OriginModelName
 	ctx["upstreamModel"] = info.UpstreamModelName
 	ctx["baseUrl"] = info.ChannelBaseUrl

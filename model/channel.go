@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"strings"
 	"sync"
 
@@ -21,25 +22,26 @@ import (
 )
 
 type Channel struct {
-	Id                 int     `json:"id"`
-	Type               int     `json:"type" gorm:"default:0"`
-	Key                string  `json:"key" gorm:"not null"`
-	OpenAIOrganization *string `json:"openai_organization"`
-	TestModel          *string `json:"test_model"`
-	Status             int     `json:"status" gorm:"default:1"`
-	Name               string  `json:"name" gorm:"index"`
-	Weight             *uint   `json:"weight" gorm:"default:0"`
-	CreatedTime        int64   `json:"created_time" gorm:"bigint"`
-	TestTime           int64   `json:"test_time" gorm:"bigint"`
-	ResponseTime       int     `json:"response_time"` // in milliseconds
-	BaseURL            *string `json:"base_url" gorm:"column:base_url;default:''"`
-	Other              string  `json:"other"`
-	Balance            float64 `json:"balance"` // in USD
-	BalanceUpdatedTime int64   `json:"balance_updated_time" gorm:"bigint"`
-	Models             string  `json:"models"`
-	Group              string  `json:"group" gorm:"type:varchar(64);default:'default'"`
-	UsedQuota          int64   `json:"used_quota" gorm:"bigint;default:0"`
-	ModelMapping       *string `json:"model_mapping" gorm:"type:text"`
+	Id                 int                      `json:"id"`
+	Type               int                      `json:"type" gorm:"default:0"`
+	Key                string                   `json:"key" gorm:"not null"`
+	AssetCredentials   *ChannelAssetCredentials `json:"asset_credentials,omitempty" gorm:"serializer:json;type:text"`
+	OpenAIOrganization *string                  `json:"openai_organization"`
+	TestModel          *string                  `json:"test_model"`
+	Status             int                      `json:"status" gorm:"default:1"`
+	Name               string                   `json:"name" gorm:"index"`
+	Weight             *uint                    `json:"weight" gorm:"default:0"`
+	CreatedTime        int64                    `json:"created_time" gorm:"bigint"`
+	TestTime           int64                    `json:"test_time" gorm:"bigint"`
+	ResponseTime       int                      `json:"response_time"` // in milliseconds
+	BaseURL            *string                  `json:"base_url" gorm:"column:base_url;default:''"`
+	Other              string                   `json:"other"`
+	Balance            float64                  `json:"balance"` // in USD
+	BalanceUpdatedTime int64                    `json:"balance_updated_time" gorm:"bigint"`
+	Models             string                   `json:"models"`
+	Group              string                   `json:"group" gorm:"type:varchar(64);default:'default'"`
+	UsedQuota          int64                    `json:"used_quota" gorm:"bigint;default:0"`
+	ModelMapping       *string                  `json:"model_mapping" gorm:"type:text"`
 	//MaxInputTokens     *int    `json:"max_input_tokens" gorm:"default:0"`
 	StatusCodeMapping *string `json:"status_code_mapping" gorm:"type:varchar(1024);default:''"`
 	Priority          *int64  `json:"priority" gorm:"bigint;default:0"`
@@ -56,7 +58,8 @@ type Channel struct {
 	OtherSettings string `json:"settings" gorm:"column:settings"` // 其他设置，存储azure版本等不需要检索的信息，详见dto.ChannelOtherSettings
 
 	// cache info
-	Keys []string `json:"-" gorm:"-"`
+	Keys                      []string `json:"-" gorm:"-"`
+	assetCredentialValidation [32]byte
 }
 
 const ChannelStatusReasonAllKeysDisabled = "All keys are disabled"
@@ -355,7 +358,21 @@ func (channel *Channel) GetAutoBan() bool {
 }
 
 func (channel *Channel) Save() error {
-	return DB.Save(channel).Error
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var original Channel
+		if err := lockForUpdate(tx).First(&original, channel.Id).Error; err != nil {
+			return err
+		}
+		if err := channel.guardAssetUpdate(tx, &original, true); err != nil {
+			return err
+		}
+		if channel.Status == common.ChannelStatusEnabled {
+			if err := guardChannelAssetEnable(tx, []int{channel.Id}); err != nil {
+				return err
+			}
+		}
+		return tx.Save(channel).Error
+	})
 }
 
 // saveStatusState persists only the fields owned by the channel status flow.
@@ -372,7 +389,14 @@ func (channel *Channel) saveStatusState() error {
 	if channel.ChannelInfo.IsMultiKey {
 		updates["channel_info"] = channel.ChannelInfo
 	}
-	return DB.Model(&Channel{}).Where("id = ?", channel.Id).Updates(updates).Error
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if channel.Status == common.ChannelStatusEnabled {
+			if err := guardChannelAssetEnable(tx, []int{channel.Id}); err != nil {
+				return err
+			}
+		}
+		return tx.Model(&Channel{}).Where("id = ?", channel.Id).Updates(updates).Error
+	})
 }
 
 func GetAllChannels(startIdx int, num int, selectAll bool, idSort bool, sortOptions ...ChannelSortOptions) ([]*Channel, error) {
@@ -469,6 +493,12 @@ func BatchInsertChannels(channels []Channel) error {
 	}()
 
 	for _, chunk := range lo.Chunk(channels, 50) {
+		for i := range chunk {
+			if err := chunk[i].ValidateAssetSettings(); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
 		if err := tx.Create(&chunk).Error; err != nil {
 			tx.Rollback()
 			return err
@@ -484,31 +514,36 @@ func BatchInsertChannels(channels []Channel) error {
 }
 
 func BatchDeleteChannels(ids []int) (int64, error) {
-	if len(ids) == 0 {
-		return 0, nil
+	var count int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		count, err = deleteChannelRecords(tx, ids)
+		return err
+	})
+	if err != nil {
+		return 0, err
 	}
-	// 使用事务 分批删除channel表和abilities表
-	tx := DB.Begin()
-	if tx.Error != nil {
-		return 0, tx.Error
-	}
-	var deletedCount int64
+	return count, nil
+}
+
+func deleteChannelRecords(tx *gorm.DB, ids []int) (int64, error) {
+	ids = slices.Clone(ids)
+	slices.Sort(ids)
+	var count int64
 	for _, chunk := range lo.Chunk(ids, 200) {
-		result := tx.Where("id in (?)", chunk).Delete(&Channel{})
+		if err := guardChannelAssetDeletion(tx, chunk); err != nil {
+			return 0, err
+		}
+		result := tx.Where("id IN ?", chunk).Delete(&Channel{})
 		if result.Error != nil {
-			tx.Rollback()
 			return 0, result.Error
 		}
-		deletedCount += result.RowsAffected
-		if err := tx.Where("channel_id in (?)", chunk).Delete(&Ability{}).Error; err != nil {
-			tx.Rollback()
+		count += result.RowsAffected
+		if err := tx.Where("channel_id IN ?", chunk).Delete(&Ability{}).Error; err != nil {
 			return 0, err
 		}
 	}
-	if err := tx.Commit().Error; err != nil {
-		return 0, err
-	}
-	return deletedCount, nil
+	return count, nil
 }
 
 func (channel *Channel) GetPriority() int64 {
@@ -551,6 +586,9 @@ func (channel *Channel) GetStatusCodeMapping() string {
 }
 
 func (channel *Channel) Insert() error {
+	if err := channel.ValidateAssetSettings(); err != nil {
+		return err
+	}
 	var err error
 	err = DB.Create(channel).Error
 	if err != nil {
@@ -599,14 +637,27 @@ func (channel *Channel) Update() error {
 			}
 		}
 	}
-	var err error
-	err = DB.Model(channel).Updates(channel).Error
-	if err != nil {
-		return err
-	}
-	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
-	return err
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var original Channel
+		if err := lockForUpdate(tx).First(&original, channel.Id).Error; err != nil {
+			return err
+		}
+		if err := channel.guardAssetUpdate(tx, &original, false); err != nil {
+			return err
+		}
+		if channel.Status == common.ChannelStatusEnabled {
+			if err := guardChannelAssetEnable(tx, []int{channel.Id}); err != nil {
+				return err
+			}
+		}
+		if err := tx.Model(channel).Updates(channel).Error; err != nil {
+			return err
+		}
+		if err := tx.First(channel, channel.Id).Error; err != nil {
+			return err
+		}
+		return channel.UpdateAbilities(tx)
+	})
 }
 
 func (channel *Channel) UpdateResponseTime(responseTime int64) {
@@ -630,12 +681,7 @@ func (channel *Channel) UpdateBalance(balance float64) {
 }
 
 func (channel *Channel) Delete() error {
-	var err error
-	err = DB.Delete(channel).Error
-	if err != nil {
-		return err
-	}
-	err = channel.DeleteAbilities()
+	_, err := BatchDeleteChannels([]int{channel.Id})
 	return err
 }
 
@@ -814,6 +860,10 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 		}
 		err = channel.saveStatusState()
 		if err != nil {
+			shouldUpdateAbilities = false
+			if common.MemoryCacheEnabled {
+				InitChannelCache()
+			}
 			common.SysLog(common.LogText("failed to update channel status: channel_id=%d, status=%d, error=%v", channel.Id, status, err))
 			return false
 		}
@@ -822,12 +872,19 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 }
 
 func EnableChannelByTag(tag string) error {
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Update("status", common.ChannelStatusEnabled).Error
-	if err != nil {
-		return err
-	}
-	err = UpdateAbilityStatusByTag(tag, true)
-	return err
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var ids []int
+		if err := tx.Model(&Channel{}).Where("tag = ?", tag).Pluck("id", &ids).Error; err != nil {
+			return err
+		}
+		if err := guardChannelAssetEnable(tx, ids); err != nil {
+			return err
+		}
+		if err := tx.Model(&Channel{}).Where("id IN ?", ids).Update("status", common.ChannelStatusEnabled).Error; err != nil {
+			return err
+		}
+		return tx.Model(&Ability{}).Where("channel_id IN ?", ids).Update("enabled", true).Error
+	})
 }
 
 func DisableChannelByTag(tag string) error {
@@ -885,7 +942,27 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 		updateData.HeaderOverride = headerOverride
 	}
 
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		query := tx.Model(&Channel{}).Where("tag = ?", tag)
+		if headerOverride != nil {
+			var channels []Channel
+			if err := lockForUpdate(tx).Where("tag = ?", tag).Order("id").Find(&channels).Error; err != nil {
+				return err
+			}
+			ids := make([]int, 0, len(channels))
+			for _, channel := range channels {
+				update := Channel{Id: channel.Id, HeaderOverride: headerOverride, ChannelInfo: channel.ChannelInfo}
+				if err := update.guardAssetUpdate(tx, &channel, false); err != nil {
+					return err
+				}
+				ids = append(ids, channel.Id)
+			}
+			// Only mutate the locked, checked set. A concurrent tag change must
+			// not add an unchecked channel to the bulk credential update.
+			query = tx.Model(&Channel{}).Where("id IN ?", ids)
+		}
+		return query.Updates(updateData).Error
+	})
 	if err != nil {
 		return err
 	}
@@ -924,13 +1001,32 @@ func updateChannelUsedQuota(id int, quota int) {
 }
 
 func DeleteChannelByStatus(status int64) (int64, error) {
-	result := DB.Where("status = ?", status).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return deleteChannelsByStatuses([]int64{status})
 }
 
 func DeleteDisabledChannel() (int64, error) {
-	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return deleteChannelsByStatuses([]int64{common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled})
+}
+
+func deleteChannelsByStatuses(statuses []int64) (int64, error) {
+	var count int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var channels []Channel
+		if err := lockForUpdate(tx).Select("id").Where("status IN ?", statuses).Order("id").Find(&channels).Error; err != nil {
+			return err
+		}
+		ids := make([]int, 0, len(channels))
+		for _, channel := range channels {
+			ids = append(ids, channel.Id)
+		}
+		var err error
+		count, err = deleteChannelRecords(tx, ids)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func GetPaginatedTags(offset int, limit int) ([]*string, error) {

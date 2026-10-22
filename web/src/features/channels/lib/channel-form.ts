@@ -31,7 +31,7 @@ import {
   MODEL_FETCHABLE_TYPES,
   OPENAI_FIELD_PASSTHROUGH_TYPES,
 } from '../constants'
-import type { Channel } from '../types'
+import type { Channel, ChannelWrite } from '../types'
 import {
   CHANNEL_TYPE_ADVANCED_CUSTOM,
   advancedCustomConfigUsesRelativeUpstreamPath,
@@ -202,6 +202,72 @@ function addRequiredIssue(
   })
 }
 
+export function supportsChannelAssets(channel: {
+  type: number
+  task_plugin_key?: string
+  task_extend_plugin_keys?: string[]
+}): boolean {
+  return (
+    channel.type === 54 ||
+    (channel.type === CHANNEL_TYPE_TASK_PLUGIN &&
+      channel.task_plugin_key === 'doubao') ||
+    (channel.type === CHANNEL_TYPE_NEW_API &&
+      channel.task_extend_plugin_keys?.includes('doubao') === true)
+  )
+}
+
+const channelAssetSettingsSchema = z
+  .object({
+    asset_endpoint: z
+      .string()
+      .trim()
+      .max(512)
+      .optional()
+      .refine((value) => {
+        if (!value) return true
+        try {
+          const url = new URL(value)
+          return (
+            url.protocol === 'https:' &&
+            !url.username &&
+            !url.password &&
+            !url.hash &&
+            !url.search
+          )
+        } catch {
+          return false
+        }
+      }, 'Enter a valid HTTPS URL'),
+    asset_project: z.string().trim().max(255).optional(),
+    asset_auth_mode: z.enum(['channel', 'aksk']).optional(),
+    asset_access_key: z.string().trim().max(1024).optional(),
+    asset_secret_key: z.string().trim().max(4096).optional(),
+    asset_credentials_configured: z.boolean().optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (
+      data.asset_auth_mode === 'aksk' &&
+      (!data.asset_credentials_configured ||
+        data.asset_access_key ||
+        data.asset_secret_key)
+    ) {
+      if (!data.asset_access_key) {
+        addRequiredIssue(
+          ctx,
+          'asset_access_key',
+          'Enter both access key and secret key'
+        )
+      }
+      if (!data.asset_secret_key) {
+        addRequiredIssue(
+          ctx,
+          'asset_secret_key',
+          'Enter both access key and secret key'
+        )
+      }
+    }
+  })
+
 export const channelFormSchema = z
   .object({
     name: z.string().min(1, ERROR_MESSAGES.REQUIRED_NAME),
@@ -262,6 +328,12 @@ export const channelFormSchema = z
     key_mode: z.enum(['append', 'replace']).optional(), // For editing multi-key channels
     // Channel extra settings (stored in setting JSON, not sent directly)
     force_format: z.boolean().optional(),
+    asset_endpoint: z.string().trim().optional(),
+    asset_project: z.string().trim().optional(),
+    asset_auth_mode: z.enum(['channel', 'aksk']).optional(),
+    asset_access_key: z.string().trim().optional(),
+    asset_secret_key: z.string().trim().optional(),
+    asset_credentials_configured: z.boolean().optional(),
     thinking_to_content: z.boolean().optional(),
     proxy: z
       .string()
@@ -297,6 +369,14 @@ export const channelFormSchema = z
     upstream_model_update_ignored_models: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    if (supportsChannelAssets(data)) {
+      const assetSettings = channelAssetSettingsSchema.safeParse(data)
+      if (!assetSettings.success) {
+        for (const issue of assetSettings.error.issues) {
+          ctx.addIssue({ ...issue })
+        }
+      }
+    }
     if (
       [
         3,
@@ -459,6 +539,12 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   key_mode: 'append',
   // Channel extra settings
   force_format: false,
+  asset_endpoint: '',
+  asset_project: '',
+  asset_auth_mode: 'channel',
+  asset_access_key: '',
+  asset_secret_key: '',
+  asset_credentials_configured: false,
   thinking_to_content: false,
   proxy: '',
   http_protocol: HTTP_PROTOCOL_AUTO,
@@ -506,6 +592,8 @@ export function transformChannelToFormDefaults(
     task_plugin_key: '',
     task_extend_plugin_keys: [] as string[],
     force_format: false,
+    asset_endpoint: '',
+    asset_project: '',
     thinking_to_content: false,
     proxy: '',
     http_protocol: HTTP_PROTOCOL_AUTO as 'auto' | 'http1',
@@ -528,6 +616,12 @@ export function transformChannelToFormDefaults(
         task_plugin_key: parsed.task_plugin_key || '',
         task_extend_plugin_keys: readTaskExtendPluginKeys(channel.type, parsed),
         force_format: parsed.force_format || false,
+        asset_endpoint:
+          typeof parsed.asset_endpoint === 'string'
+            ? parsed.asset_endpoint
+            : '',
+        asset_project:
+          typeof parsed.asset_project === 'string' ? parsed.asset_project : '',
         thinking_to_content: parsed.thinking_to_content || false,
         proxy: parsed.proxy || '',
         http_protocol: protocol,
@@ -607,6 +701,10 @@ export function transformChannelToFormDefaults(
     type: channel.type,
     base_url: channel.base_url || '',
     key: '', // Never populate key from backend for security
+    asset_auth_mode: channel.asset_credentials_configured ? 'aksk' : 'channel',
+    asset_access_key: '',
+    asset_secret_key: '',
+    asset_credentials_configured: channel.asset_credentials_configured === true,
     openai_organization: channel.openai_organization || '',
     models: channel.models || '',
     group: parseGroups(channel.group || 'default'),
@@ -657,6 +755,7 @@ export function transformChannelToFormDefaults(
  * Build the setting JSON string from form extra settings
  */
 export function buildSettingJSON(formData: ChannelFormValues): string {
+  const supportsAssets = supportsChannelAssets(formData)
   const settingObj: Record<string, unknown> = {
     task_plugin_key:
       formData.type === CHANNEL_TYPE_TASK_PLUGIN
@@ -668,6 +767,12 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
         ? formData.task_extend_plugin_keys
         : undefined,
     force_format: formData.force_format || false,
+    asset_endpoint: supportsAssets
+      ? formData.asset_endpoint?.trim() || undefined
+      : undefined,
+    asset_project: supportsAssets
+      ? formData.asset_project?.trim() || undefined
+      : undefined,
     thinking_to_content: formData.thinking_to_content || false,
     proxy: formData.proxy?.trim() || '',
     pass_through_body_enabled:
@@ -852,6 +957,24 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
   return JSON.stringify(settingsObj)
 }
 
+function buildAssetCredentials(
+  formData: ChannelFormValues
+): ChannelWrite['asset_credentials'] {
+  if (
+    !supportsChannelAssets(formData) ||
+    formData.asset_auth_mode === 'channel'
+  ) {
+    return formData.asset_credentials_configured ? {} : undefined
+  }
+  if (formData.asset_access_key?.trim() && formData.asset_secret_key?.trim()) {
+    return {
+      access_key: formData.asset_access_key.trim(),
+      secret_key: formData.asset_secret_key.trim(),
+    }
+  }
+  return undefined
+}
+
 function normalizeBaseUrl(value: string | undefined): string {
   return String(value || '')
     .trim()
@@ -865,15 +988,16 @@ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
   mode: 'single' | 'batch' | 'multi_to_single'
   multi_key_mode?: 'random' | 'polling'
   batch_add_set_key_prefix_2_name?: boolean
-  channel: Partial<Channel>
+  channel: ChannelWrite
 } {
   const mode = formData.multi_key_mode || 'single'
 
-  const channel: Partial<Channel> = {
+  const channel: ChannelWrite = {
     name: formData.name,
     type: formData.type,
     base_url: normalizeBaseUrl(formData.base_url) || null,
     key: formData.key,
+    asset_credentials: buildAssetCredentials(formData),
     openai_organization: formData.openai_organization || null,
     models: formData.models,
     group: formatGroups(formData.group),
@@ -916,9 +1040,10 @@ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
 export function transformFormDataToUpdatePayload(
   formData: ChannelFormValues,
   channelId: number
-): Partial<Channel> {
-  const payload: Partial<Channel> = {
+): ChannelWrite {
+  const payload: ChannelWrite = {
     id: channelId,
+    asset_credentials: buildAssetCredentials(formData),
     name: formData.name,
     type: formData.type,
     base_url: normalizeBaseUrl(formData.base_url) || null,

@@ -334,6 +334,9 @@ func InitResources() error {
 		}
 	}
 	model.InitOptionMap()
+	if err := service.InitAssetStorage(); err != nil {
+		return fmt.Errorf("failed to initialize asset storage: %w", err)
+	}
 
 	// 清理旧的磁盘缓存文件
 	common.CleanupOldCacheFiles()

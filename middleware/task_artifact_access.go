@@ -76,6 +76,13 @@ func (l *taskArtifactAccessLimiter) invalidAttempt(now time.Time, ip string) boo
 	return true
 }
 
+func (l *taskArtifactAccessLimiter) invalidRateExceeded(now time.Time, ip string) bool {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+	rate := l.rates[ip]
+	return now.Sub(rate.windowStart) < taskArtifactAccessRateWindow && rate.count >= l.limits.InvalidRatePerMinute
+}
+
 func (l *taskArtifactAccessLimiter) acquire(ip, taskID, artifactKey string) (func(), bool) {
 	l.mutex.Lock()
 	defer l.mutex.Unlock()
@@ -116,7 +123,9 @@ func redactTaskArtifactAccessQuery() gin.HandlerFunc {
 			strings.HasSuffix(path, "/content")
 		isLegacyVideoContent := strings.HasPrefix(path, "/v1/videos/") &&
 			strings.HasSuffix(path, "/content")
-		if !isArtifactContent && !isLegacyVideoContent {
+		isAssetContent := strings.HasPrefix(path, "/v1/assets/") &&
+			strings.HasSuffix(path, "/content")
+		if !isArtifactContent && !isLegacyVideoContent && !isAssetContent {
 			c.Next()
 			return
 		}
@@ -167,6 +176,37 @@ func popTaskArtifactAccessQuery(request *http.Request) (string, bool, bool) {
 	request.URL.RawQuery = strings.Join(kept, "&")
 	request.RequestURI = request.URL.RequestURI()
 	return rawAccess, true, invalid
+}
+
+// LocalAssetContentAccessQuery reads the capability retained before logging.
+// Empty values make malformed or ambiguous queries fail signature verification.
+func LocalAssetContentAccessQuery(c *gin.Context) (expires, access string) {
+	access = c.GetString(taskArtifactAccessRawContextKey)
+	present := c.GetBool(taskArtifactAccessPresentContextKey)
+	invalid := c.GetBool(taskArtifactAccessInvalidContextKey)
+	if queryAccess, queryPresent, queryInvalid := popTaskArtifactAccessQuery(c.Request); queryPresent {
+		invalid = invalid || present || queryInvalid
+		access, present = queryAccess, true
+	}
+	query, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil || !present || invalid || access == "" || len(query) != 1 || len(query["expires"]) != 1 {
+		return "", ""
+	}
+	return query.Get("expires"), access
+}
+
+// AcquireAnonymousContentAccess shares the artifact download concurrency budget
+// and rejects an exhausted invalid-access budget before storage or database I/O.
+// The caller must release it after closing the content, including failure paths.
+func AcquireAnonymousContentAccess(c *gin.Context, objectID, artifactKey string) (func(), bool) {
+	if taskArtifactAnonymousLimiter.invalidRateExceeded(time.Now(), c.ClientIP()) {
+		return nil, false
+	}
+	return taskArtifactAnonymousLimiter.acquire(c.ClientIP(), objectID, artifactKey)
+}
+
+func AllowInvalidContentAccessAttempt(c *gin.Context) bool {
+	return taskArtifactAnonymousLimiter.invalidAttempt(time.Now(), c.ClientIP())
 }
 
 // TokenOrTaskArtifactAccessAuth accepts the normal relay API Bearer token or a

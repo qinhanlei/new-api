@@ -22,6 +22,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	kittypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -228,6 +229,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		if err := helper.ModelMappedHelper(c, info, nil); err != nil {
 			return nil, service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
 		}
+		if value, exists := c.Get(service.ContextTaskSubmission); exists && value.(*model.TaskSubmission).UpstreamModel != info.UpstreamModelName {
+			return nil, service.TaskErrorWrapperLocal(errors.New("channel model mapping changed while preparing assets"), "asset_channel_changed", http.StatusConflict)
+		}
 	}
 	if taskErr := adaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {
 		return nil, taskErr
@@ -335,9 +339,16 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 
 	// 7. 预扣费：首次尝试创建计费会话；重试时会话已存在，换到更贵的渠道要在
 	//    发起上游请求前补足预扣，余额不足就不发请求。
-	if info.Billing != nil || !info.PriceData.FreeModel {
+	_, durableTask := c.Get(service.ContextTaskSubmission)
+	if info.Billing != nil || !info.PriceData.FreeModel || durableTask {
 		info.ForcePreConsume = true
-		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
+		var apiErr *kittypes.NewAPIError
+		if durableTask {
+			apiErr = service.PreConsumeDurableTaskBilling(c, info, info.PriceData.Quota)
+		} else {
+			apiErr = service.PreConsumeBilling(c, info.PriceData.Quota, info)
+		}
+		if apiErr != nil {
 			return nil, service.TaskErrorFromAPIError(apiErr)
 		}
 	}
@@ -349,6 +360,20 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 9. 发送请求
+	if pending, exists := c.Get(service.ContextTaskSubmission); exists {
+		submission := pending.(*model.TaskSubmission)
+		task, found, err := model.GetByTaskId(info.UserId, submission.TaskID)
+		if err != nil || !found {
+			return nil, service.TaskErrorWrapperLocal(errors.New("pending task unavailable"), "task_not_found", http.StatusConflict)
+		}
+		private := task.PrivateData
+		private.NodeName, private.BillingSource, private.SubscriptionId = common.NodeName, info.BillingSource, info.SubscriptionId
+		private.BillingContext = service.TaskBillingContextFromRelayInfo(info)
+		if err := model.MarkTaskSubmissionSending(c.Request.Context(), submission.TaskID, submission.LeaseOwner, private, info.Billing.GetPreConsumedQuota()); err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "task_submission_lease_lost", http.StatusConflict)
+		}
+		c.Set("task_submission_sent", true)
+	}
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError, common.UpstreamAddresses(c)...)
@@ -360,6 +385,10 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	// Any 2xx is a successful submission: task APIs commonly answer 201 Created
 	// or 202 Accepted, and parseSubmitResponse receives the exact status code.
 	if resp.StatusCode/100 != 2 {
+		switch resp.StatusCode {
+		case 400, 401, 403, 404, 405, 413, 415, 422, 429:
+			c.Set("task_submission_rejected", true)
+		}
 		responseBody, _ := io.ReadAll(resp.Body)
 		return nil, service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode, common.UpstreamAddresses(c)...)
 	}

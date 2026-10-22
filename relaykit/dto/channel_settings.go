@@ -12,6 +12,8 @@ import (
 )
 
 type ChannelSettings struct {
+	AssetEndpoint             string `json:"asset_endpoint,omitempty"`
+	AssetProject              string `json:"asset_project,omitempty"`
 	TaskPluginKey             string `json:"task_plugin_key,omitempty"`
 	ForceFormat               bool   `json:"force_format,omitempty"`
 	ThinkingToContent         bool   `json:"thinking_to_content,omitempty"`

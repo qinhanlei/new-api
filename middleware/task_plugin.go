@@ -325,7 +325,17 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 // plugin code. Invalid or unidentifiable ordinary requests deliberately fall
 // through so the existing endpoint remains responsible for its validation.
 func PinTaskPluginEndpoint() gin.HandlerFunc {
+	return PinTaskPluginEndpointForPath("")
+}
+
+// PinTaskPluginEndpointForPath shares selection with a wire-format facade while
+// retaining the actual request path for audit and error reporting.
+func PinTaskPluginEndpointForPath(protocolPath string) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		lookupPath := protocolPath
+		if lookupPath == "" {
+			lookupPath = c.Request.URL.Path
+		}
 		generation := pluginruntime.DefaultRegistry.Generation()
 		if generation == nil {
 			c.Next()
@@ -370,7 +380,7 @@ func PinTaskPluginEndpoint() gin.HandlerFunc {
 				rewriteTo = target.Alias
 			}
 		}
-		binding, found := generation.LookupEndpoint(c.Request.Method, c.Request.URL.Path, lookupModel)
+		binding, found := generation.LookupEndpoint(c.Request.Method, lookupPath, lookupModel)
 		if !found || binding.Plugin == nil {
 			c.Set(contextKeyTaskPluginEndpointModel, *modelRequest)
 			c.Next()
@@ -384,7 +394,7 @@ func PinTaskPluginEndpoint() gin.HandlerFunc {
 		}
 		modelRequest.Model = pinModel
 		c.Set(contextKeyTaskPluginEndpointModel, *modelRequest)
-		candidates := generation.LookupEndpointCandidates(c.Request.Method, c.Request.URL.Path, lookupModel)
+		candidates := generation.LookupEndpointCandidates(c.Request.Method, lookupPath, lookupModel)
 		if len(candidates) == 0 {
 			candidates = []pluginruntime.ProtocolBinding{binding}
 		}
@@ -620,6 +630,7 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 		accepted := make([]pluginruntime.ProtocolBinding, 0, len(candidates))
 		var resolved map[string]any
 		var resolvedBodyText json.RawMessage
+		var managedRefs []string
 		var failures []string
 		rejectedPlugins := make(map[string][]string)
 		for _, candidate := range candidates {
@@ -634,6 +645,7 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 				"protocols", []string{candidate.Protocol, "decodeRequest"}, candidateContext.JSValueFor(candidate.Plugin.Meta),
 			)
 			result, resultOK := resolvedValue.(map[string]any)
+			refs, refsErr := service.ParseTaskAssetReferences(result["assetRefs"])
 			detail := ""
 			reason := ""
 			if callErr != nil {
@@ -654,6 +666,9 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 			} else if model != pinned.Model || (pinned.MappedModel == "" && !slices.Contains(candidate.Plugin.Meta.Models, model)) {
 				reason = "resolved_model_not_owned"
 				detail = fmt.Sprintf("model %q is not served by this plugin", model)
+			} else if refsErr != nil {
+				reason = "invalid_asset_references"
+				detail = refsErr.Error()
 			}
 			if detail != "" {
 				logger.LogWarn(c, common.LogText("task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=parse_request reason=%s err=%q elapsed_ms=%d",
@@ -662,6 +677,15 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 					failures = append(failures, detail)
 				}
 				rejectedPlugins[detail] = append(rejectedPlugins[detail], candidate.Plugin.Meta.Key)
+				continue
+			}
+			// A decoder that ignores managed references must not make the first
+			// distribution miss the asset constraint or change its ownership set.
+			if len(refs) > 0 && len(managedRefs) == 0 {
+				managedRefs = refs
+				accepted = accepted[:0]
+				resolved = nil
+			} else if len(managedRefs) > 0 && !slices.Equal(refs, managedRefs) {
 				continue
 			}
 			accepted = append(accepted, candidate)
@@ -1036,6 +1060,9 @@ func taskPluginLegacyPlatforms(meta pluginruntime.Meta) []constant.TaskPlatform 
 }
 
 func applyOriginTaskIntent(c *gin.Context, intent map[string]any, meta pluginruntime.Meta) *originTaskIntentError {
+	if err := service.SetTaskAssetIntent(c, intent["assetRefs"]); err != nil {
+		return &originTaskIntentError{Code: "invalid_asset_reference", Message: err.Error(), StatusCode: http.StatusBadRequest}
+	}
 	raw, present := intent["originTaskIds"]
 	if !present {
 		return nil

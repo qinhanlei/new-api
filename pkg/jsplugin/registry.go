@@ -2,6 +2,7 @@ package jsplugin
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"maps"
@@ -222,8 +223,9 @@ type UsageFieldSchema struct {
 }
 
 type LoadedPlugin struct {
-	Meta   Meta
-	Engine *Engine
+	Meta       Meta
+	Engine     *Engine
+	SourceHash string
 }
 
 // UsesSubmitEventDelta reports whether SSE submissions go through
@@ -532,7 +534,7 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 			return nil, fmt.Errorf("plugin %s export %q is no longer supported", meta.Key, removed)
 		}
 	}
-	return &LoadedPlugin{Meta: meta, Engine: engine}, nil
+	return &LoadedPlugin{Meta: meta, Engine: engine, SourceHash: fmt.Sprintf("%x", sha256.Sum256([]byte(source)))}, nil
 }
 
 func (r *Registry) Get(platform string) (*LoadedPlugin, bool) {

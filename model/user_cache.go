@@ -89,6 +89,14 @@ func GetUserCache(userId int) (*UserBase, error) {
 	// Try getting from Redis first
 	userCache, err := cacheGetUserBase(userId)
 	if err == nil {
+		if common.AssetLibraryEnabled {
+			// Keep the authentication version fence while reading the authoritative
+			// balance; durable task reservations never mutate cached balances.
+			userCache.Quota, err = GetUserQuota(userId, true)
+			if err != nil {
+				return nil, err
+			}
+		}
 		return userCache, nil
 	}
 

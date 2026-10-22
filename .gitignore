@@ -30,6 +30,7 @@ tiktoken_cache
 electron/node_modules
 electron/dist
 /data/
+/assets/
 .gomodcache/
 .gocache-temp
 .gopath

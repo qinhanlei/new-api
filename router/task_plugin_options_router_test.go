@@ -52,4 +52,15 @@ func TestGetTaskPluginOptionsAdminForbiddenRootAllowed(t *testing.T) {
 			assert.Equal(t, testCase.wantStatus, recorder.Code)
 		})
 	}
+	// Channel asset cleanup and reconciliation have the same sensitive-write
+	// boundary as channel credentials, including for restricted administrators.
+	for _, role := range []int{common.RoleAdminUser, common.RoleRootUser} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/channel/1/assets/cleanup", nil)
+		c.Set("id", role)
+		c.Set("role", role)
+		middleware.RequirePermission(authz.ChannelSensitiveWrite)(c)
+		assert.Equal(t, role == common.RoleAdminUser, c.IsAborted())
+	}
 }

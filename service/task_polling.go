@@ -83,7 +83,7 @@ func sweepTimedOutTasks(ctx context.Context) {
 	timedOutCount := 0
 
 	for _, task := range tasks {
-		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
+		isLegacy := !task.PrivateData.DurableBilling && task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
 
 		oldStatus := task.Status
 		task.Status = model.TaskStatusFailure
@@ -98,7 +98,7 @@ func sweepTimedOutTasks(ctx context.Context) {
 			task.FailReason = reason
 		}
 
-		won, err := task.UpdateWithStatus(oldStatus)
+		won, err := updateTaskWithCompletion(ctx, nil, task, oldStatus, relaycommon.FailTaskInfo(task.FailReason))
 		if err != nil {
 			logger.LogError(ctx, common.LogText("sweepTimedOutTasks CAS update error for task %s: %v", task.TaskID, err))
 			continue
@@ -108,7 +108,9 @@ func sweepTimedOutTasks(ctx context.Context) {
 			continue
 		}
 		timedOutCount++
-		if !isLegacy && task.Quota != 0 {
+		if task.PrivateData.DurableBilling {
+			finalizeTerminalTask(ctx, nil, task, relaycommon.FailTaskInfo(task.FailReason))
+		} else if !isLegacy && task.Quota != 0 {
 			RefundTaskQuota(ctx, task, reason)
 		}
 	}
@@ -169,6 +171,12 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		for _, task := range tasks {
 			upstreamID := task.GetUpstreamTaskID()
 			if upstreamID == "" {
+				if task.PrivateData.DurableBilling {
+					if err := failTaskFromPoll(ctx, nil, task, task.Status, "Upstream task not found"); err != nil {
+						logger.LogWarn(ctx, common.LogText("failed to settle durable task %s: %s", task.TaskID, err.Error()))
+					}
+					continue
+				}
 				// 统计失败的未完成任务
 				nullTaskIds = append(nullTaskIds, task.ID)
 				continue
@@ -250,6 +258,12 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
+				if t.PrivateData.DurableBilling {
+					if err := failTaskFromPoll(ctx, nil, t, t.Status, "Failed to get the channel information. Please contact the administrator"); err != nil {
+						logger.LogWarn(ctx, common.LogText("failed to settle durable task %s: %s", t.TaskID, err.Error()))
+					}
+					continue
+				}
 				failedIDs = append(failedIDs, t.ID)
 			}
 		}
@@ -375,7 +389,13 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
-		won, updateErr := task.UpdateWithStatus(snap.Status)
+		var won bool
+		var updateErr error
+		if terminalTransition {
+			won, updateErr = updateTaskWithCompletion(ctx, adaptor, task, snap.Status, &responseItem.TaskInfo)
+		} else {
+			won, updateErr = task.UpdateWithStatus(snap.Status)
+		}
 		if updateErr != nil {
 			common.SysLog(common.LogText("UpdateSunoTask task error: %s", updateErr.Error()))
 			continue
@@ -436,6 +456,12 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
+				if t.PrivateData.DurableBilling {
+					if err := failTaskFromPoll(ctx, nil, t, t.Status, "Failed to get the channel information. Please contact the administrator"); err != nil {
+						logger.LogWarn(ctx, common.LogText("failed to settle durable task %s: %s", t.TaskID, err.Error()))
+					}
+					continue
+				}
 				failedIDs = append(failedIDs, t.ID)
 			}
 		}
@@ -612,7 +638,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 	if isDone && snap.Status != task.Status {
-		won, err := task.UpdateWithStatus(snap.Status)
+		won, err := updateTaskWithCompletion(ctx, adaptor, task, snap.Status, taskResult)
 		if err != nil {
 			logger.LogError(ctx, common.LogText("UpdateWithStatus failed for task %s: %s", task.TaskID, err.Error()))
 			shouldFinalizeBilling = false
@@ -639,6 +665,12 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 // finalizeTerminalTask 终态统一收尾（状态 CAS 赢家调用，恰好一次）：采样 + 结算 + 失败兜底退款。
 func finalizeTerminalTask(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) {
 	perfmetrics.RecordTaskResult(task, taskResult)
+	if task.PrivateData.DurableBilling {
+		if err := finishDurableTaskCompletion(ctx, task); err != nil {
+			logger.LogWarn(ctx, common.LogText("failed to settle durable task %s: %s", task.TaskID, err.Error()))
+		}
+		return
+	}
 	billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
 	if task.Status == model.TaskStatusFailure && !billingSettled && task.Quota != 0 {
 		RefundTaskQuota(ctx, task, task.FailReason)
@@ -685,33 +717,41 @@ func truncateBase64(s string) string {
 //
 // 表达式求值失败会保留预扣额度，因此也视为已接管，避免错误全退。
 func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) bool {
+	billing, handled := taskCompletionBillingPlan(ctx, adaptor, task, taskResult)
+	if billing.Operation == model.TaskReservationRecalculate {
+		RecalculateTaskQuota(ctx, task, billing.Quota, billing.Reason, billing.Clamps...)
+	}
+	return handled
+}
+
+func taskCompletionBillingPlan(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) (taskCompletionBilling, bool) {
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.TieredSnapshot != nil {
 		// 用量表达式结算只适用于成功任务；失败任务由调用方全额退款。
 		if task.Status == model.TaskStatusFailure {
-			return false
+			return taskCompletionBilling{}, false
 		}
 		result, usageFacts, err := EvaluateTaskCompletionUsage(bc.TieredSnapshot, taskResult.UsageFacts)
 		if err != nil {
 			logger.LogWarn(ctx, common.LogText("task %s expression settlement failed, keeping the pre-consumed quota: %v", task.TaskID, err))
-			return true
+			return taskCompletionBilling{}, true
 		}
 		if result.Clamp != nil {
 			logger.LogWarn(ctx, common.LogText("task %s expression settlement quota was clamped: %+v", task.TaskID, result.Clamp))
 		}
 		bc.TieredSnapshot.UsageFacts = usageFacts
 		bc.TieredSnapshot.EstimatedTier = result.MatchedTier
-		RecalculateTaskQuota(ctx, task, result.ActualQuotaAfterGroup, common.NewMessage("Settled by the task usage expression"), result.Clamp)
-		return true
+		return taskCompletionBilling{Operation: model.TaskReservationRecalculate, Quota: result.ActualQuotaAfterGroup, Reason: common.NewMessage("Settled by the task usage expression"), Clamps: []*common.QuotaClamp{result.Clamp}}, true
 	}
 	// 按次计费的成功任务保持预扣；失败任务由调用方全额退款。
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.PerCallBilling {
 		logger.LogInfo(ctx, common.LogText("task %s is billed per request, skipping difference settlement", task.TaskID))
-		return false
+		return taskCompletionBilling{}, false
 	}
 	// 优先让 adaptor 决定最终额度。
-	if actualQuota := adaptor.AdjustBillingOnComplete(task, taskResult); actualQuota > 0 {
-		RecalculateTaskQuota(ctx, task, actualQuota, common.NewMessage("Adjusted by the channel adaptor"))
-		return true
+	if adaptor != nil {
+		if actualQuota := adaptor.AdjustBillingOnComplete(task, taskResult); actualQuota > 0 {
+			return taskCompletionBilling{Operation: model.TaskReservationRecalculate, Quota: actualQuota, Reason: common.NewMessage("Adjusted by the channel adaptor")}, true
+		}
 	}
 	// 回退到 token 重算。
 	tokens := taskResult.TotalTokens
@@ -719,9 +759,12 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		tokens = taskResult.CompletionTokens
 	}
 	if tokens > 0 {
-		return RecalculateTaskQuotaByTokens(ctx, task, tokens)
+		quota, reason, clamp, ok := taskQuotaByTokens(task, tokens)
+		if ok {
+			return taskCompletionBilling{Operation: model.TaskReservationRecalculate, Quota: quota, Reason: reason, Clamps: []*common.QuotaClamp{clamp}}, true
+		}
 	}
-	return false
+	return taskCompletionBilling{}, false
 }
 
 func classifyPollHTTP(statusCode int) string {
@@ -815,7 +858,7 @@ func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *mod
 		task.FinishTime = now
 	}
 	task.FailReason = reason
-	won, err := task.UpdateWithStatus(fromStatus)
+	won, err := updateTaskWithCompletion(ctx, adaptor, task, fromStatus, relaycommon.FailTaskInfo(reason))
 	if err != nil {
 		return err
 	}

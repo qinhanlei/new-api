@@ -757,6 +757,10 @@ func AddChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if err := addChannelRequest.Channel.ValidateAssetSettings(); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 
 	addChannelRequest.Channel.CreatedTime = common.GetTimestamp()
 	keys := make([]string, 0)
@@ -1221,6 +1225,10 @@ func UpdateChannel(c *gin.Context) {
 			// 覆盖模式：直接使用新密钥（默认行为，不需要特殊处理）
 		}
 	}
+	if err := service.ValidateChannelAssetChange(c.Request.Context(), originChannel, &channel.Channel); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	err = channel.Update()
 	if err != nil {
 		common.ApiError(c, err)
@@ -1246,6 +1254,9 @@ func UpdateChannel(c *gin.Context) {
 	}
 	if channel.Key != "" && channel.Key != originChannel.Key {
 		changedFields = append(changedFields, "key")
+	}
+	if _, provided := requestData["asset_credentials"]; provided {
+		changedFields = append(changedFields, "asset_credentials")
 	}
 	updateAudit := map[string]any{
 		"id":             channel.Id,

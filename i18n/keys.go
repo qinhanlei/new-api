@@ -113,3 +113,36 @@ const (
 	MsgChannelUpstreamUpdateFailedChannels  = "channel.upstream_update_failed_channels"
 	MsgChannelUpstreamUpdateMoreOmitted     = "channel.upstream_update_more_omitted"
 )
+
+// Unified material library errors returned to API clients.
+const (
+	MsgAssetInternal     = "asset.asset_internal_error"
+	MsgAssetNotFound     = "asset.asset_not_found"
+	MsgAssetInvalid      = "asset.invalid_asset_request"
+	MsgAssetMediaType    = "asset.unsupported_asset_media"
+	MsgAssetTooLarge     = "asset.asset_too_large"
+	MsgAssetLimit        = "asset.asset_storage_limit"
+	MsgAssetSource       = "asset.asset_source_error"
+	MsgAssetStorage      = "asset.asset_storage_unavailable"
+	MsgAssetAccessLimit  = "asset.asset_access_limited"
+	MsgAssetUploading    = "asset.asset_upload_in_progress"
+	MsgAssetDisabled     = "asset.disabled"
+	MsgAssetBinding      = "asset.binding_required"
+	MsgAssetPlugin       = "asset.plugin_required"
+	MsgAssetJSON         = "asset.json_required"
+	MsgAssetChannelMedia = "asset.channel_media_unsupported"
+	MsgAssetUnavailable  = "asset.unavailable"
+)
+
+// Native video facade errors returned to API clients.
+const (
+	MsgVideoUnsupportedModel    = "video.unsupported_model"
+	MsgVideoRetrieveFailed      = "video.retrieve_failed"
+	MsgVideoTaskNotFound        = "video.task_not_found"
+	MsgVideoJSONRequired        = "video.json_required"
+	MsgVideoContentRequired     = "video.content_required"
+	MsgVideoContentEntryInvalid = "video.content_entry_invalid"
+	MsgVideoContentTextInvalid  = "video.content_text_invalid"
+	MsgVideoContentInvalid      = "video.content_invalid"
+	MsgVideoReadFailed          = "video.read_failed"
+)
