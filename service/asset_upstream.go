@@ -1,0 +1,236 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+	volcbase "github.com/volcengine/volcengine-go-sdk/volcengine/base"
+)
+
+const AssetAPIVersion = "2024-01-01"
+
+type AssetError struct {
+	HTTPStatus int
+	Code       string
+	Message    string
+	Retryable  bool
+}
+
+func (err *AssetError) Error() string { return err.Message }
+
+func assetError(status int, code, message string) *AssetError {
+	return &AssetError{HTTPStatus: status, Code: code, Message: message, Retryable: status == http.StatusTooManyRequests || status >= 500}
+}
+
+func IsAssetChannelEnabled(channel *model.Channel, config *system_setting.AssetChannelConfig) bool {
+	return channel != nil && config != nil && config.Enabled && config.Endpoint != "" && channel.Status == common.ChannelStatusEnabled && !channel.ChannelInfo.IsMultiKey && len(channel.GetKeys()) == 1 && config.ChannelScope == model.AssetChannelScope(channel)
+}
+
+func GetAssetChannelConfig(ctx context.Context, channelID int) (dto.AssetChannelView, error) {
+	config, err := model.LoadAssetChannelConfig(ctx, channelID)
+	return dto.AssetChannelView{AssetChannelFields: config.AssetChannelFields, ChannelID: channelID, HasSecret: config.SecretKey != ""}, err
+}
+
+func UpdateAssetChannelConfig(ctx context.Context, channelID int, input dto.AssetChannelUpdate) (dto.AssetChannelView, error) {
+	current, err := model.LoadAssetChannelConfig(ctx, channelID)
+	if err != nil {
+		return dto.AssetChannelView{}, err
+	}
+	if current.Revision != input.Revision {
+		return dto.AssetChannelView{}, model.ErrAssetConflict
+	}
+	channel, err := model.GetChannelById(channelID, true)
+	if err != nil {
+		return dto.AssetChannelView{}, err
+	}
+	next := system_setting.AssetChannelConfig{AssetChannelFields: input.AssetChannelFields, SecretKey: current.SecretKey, ChannelScope: model.AssetChannelScope(channel)}
+	next.Endpoint = strings.TrimSpace(next.Endpoint)
+	next.ProjectName = strings.TrimSpace(next.ProjectName)
+	if next.ProjectName == "" {
+		next.ProjectName = "default"
+	}
+	if next.AuthType == "" {
+		next.AuthType = "bearer"
+	}
+	if input.SecretKey != nil {
+		next.SecretKey = *input.SecretKey
+	}
+	u, parseErr := url.Parse(next.Endpoint)
+	if next.Endpoint != "" && (parseErr != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "") {
+		return dto.AssetChannelView{}, assetError(http.StatusBadRequest, "InvalidParameter.Endpoint", "Material endpoint must be an HTTPS URL without a query or credentials")
+	}
+	if next.Enabled && (next.Endpoint == "" || channel.ChannelInfo.IsMultiKey || len(channel.GetKeys()) != 1) {
+		return dto.AssetChannelView{}, assetError(http.StatusBadRequest, "InvalidParameter.Channel", "Material channels require an endpoint and one API key")
+	}
+	if len(next.ProjectName) > 64 || strings.ContainsAny(next.ProjectName, "\r\n\t") {
+		return dto.AssetChannelView{}, assetError(http.StatusBadRequest, "InvalidParameter.ProjectName", "Invalid upstream project name")
+	}
+	if next.AuthType != "bearer" && next.AuthType != "aksk" {
+		return dto.AssetChannelView{}, assetError(http.StatusBadRequest, "InvalidParameter.AuthType", "Unsupported material authentication type")
+	}
+	if next.AuthType == "aksk" && next.Enabled && (next.AccessKey == "" || next.SecretKey == "") {
+		return dto.AssetChannelView{}, assetError(http.StatusBadRequest, "InvalidParameter.Credentials", "Material access key and secret are required")
+	}
+	// A rotated signing secret must still be able to read a known resource before
+	// replacing the credential needed to poll or remove existing replicas.
+	if current.SecretKey != next.SecretKey && current.SecretKey != "" {
+		replicas, loadErr := model.AssetChannelGroupReplicas(ctx, channelID)
+		if loadErr != nil {
+			return dto.AssetChannelView{}, loadErr
+		}
+		for _, replica := range replicas {
+			if replica.UpstreamID == "" || replica.State == model.AssetDeleted {
+				continue
+			}
+			var result struct {
+				ID string `json:"Id"`
+			}
+			if err = callAssetUpstream(ctx, channel, next, "GetAssetGroup", map[string]any{"Id": replica.UpstreamID}, &result); err != nil {
+				return dto.AssetChannelView{}, assetError(http.StatusBadRequest, "InvalidParameter.Credentials", "The new credential cannot access the existing material group")
+			}
+			if result.ID != replica.UpstreamID {
+				return dto.AssetChannelView{}, assetError(http.StatusBadRequest, "InvalidParameter.Credentials", "The new credential returned a different material group")
+			}
+			break
+		}
+	}
+	if err = model.SaveAssetChannelConfig(ctx, channelID, next); err != nil {
+		return dto.AssetChannelView{}, err
+	}
+	next.Revision++
+	return dto.AssetChannelView{AssetChannelFields: next.AssetChannelFields, ChannelID: channelID, HasSecret: next.SecretKey != ""}, nil
+}
+
+var assetErrorURLPattern = regexp.MustCompile(`https?://[^\s"<>]+`)
+
+func safeAssetMessage(message string, secrets ...string) string {
+	message = assetErrorURLPattern.ReplaceAllString(message, "[URL]")
+	for _, secret := range secrets {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	message = strings.Map(func(r rune) rune {
+		if r < ' ' && r != '\t' {
+			return ' '
+		}
+		return r
+	}, message)
+	if len(message) > 1024 {
+		message = message[:1024]
+	}
+	return message
+}
+
+// All actions use the configured management endpoint. Generation credentials
+// are sent only to that administrator-selected host; redirects are rejected.
+func callAssetUpstream(ctx context.Context, channel *model.Channel, config system_setting.AssetChannelConfig, action string, payload map[string]any, result any) error {
+	endpoint, err := url.Parse(config.Endpoint)
+	if err != nil || endpoint.Host == "" {
+		return assetError(http.StatusBadGateway, "UpstreamConfigurationInvalid", "The material endpoint is not configured")
+	}
+	query := endpoint.Query()
+	query.Set("Action", action)
+	query.Set("Version", AssetAPIVersion)
+	endpoint.RawQuery = query.Encode()
+	payload["ProjectName"] = config.ProjectName
+	data, err := common.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(data))
+	if err != nil {
+		return assetError(http.StatusBadGateway, "UpstreamConfigurationInvalid", "The material endpoint is invalid")
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if config.AuthType == "aksk" {
+		credential := volcbase.Credentials{AccessKeyID: config.AccessKey, SecretAccessKey: config.SecretKey, Region: "cn-beijing", Service: "ark"}
+		credential.Sign(request)
+	} else {
+		request.Header.Set("Authorization", "Bearer "+channel.Key)
+	}
+	baseClient, err := GetHttpClientWithProxySettings(channel.GetSetting().Proxy, channel.GetSetting())
+	if err != nil {
+		return assetError(http.StatusBadGateway, "UpstreamConfigurationInvalid", "The channel transport is unavailable")
+	}
+	client := *baseClient
+	client.Timeout = 30 * time.Second
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := client.Do(request)
+	if err != nil {
+		code := "UpstreamUnavailable"
+		if strings.HasPrefix(action, "Create") {
+			code = "UpstreamResultUnknown"
+		}
+		return assetError(http.StatusBadGateway, code, "The upstream material response could not be confirmed")
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
+	if err != nil || len(body) > 1<<20 {
+		return assetError(http.StatusBadGateway, "UpstreamResultUnknown", "The upstream material response could not be read")
+	}
+	var envelope struct {
+		ResponseMetadata struct {
+			Error *dto.AssetFailure `json:"Error"`
+		} `json:"ResponseMetadata"`
+		Result any `json:"Result"`
+	}
+	if err = common.Unmarshal(body, &envelope); err != nil {
+		code := "UpstreamInvalidResponse"
+		if strings.HasPrefix(action, "Create") {
+			code = "UpstreamResultUnknown"
+		}
+		return assetError(http.StatusBadGateway, code, "The upstream material response was not valid JSON")
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 || envelope.ResponseMetadata.Error != nil {
+		status := response.StatusCode
+		if status < 400 {
+			status = http.StatusBadGateway
+		}
+		code, message := "UpstreamError", "The upstream material operation failed"
+		if envelope.ResponseMetadata.Error != nil {
+			code = safeAssetMessage(envelope.ResponseMetadata.Error.Code, channel.Key, config.SecretKey)
+			if len(code) > 128 {
+				code = "UpstreamError"
+			}
+			message = safeAssetMessage(envelope.ResponseMetadata.Error.Message, channel.Key, config.SecretKey)
+		}
+		if strings.HasPrefix(action, "Create") && status >= 500 {
+			code = "UpstreamResultUnknown"
+		}
+		return assetError(status, code, message)
+	}
+	if envelope.Result == nil {
+		return assetError(http.StatusBadGateway, "UpstreamResultUnknown", "The upstream material response did not contain a result")
+	}
+	if result == nil {
+		return nil
+	}
+	data, err = common.Marshal(envelope.Result)
+	if err != nil {
+		return err
+	}
+	if err = common.Unmarshal(data, result); err != nil {
+		return assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material result was invalid")
+	}
+	return nil
+}
+
+func assetFailure(err error) (string, string, bool) {
+	var failure *AssetError
+	if errors.As(err, &failure) {
+		return failure.Code, failure.Message, failure.Retryable
+	}
+	return "InternalError", "The material operation failed", true
+}

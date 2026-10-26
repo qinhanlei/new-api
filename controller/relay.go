@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -311,7 +312,22 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		service.RequestPolicy(c).BeginAttempt(channel, info.UsingGroup)
 		return channel, nil
 	}
-	channel, selectGroup, err := service.CacheGetRandomSatisfiedChannel(retryParam)
+	var channel *model.Channel
+	var selectGroup string
+	var err error
+	if len(service.TaskAssetReferences(c)) > 0 {
+		var selectionErr *service.ChannelSelectError
+		channel, selectGroup, selectionErr = service.SelectChannelForRequest(c, info.OriginModelName, retryParam)
+		if selectionErr != nil {
+			message := i18n.TSource(c, selectionErr.Message)
+			if selectionErr.MessageID != "" {
+				message = i18n.T(c, selectionErr.MessageID, selectionErr.Params)
+			}
+			return nil, types.NewErrorWithStatusCode(errors.New(message), types.ErrorCode(selectionErr.Code), selectionErr.StatusCode, types.ErrOptionWithSkipRetry())
+		}
+	} else {
+		channel, selectGroup, err = service.CacheGetRandomSatisfiedChannel(retryParam)
+	}
 	if err != nil {
 		return nil, types.NewError(errors.New(i18n.T(c, i18n.MsgRelayRetryGetChannelFailed, map[string]any{"Group": selectGroup, "Model": info.OriginModelName, "Error": err.Error()})), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -518,6 +534,16 @@ func executeTaskSubmissionWith(
 	durable := false
 	stage := "start"
 	defer func() {
+		// A failed response does not prove the upstream rejected the task. Keep
+		// its source references until reconciliation or the orphan retention
+		// window; failures before transport can release them immediately.
+		if !durable && len(service.TaskAssetReferences(c)) > 0 && relayInfo.PublicTaskID != "" && !c.GetBool(pluginruntime.ContextKeyAssetSubmissionStarted) {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+			defer cancel()
+			if err := model.ReleaseAssetUses(cleanup, relayInfo.PublicTaskID); err != nil {
+				logger.LogError(c, common.LogText("Unable to release asset references after task submission"))
+			}
+		}
 		if !durable && relayInfo.Billing != nil {
 			diagnostics.refund(stage)
 			relayInfo.Billing.Refund(c)
@@ -560,7 +586,11 @@ func executeTaskSubmissionWith(
 			channel, channelErr = getChannel(c, relayInfo, retryParam)
 			if channelErr != nil {
 				logger.LogError(c, channelErr.Error())
-				taskErr = service.TaskErrorWrapperLocal(channelErr.Err, "get_channel_failed", channelErr.StatusCode)
+				code := "get_channel_failed"
+				if len(service.TaskAssetReferences(c)) > 0 {
+					code = string(channelErr.GetErrorCode())
+				}
+				taskErr = service.TaskErrorWrapperLocal(channelErr.Err, code, channelErr.StatusCode)
 				break
 			}
 		}
@@ -580,6 +610,7 @@ func executeTaskSubmissionWith(
 		c.Request.Body = io.NopCloser(bodyStorage)
 
 		stage = "submit"
+		c.Set(pluginruntime.ContextKeyAssetSubmissionStarted, false)
 		result, taskErr = submit(c, relayInfo)
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
@@ -722,6 +753,15 @@ func executeTaskSubmissionWith(
 		return nil, taskErr
 	}
 	durable = true
+	if len(service.TaskAssetReferences(c)) > 0 {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+		if err := model.CommitAssetUses(cleanup, task.TaskID); err != nil {
+			// The durable task remains authoritative for retention even if this
+			// bookkeeping update fails; do not turn a submitted task into a retry.
+			logger.LogError(c, common.LogText("Unable to update asset references for the submitted task"))
+		}
+		cancel()
+	}
 	stage = "settle"
 	diagnostics.durable(task)
 	diagnostics.settleStart(task, result.Quota)
@@ -827,6 +867,13 @@ func taskSubmissionAPIError(taskErr *taskdto.TaskError) *types.NewAPIError {
 // reason is recorded in the request policy decision events of the log details.
 func decideTaskRetry(c *gin.Context, taskErr *taskdto.TaskError, retryTimes int) service.PolicyDecision {
 	stop := service.PolicyDecision{Action: "stop", Source: "system"}
+	if taskErr != nil && len(service.TaskAssetReferences(c)) > 0 && c.GetBool(pluginruntime.ContextKeyAssetSubmissionStarted) &&
+		(taskErr.LocalError || taskErr.StatusCode >= http.StatusInternalServerError) {
+		// An uncertain submission may still consume these assets upstream. A
+		// second task cannot replace its retention record or prove it finished.
+		stop.Reason = "asset_submission_outcome_unknown"
+		return stop
+	}
 	retry := service.PolicyDecision{Action: "retry", Reason: "retry_status_matched", Source: "system"}
 	switch {
 	case taskErr == nil:

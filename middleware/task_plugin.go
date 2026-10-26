@@ -154,6 +154,12 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 			}
 		}
 
+		reservedAssets, assetErr := pluginruntime.ReservedAssetReferences(requestContext.Body)
+		if assetErr != nil {
+			abortTaskAssetError(c, assetErr)
+			return
+		}
+		c.Set(pluginruntime.ContextKeyAssetReferences, reservedAssets)
 		hookStarted := time.Now()
 		resolvedValue, requestBodyText, err := pinned.Plugin.Engine.CallPathWithMemberJSON(
 			c.Request.Context(), 0, pinned.Plugin.Meta.JSONTextMember("requestBody"),
@@ -283,6 +289,10 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 				return
 			}
 			_, bodyReplaced := resolved["requestBody"]
+			if err := prepareTaskPluginAssets(c, pinned.Plugin, requestContext.RequestBody, "native", pinned.Route.Decode, modelName); err != nil {
+				abortTaskAssetError(c, err)
+				return
+			}
 			logger.LogDebug(
 				c,
 				"task_plugin subsystem=route event=resolved generation=%d plugin=%q kind=submit model=%q action_present=%t request_body_replaced=%t distribute=true elapsed_ms=%d",
@@ -352,8 +362,31 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 		}
 		endpoint, found := lookupTaskPluginEndpoint(generation, c.Request.Method, c.Request.URL.Path, request.Model)
 		if !found {
+			_, probeErr := probeTaskPluginAssets(c, pluginruntime.PinnedEndpoint{Model: request.Model})
+			if probeErr != nil {
+				abortTaskAssetError(c, probeErr)
+				return
+			}
 			c.Set(contextKeyTaskPluginEndpointModel, *request)
 			c.Next()
+			return
+		}
+		endpoint, err = probeTaskPluginAssets(c, endpoint)
+		if err != nil {
+			abortTaskAssetError(c, err)
+			return
+		}
+		if len(service.TaskAssetReferences(c)) > 0 {
+			if common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) {
+				limit, _ := common.GetContextKeyType[map[string]bool](c, constant.ContextKeyTokenModelLimit)
+				if !TokenModelLimitAllows(limit, endpoint.Model) {
+					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenModelForbidden, map[string]any{"Model": request.Model}))
+					return
+				}
+			}
+			// Gateway references require plugin handling. Normalize all
+			// candidates before distribution can enqueue replica preparation.
+			pinEndpoint(c)
 			return
 		}
 
@@ -722,6 +755,16 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 			} else if model != pinned.Model || (pinned.MappedModel == "" && !slices.Contains(candidate.Plugin.Meta.Models, model)) {
 				reason = "resolved_model_not_owned"
 				detail = fmt.Sprintf("model %q is not served by this plugin", model)
+			}
+			if detail == "" {
+				body := requestContext.RequestBody
+				if normalized, present := result["requestBody"]; present {
+					body = normalized
+				}
+				if assetErr := prepareTaskPluginAssets(c, candidate.Plugin, body, candidate.Protocol, candidate.Operation.Name, pinned.Model); assetErr != nil {
+					reason = "invalid_asset_references"
+					detail = i18n.TSource(c, assetReferenceErrorMessage(assetErr))
+				}
 			}
 			if detail != "" {
 				logger.LogWarn(c, common.LogText("task_plugin subsystem=endpoint event=prepare_rejected generation=%d plugin=%q stage=parse_request reason=%s err=%q elapsed_ms=%d",
@@ -1314,6 +1357,14 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 		return false
 	}
 	sanitized := sanitizedTaskPluginError(taskErr.StatusCode, taskErr.Message)
+	if taskErr.Code == "InvalidAssetReference" || len(service.TaskAssetReferences(c)) > 0 {
+		switch taskErr.Code {
+		case "InvalidAssetReference", "AssetNotReady", "AssetFailed", "AssetStorageDisabled", "AssetUnavailable", "ResourceNotFound", "AccessDenied":
+			sanitized.Code = taskErr.Code
+			sanitized.Message = taskErr.Message
+			sanitized.Retryable = taskErr.Code == "AssetNotReady"
+		}
+	}
 	requestID := c.GetString(common.RequestIdKey)
 	hasRenderer, err := pinned.Plugin.Engine.HasCallablePath(c.Request.Context(), "native", "error")
 	requestValue, exists := c.Get(pluginruntime.ContextKeyRouteRequest)
@@ -1520,6 +1571,10 @@ func PrepareTaskPluginSubmit() gin.HandlerFunc {
 			}
 		}
 		c.Set("task_request", requestBody)
+		if err := prepareTaskPluginAssets(c, plugin, requestBody, "task", "create", modelName); err != nil {
+			abortTaskAssetError(c, err)
+			return
+		}
 		if plugin.Meta.PreservesJSONOrder() {
 			// The body as stored after any model rewrite: the text hooks get.
 			storage, err := common.GetBodyStorage(c)

@@ -1244,6 +1244,8 @@ func TestSubmitResponseTypesContract(t *testing.T) {
 		{"legacy JSON", "", "", true},
 		{"SSE declared", `submitResponseTypes:["json","sse"],`, `export function parseSubmitEvent(){return {state:null,done:true};}`, true},
 		{"host JSON utility", `requiredCapabilities:["json-clone@1"],`, "", true},
+		{"asset references", `requiredCapabilities:["asset-references@1"],`, `export function extractAssetReferences(){return [];}`, true},
+		{"asset references missing hook", `requiredCapabilities:["asset-references@1"],`, "", false},
 		{"SSE delta", `submitResponseTypes:["sse"],requiredCapabilities:["submit-sse-delta@1"],`, `export function parseSubmitEventDelta(){return {changes:[],state:null,done:true};}`, true},
 		{"SSE delta missing hook", `submitResponseTypes:["sse"],requiredCapabilities:["submit-sse-delta@1"],`, `export function parseSubmitEvent(){return {state:null,done:true};}`, false},
 		{"SSE delta hook without declaration", `submitResponseTypes:["sse"],`, `export function parseSubmitEventDelta(){return {changes:[],state:null,done:true};}`, true},
@@ -1269,5 +1271,47 @@ export function parseSubmitEventDelta(){return {changes:[],state:null,done:true}
 				require.Error(t, err)
 			}
 		})
+	}
+}
+
+func TestAssetReferenceHookContract(t *testing.T) {
+	source := routingTestPluginSource("assets", 0, `["model"]`, `requiredCapabilities:["asset-references@1"],`, "") + `
+export function extractAssetReferences(ctx) { return ctx.body.value; }`
+	plugin, err := CompilePlugin(source, Options{})
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name    string
+		value   any
+		want    []string
+		invalid bool
+	}{
+		{name: "deduplicated IDs", value: []any{"asset-na-b", "asset-na-a", "asset-na-b"}, want: []string{"asset-na-a", "asset-na-b"}},
+		{name: "empty array", value: []any{}, want: []string{}},
+		{name: "upstream ID", value: []any{"asset-upstream"}, invalid: true},
+		{name: "empty opaque ID", value: []any{"asset-na-"}, invalid: true},
+		{name: "URL instead of ID", value: []any{"asset://asset-na-a"}, invalid: true},
+		{name: "not an array", value: "asset-na-a", invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ids, err := ExtractAssetReferences(t.Context(), plugin, map[string]any{"kind": "json", "value": tc.value}, "task", "create", "model", true)
+			if tc.invalid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, ids)
+		})
+	}
+	plugin, err = CompilePlugin(strings.Replace(source, `return ctx.body.value;`, `utils.fetch({url:"https://upstream.example"}); return [];`, 1), Options{})
+	require.NoError(t, err)
+	_, err = ExtractAssetReferences(t.Context(), plugin, nil, "task", "create", "model", true)
+	require.ErrorContains(t, err, "utils.fetch is not available")
+	for _, body := range []any{
+		map[string]any{"kind": "json", "value": map[string]any{"custom": []any{"asset://asset-na-b", "asset://asset-na-a"}}},
+		map[string]any{"kind": "multipart", "fields": map[string][]string{"custom": {`{"media":["asset://asset-na-b","asset://asset-na-a"]}`}}},
+	} {
+		ids, err := ReservedAssetReferences(body)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"asset-na-a", "asset-na-b"}, ids)
 	}
 }

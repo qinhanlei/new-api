@@ -85,6 +85,11 @@ export function SidebarModulesCard() {
           description: t('System data statistics'),
         },
         {
+          key: 'assets',
+          title: t('Asset library'),
+          description: t('View your asset groups and assets.'),
+        },
+        {
           key: 'token',
           title: t('Token Management'),
           description: t('API token management'),

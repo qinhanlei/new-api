@@ -66,6 +66,105 @@ func newDoubaoPlugin(t *testing.T) (*jsplugin.Registry, *jsplugin.LoadedPlugin) 
 	return registry, plugin
 }
 
+func TestDoubaoAssetReferencesAcrossSubmitProtocols(t *testing.T) {
+	_, plugin := newDoubaoPlugin(t)
+	const videoModel = "doubao-seedance-2-5-260628"
+	content := []any{
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "asset://asset-na-image"}, "role": "reference_image"},
+		map[string]any{"type": "video_url", "video_url": map[string]any{"url": "asset://asset-na-video"}, "role": "reference_video"},
+		map[string]any{"type": "audio_url", "audio_url": map[string]any{"url": "asset://asset-na-audio"}, "role": "reference_audio"},
+	}
+	metadata := map[string]any{"content": content, "duration": 4, "resolution": "480p", "generate_audio": false, "watermark": false, "seed": 0}
+	normalized := map[string]any{"model": videoModel, "prompt": "dance", "metadata": metadata}
+	native := maps.Clone(metadata)
+	native["model"] = videoModel
+	encodedMetadata, err := common.Marshal(metadata)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name, protocol, hook string
+		body                 any
+	}{
+		{"native", "native", "createTask", map[string]any{"kind": "json", "value": native}},
+		{"generic task", "task", "", map[string]any{"kind": "json", "value": normalized}},
+		{"OpenAI video JSON", "openai_video", "decodeRequest", map[string]any{"kind": "json", "value": normalized}},
+		{"OpenAI video multipart", "openai_video", "decodeRequest", map[string]any{"kind": "multipart", "fields": map[string]any{"model": []string{videoModel}, "metadata": []string{string(encodedMetadata)}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := []string{"asset-na-audio", "asset-na-image", "asset-na-video"}
+			ids, err := jsplugin.ExtractAssetReferences(t.Context(), plugin, tc.body, tc.protocol, "create", videoModel, false)
+			require.NoError(t, err)
+			assert.Equal(t, want, ids)
+			body := any(normalized)
+			if tc.hook != "" {
+				ctx := map[string]any{"body": tc.body, "model": videoModel}
+				var decoded any
+				if tc.protocol == "native" {
+					decoded, err = plugin.Engine.CallPath(t.Context(), "native", []string{tc.hook}, ctx)
+				} else {
+					decoded, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{tc.protocol, tc.hook}, ctx)
+				}
+				require.NoError(t, err)
+				body = alibabaObject(t, decoded)["requestBody"]
+			}
+			ids, err = jsplugin.ExtractAssetReferences(t.Context(), plugin, map[string]any{"kind": "json", "value": body}, tc.protocol, "create", videoModel, true)
+			require.NoError(t, err)
+			assert.Equal(t, want, ids)
+			ctx := map[string]any{"requestBody": body, "model": videoModel, "upstreamModel": videoModel, "baseUrl": doubaoBaseURL}
+			facts, err := plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+			require.NoError(t, err)
+			for _, channel := range []string{"first", "retry"} {
+				ctx["assets"] = []map[string]any{
+					{"id": "asset-na-image", "upstreamId": channel + "-image", "type": "Image"},
+					{"id": "asset-na-video", "upstreamId": channel + "-video", "type": "Video"},
+					{"id": "asset-na-audio", "upstreamId": channel + "-audio", "type": "Audio"},
+				}
+				built, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+				require.NoError(t, err)
+				upstream := alibabaObject(t, alibabaObject(t, built)["body"])
+				items := upstream["content"].([]any)
+				for index, name := range []string{"image", "video", "audio"} {
+					item := alibabaObject(t, items[index])
+					assert.Equal(t, "asset://"+channel+"-"+name, alibabaObject(t, item[name+"_url"])["url"])
+					assert.Equal(t, "reference_"+name, item["role"])
+					assert.Equal(t, name+"_url", item["type"])
+				}
+				assert.Equal(t, false, upstream["generate_audio"])
+				assert.Equal(t, false, upstream["watermark"])
+				assert.EqualValues(t, 0, upstream["seed"])
+				assert.EqualValues(t, 4, upstream["duration"])
+				after, err := plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+				require.NoError(t, err)
+				assert.Equal(t, facts, after, "reference replacement must preserve usage")
+			}
+			delete(ctx, "assets")
+			_, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+			require.ErrorContains(t, err, "was not resolved")
+		})
+	}
+
+	for _, tc := range []struct {
+		name, protocol, model string
+		value                 any
+		want                  []string
+		wantError             string
+	}{
+		{name: "legacy upstream IDs", protocol: "task", model: videoModel, value: map[string]any{"images": []any{"asset://provider-owned"}}, want: []string{}},
+		{name: "mixed IDs", protocol: "task", model: videoModel, value: map[string]any{"images": []any{"asset://asset-na-image", "asset://provider-owned"}}, wantError: "cannot be mixed"},
+		{name: "Responses direct input item", protocol: "openai_responses", model: videoModel, value: map[string]any{"input": []any{map[string]any{"type": "input_image", "image_url": "asset://asset-na-image"}}}, want: []string{"asset-na-image"}},
+		{name: "image generation rejects library refs", protocol: "openai_image", model: "doubao-seedream-5-0-lite-260128", value: map[string]any{"image": []any{"asset://asset-na-image"}}, wantError: "only supported for video"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ids, err := jsplugin.ExtractAssetReferences(t.Context(), plugin, map[string]any{"kind": "json", "value": tc.value}, tc.protocol, "create", tc.model, false)
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, ids)
+		})
+	}
+}
+
 func decodeDoubaoImage(t *testing.T, registry *jsplugin.Registry, plugin *jsplugin.LoadedPlugin, body map[string]any) (map[string]any, error) {
 	t.Helper()
 	binding, found := registry.Generation().LookupDeclaredRoute(http.MethodPost, doubaoImageRoute)

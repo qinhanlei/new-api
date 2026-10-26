@@ -9,11 +9,82 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAssetActionsKeepArkErrorsAndDoNotShadowVideoRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(middleware.RequestId())
+	SetAssetRouter(engine)
+	engine.POST("/doubao/api/v3/contents/generations/tasks", func(c *gin.Context) { c.Status(http.StatusAccepted) })
+
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/doubao/?Action=CreateAsset&Version=2024-01-01", strings.NewReader(`{}`)))
+	require.Equal(t, http.StatusUnauthorized, response.Code)
+	var payload struct {
+		Metadata struct {
+			RequestID string `json:"RequestId"`
+			Action    string `json:"Action"`
+			Version   string `json:"Version"`
+			Error     struct {
+				Code string `json:"Code"`
+			} `json:"Error"`
+		} `json:"ResponseMetadata"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	assert.NotEmpty(t, payload.Metadata.RequestID)
+	assert.Equal(t, "CreateAsset", payload.Metadata.Action)
+	assert.Equal(t, "2024-01-01", payload.Metadata.Version)
+	assert.Equal(t, "AuthenticationError", payload.Metadata.Error.Code)
+
+	response = httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/doubao/api/v3/contents/generations/tasks", strings.NewReader(`{}`)))
+	assert.Equal(t, http.StatusAccepted, response.Code)
+}
+
+func TestAssetPollingDoesNotConsumeMutationRateLimit(t *testing.T) {
+	previousEnabled, previousLimit, previousRedis := common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.RedisEnabled
+	common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.RedisEnabled = true, 1, false
+	t.Cleanup(func() {
+		common.CriticalRateLimitEnable = previousEnabled
+		common.CriticalRateLimitNum = previousLimit
+		common.RedisEnabled = previousRedis
+	})
+	engine := gin.New()
+	engine.POST("/actions", func(c *gin.Context) { c.Set("id", 981761) }, assetMutationRateLimit(), func(c *gin.Context) { c.Status(http.StatusOK) })
+	for _, tc := range []struct {
+		action string
+		status int
+	}{
+		{"ListAssets", http.StatusOK}, {"GetAsset", http.StatusOK},
+		{"CreateAsset", http.StatusOK}, {"CreateAsset", http.StatusTooManyRequests},
+		{"ListAssets", http.StatusOK},
+	} {
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/actions?Action="+tc.action, nil))
+		assert.Equal(t, tc.status, response.Code, tc.action)
+	}
+}
+
+func TestAssetEnvelopePreservesPanicRecovery(t *testing.T) {
+	engine := gin.New()
+	engine.Use(gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, _ any) {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	}))
+	engine.POST("/doubao/", assetActionEnvelope(), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"partial": true})
+		panic("test panic")
+	})
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/doubao/", nil))
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
+	assert.JSONEq(t, `{"error":"internal error"}`, response.Body.String())
+}
 
 func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
 	setupRelayRouterTestDB(t)

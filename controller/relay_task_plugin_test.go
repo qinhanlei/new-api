@@ -156,6 +156,66 @@ func TestExecuteTaskSubmissionRefundsWhenInsertFails(t *testing.T) {
 	assert.False(t, c.Writer.Written())
 }
 
+func TestAssetReferencesFollowTaskSubmissionDurability(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		started  bool
+		success  bool
+		wantUses int64
+	}{
+		{name: "rejected before transport", wantUses: 0},
+		{name: "upstream result unknown", started: true, wantUses: 1},
+		{name: "persisted task", started: true, success: true, wantUses: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, dialect := openTaskDialectDatabase(t, &model.Task{}, &model.Asset{}, &model.AssetUse{}, &model.User{}, &model.Channel{})
+			previousDB, previousType := model.DB, common.MainDatabaseType()
+			previousLogConsume := common.LogConsumeEnabled
+			model.DB = database
+			common.SetMainDatabaseType(dialect)
+			common.LogConsumeEnabled = false
+			t.Cleanup(func() {
+				model.DB = previousDB
+				common.SetMainDatabaseType(previousType)
+				common.LogConsumeEnabled = previousLogConsume
+			})
+			asset := model.Asset{PublicID: "asset-na-durable", UserID: 1, Status: model.AssetActive}
+			require.NoError(t, database.Create(&asset).Error)
+			require.NoError(t, database.Create(&model.AssetUse{AssetID: asset.ID, TaskID: "task_public", ChannelID: 1, CreatedAt: time.Now().Unix()}).Error)
+			events := []string{}
+			billing := &taskSubmissionTestBilling{events: &events}
+			c := taskSubmissionTestContext()
+			c.Set(pluginruntime.ContextKeyAssetReferences, []string{asset.PublicID})
+			info := taskSubmissionRelayInfo(billing)
+			outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+				c.Set(pluginruntime.ContextKeyAssetSubmissionStarted, tc.started)
+				if !tc.success {
+					return nil, service.TaskErrorWrapperLocal(errors.New("material submission rejected"), "AssetNotReady", http.StatusConflict)
+				}
+				return &relay.TaskSubmitResult{UpstreamTaskID: "upstream-task", Platform: constant.TaskPlatform("doubao")}, nil
+			})
+			if tc.success {
+				require.Nil(t, taskErr)
+				require.NotNil(t, outcome)
+			} else {
+				require.NotNil(t, taskErr)
+				assert.Nil(t, outcome)
+				assert.NotContains(t, events, "reserve")
+			}
+			var count int64
+			require.NoError(t, database.Model(&model.AssetUse{}).Count(&count).Error)
+			assert.Equal(t, tc.wantUses, count)
+			if tc.success {
+				var use model.AssetUse
+				require.NoError(t, database.First(&use).Error)
+				assert.True(t, use.Committed)
+				require.NoError(t, database.First(&asset, asset.ID).Error)
+				assert.Positive(t, asset.LastInferenceAt)
+			}
+		})
+	}
+}
+
 func TestExecuteTaskSubmissionSettlementFailureStaysDurableAndWritesNothing(t *testing.T) {
 	events := make([]string, 0, 3)
 	database := setupTaskSubmissionDatabase(t, true, &events)
@@ -642,6 +702,33 @@ func TestRespondTaskSubmissionErrorWithoutCause(t *testing.T) {
 	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "request_failed", Source: "system"}, events[0].Decision)
 	assert.Equal(t, http.StatusServiceUnavailable, events[0].Status)
 	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "local_rejection", Source: "system"}, decideTaskRetry(c, &dto.TaskError{StatusCode: http.StatusForbidden, LocalError: true, Message: "billing"}, 2), "local errors stop once the status rules do not force a retry")
+}
+
+func TestAssetUnknownSubmissionStopsRetryWithoutChangingKnownRejections(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		assets  bool
+		started bool
+		err     *dto.TaskError
+		want    string
+	}{
+		{"transport", true, true, &dto.TaskError{StatusCode: 500, Code: "do_request_failed"}, "stop"},
+		{"unreadable accepted response", true, true, &dto.TaskError{StatusCode: 502, Code: "parse_response_failed"}, "stop"},
+		{"local response parsing", true, true, &dto.TaskError{StatusCode: 400, LocalError: true}, "stop"},
+		{"explicit rate limit", true, true, &dto.TaskError{StatusCode: 429}, "retry"},
+		{"before transport", true, false, &dto.TaskError{StatusCode: 502}, "retry"},
+		{"unrelated task", false, true, &dto.TaskError{StatusCode: 502}, "retry"},
+		{"success", true, true, nil, "stop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := taskSubmissionTestContext()
+			if tc.assets {
+				c.Set(pluginruntime.ContextKeyAssetReferences, []string{"asset-na-example"})
+			}
+			c.Set(pluginruntime.ContextKeyAssetSubmissionStarted, tc.started)
+			assert.Equal(t, tc.want, decideTaskRetry(c, tc.err, 2).Action)
+		})
+	}
 }
 
 func TestExecuteTaskSubmissionRefundsWhenFinalReserveFails(t *testing.T) {

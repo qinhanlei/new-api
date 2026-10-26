@@ -24,6 +24,8 @@ import (
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -52,6 +54,41 @@ func TestPrepareTaskPluginSubmitRejectsMissingModel(t *testing.T) {
 	PrepareTaskPluginSubmit()(c)
 	assert.Equal(t, http.StatusBadRequest, recorder.Code)
 	assert.Contains(t, recorder.Body.String(), "model is required")
+}
+
+func TestTaskPluginEntriesRejectUnclaimedGatewayAssets(t *testing.T) {
+	require.NoError(t, appI18n.Init())
+	source := strings.Replace(genericTaskPluginSource, `fetchMode: "per_task"`, `fetchMode: "per_task",routes:[{method:"POST",path:"/asset-test/jobs",type:"submit",decode:"create",render:"created"}]`, 1) + `
+export const native = {
+create(ctx) { return {kind:"submit",model:"doc",requestBody:ctx.body.value}; },
+created(ctx,task) { return task; },
+error(ctx,error) { return {error:error}; }
+};`
+	plugin, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister("generic-entry-test")) })
+	for _, tc := range []struct {
+		name, path string
+		handlers   []gin.HandlerFunc
+	}{
+		{"generic", "/v1/tasks/:key", []gin.HandlerFunc{PrepareTaskPluginSubmit()}},
+		{"native", "/asset-test/jobs", []gin.HandlerFunc{pinTaskPluginRoute(plugin, 0), PrepareTaskPluginRoute()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router := gin.New()
+			reached := false
+			handlers := append(tc.handlers, func(c *gin.Context) { reached = true; c.Status(http.StatusNoContent) })
+			router.POST(tc.path, handlers...)
+			path := strings.Replace(tc.path, ":key", "generic-entry-test", 1)
+			request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"doc","custom":["asset://asset-na-unclaimed"]}`))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			assert.False(t, reached)
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), "InvalidAssetReference")
+		})
+	}
 }
 
 func TestPrepareTaskPluginRouteUsesCanonicalContextAndResolvedSubmit(t *testing.T) {
@@ -2007,10 +2044,12 @@ func insertTaskPluginRouteTask(t *testing.T, task *model.Task) {
 }
 
 func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
+	require.NoError(t, appI18n.Init())
 	for _, tc := range []struct {
 		name, alpha, beta string
 		wantKeys          []string
 		wantError         string
+		assets            bool
 	}{
 		{name: "first decoder rejects", alpha: `throw new Error("alpha only accepts 720p")`, beta: `return {model:ctx.model,action:"beta",requestBody:{resolution:"1080p"}}`, wantKeys: []string{"decode-beta"}},
 		{name: "second decoder rejects", alpha: `return {model:ctx.model,action:"alpha"}`, beta: `throw new Error("beta rejects")`, wantKeys: []string{"decode-alpha"}},
@@ -2019,16 +2058,27 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 		{name: "duplicate failures are grouped", alpha: `throw new Error("unsupported resolution")`, beta: `throw new Error("unsupported resolution")`, wantError: "decode-alpha, decode-beta: unsupported resolution"},
 		{name: "invalid result is excluded", alpha: `return {kind:"query",model:ctx.model}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
 		{name: "rewritten model is excluded", alpha: `return {model:"another-model"}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
+		{name: "asset candidate cannot drop references", assets: true, alpha: `return {model:ctx.model,requestBody:{}}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
+		{name: "asset candidate cannot invent references", assets: true, alpha: `return {model:ctx.model,requestBody:{asset:"asset://asset-na-other"}}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, spec := range []struct{ key, decode string }{{"decode-alpha", tc.alpha}, {"decode-beta", tc.beta}} {
-				_, err := jsplugin.DefaultRegistry.Register(taskResponsesPluginSource(spec.key, 0, `["decode-shared-model"]`, `["sync"]`, `renderFinal:function(){return {};}`, spec.decode), jsplugin.Options{})
+				source := taskResponsesPluginSource(spec.key, 0, `["decode-shared-model"]`, `["sync"]`, `renderFinal:function(){return {};}`, spec.decode)
+				if tc.assets {
+					source = strings.Replace(source, `fetchMode: "per_task",`, `fetchMode: "per_task", requiredCapabilities:["asset-references@1"],`, 1) + `
+export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx.body.value.asset.slice(8)] : []; }`
+				}
+				_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
 				require.NoError(t, err)
 				t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(spec.key)) })
 			}
 			var gotKeys []string
 			router := gin.New()
-			router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			router.POST("/v1/responses", func(c *gin.Context) {
+				if tc.assets {
+					c.Set(jsplugin.ContextKeyAssetReferences, []string{"asset-na-original"})
+				}
+			}, PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 				pinned := c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint)
 				for _, candidate := range pinned.Candidates {
 					gotKeys = append(gotKeys, candidate.Plugin.Meta.Key)
@@ -2039,7 +2089,7 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 				assert.Equal(t, tc.wantKeys, service.GetChannelConstraints(c).Filters[0].TaskPluginKeys)
 				c.Status(http.StatusNoContent)
 			})
-			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model","resolution":"1080p"}`))
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model","resolution":"1080p","asset":"asset://asset-na-original"}`))
 			request.Header.Set("Content-Type", "application/json")
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, request)
@@ -2057,6 +2107,9 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 
 func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 	require.NoError(t, appI18n.Init())
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"route-test":1}`))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios)) })
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {
 			dsn := ""
@@ -2076,15 +2129,16 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 			database := model.DB
 			// Every table belongs to this run, including when a developer points
 			// a test DSN at a database shared with another test suite.
-			database.Config.NamingStrategy = schema.NamingStrategy{TablePrefix: "endpoint_route_" + common.GetUUID() + "_"}
-			require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}))
+			database.Config.NamingStrategy = schema.NamingStrategy{TablePrefix: "endpoint_route_" + common.GetUUID()[:8] + "_"}
+			tables := []any{&model.Channel{}, &model.Ability{}, &model.Task{}, &model.User{}, &model.Option{}, &model.Asset{}, &model.AssetGroup{}, &model.AssetReplica{}, &model.AssetGroupReplica{}}
+			require.NoError(t, database.AutoMigrate(tables...))
 			t.Cleanup(func() {
-				for _, table := range []any{&model.Ability{}, &model.Channel{}, &model.Task{}} {
-					require.NoError(t, database.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
+				for _, table := range tables {
+					require.NoError(t, database.Unscoped().Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
 				}
 				common.MemoryCacheEnabled = true
 				model.InitChannelCache()
-				require.NoError(t, database.Migrator().DropTable(&model.Ability{}, &model.Channel{}, &model.Task{}))
+				require.NoError(t, database.Migrator().DropTable(tables...))
 				model.DB = previousDB
 				common.SetDatabaseTypes(previousMain, previousLog)
 				common.SQLitePath, common.IsMasterNode = previousPath, previousMaster
@@ -2108,20 +2162,22 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 				t.Run(fmt.Sprintf("memory_cache=%t", memoryCache), func(t *testing.T) {
 					common.MemoryCacheEnabled = memoryCache
 					for _, tc := range []struct {
-						name, path, model        string
-						pluginType               int
-						ordinaryType             int
-						ordinaryPriority         int64
-						pluginPriority           int64
-						pluginOnly, wantPlugin   bool
-						multipart, stream        bool
-						pinOrdinary, pinPlugin   bool
-						wrongGroup, wrongModel   bool
-						disabled, unrelated      bool
-						decoderRejects, syncOnly bool
-						originPin, retry         bool
-						legacy, mapped, shared   bool
-						wantStatus               int
+						name, path, model                                                   string
+						pluginType                                                          int
+						ordinaryType                                                        int
+						ordinaryPriority                                                    int64
+						pluginPriority                                                      int64
+						pluginOnly, wantPlugin                                              bool
+						multipart, stream                                                   bool
+						pinOrdinary, pinPlugin                                              bool
+						wrongGroup, wrongModel                                              bool
+						disabled, unrelated                                                 bool
+						decoderRejects, syncOnly                                            bool
+						originPin, retry                                                    bool
+						legacy, mapped, shared                                              bool
+						assets, pendingAssets, readyAlternate, storageDisabled, modelDenied bool
+						oldAssetPlugin                                                      bool
+						wantStatus                                                          int
 					}{
 						{name: "ordinary images bypass plugin decoder", decoderRejects: true},
 						{name: "ordinary images win by priority", ordinaryPriority: 20},
@@ -2153,10 +2209,18 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 						{name: "ordinary retries stay on ordinary channels", ordinaryPriority: 20, pluginPriority: 10, retry: true},
 						{name: "plugin retries stay on plugin channels", pluginPriority: 20, retry: true, wantPlugin: true},
 						{name: "rejected shared candidate still allows another plugin", pluginOnly: true, shared: true, decoderRejects: true, pluginPriority: 20, wantPlugin: true},
+						{name: "library assets exclude higher priority ordinary channels", path: "/v1/videos", assets: true, ordinaryPriority: 50, wantPlugin: true},
+						{name: "library assets retain mapped aliases", path: "/v1/videos", assets: true, model: "friendly-image", mapped: true, wantPlugin: true},
+						{name: "pending library assets return conflict", path: "/v1/videos", assets: true, pendingAssets: true, wantStatus: http.StatusConflict},
+						{name: "ready library replica wins while preferred is prepared", path: "/v1/videos", assets: true, pendingAssets: true, readyAlternate: true, pluginPriority: 20, wantPlugin: true},
+						{name: "library assets respect explicit channel pins", path: "/v1/videos", assets: true, pendingAssets: true, readyAlternate: true, pinPlugin: true, wantStatus: http.StatusConflict},
+						{name: "disabled storage fails before ordinary relay", path: "/v1/videos", assets: true, storageDisabled: true, wantStatus: http.StatusServiceUnavailable},
+						{name: "library assets preserve model restriction with pin", path: "/v1/videos", assets: true, modelDenied: true, pinPlugin: true, wantStatus: http.StatusForbidden},
+						{name: "old plugin cannot forward gateway asset namespace", path: "/v1/videos", assets: true, oldAssetPlugin: true, ordinaryPriority: 50, wantStatus: http.StatusBadRequest},
 					} {
 						t.Run(tc.name, func(t *testing.T) {
-							for _, table := range []any{&model.Ability{}, &model.Channel{}, &model.Task{}} {
-								require.NoError(t, database.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
+							for _, table := range tables {
+								require.NoError(t, database.Unscoped().Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
 							}
 							key := "channel-route-test"
 							path := common.GetStringIfEmpty(tc.path, "/v1/images/generations")
@@ -2169,8 +2233,14 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 								decode = `throw new Error("plugin rejected this request");`
 							} else if tc.originPin {
 								decode = `return {model: ctx.model, originTaskIds: ["task-route-origin"], requestBody: {normalized: true}};`
+							} else if tc.assets {
+								decode = `return {model: ctx.model, requestBody: ctx.body.value};`
 							}
 							source := taskProtocolPluginSource(key, "1.0.0", `["channel-route-model"]`, path, decode)
+							if tc.assets && !tc.oldAssetPlugin {
+								source = strings.Replace(source, `fetchMode: "per_task",`, `fetchMode: "per_task", requiredCapabilities:["asset-references@1"],`, 1) + `
+export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx.body.value.asset.slice(8)] : []; }`
+							}
 							if tc.syncOnly {
 								source = taskResponsesPluginSource(key, 0, `["channel-route-model"]`, `["sync"]`, `renderFinal: function() { return {}; },`, decode)
 							}
@@ -2210,7 +2280,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							if !tc.pluginOnly {
 								channels = append(channels, ordinary)
 							}
-							if tc.originPin || tc.retry || tc.shared {
+							if tc.originPin || tc.retry || tc.shared || tc.readyAlternate {
 								alternate := &model.Channel{Type: ordinary.Type, Status: common.ChannelStatusEnabled, Name: "alternate", Key: "alternate-key", Group: "route-test", Models: modelName}
 								if tc.wantPlugin {
 									alternate.Type = plugin.Type
@@ -2229,11 +2299,35 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							for _, channel := range channels {
 								require.NoError(t, channel.Insert())
 							}
+							if tc.assets {
+								require.NoError(t, database.Create(&model.User{Id: 7, Username: "asset-router", Group: "route-test", Status: common.UserStatusEnabled}).Error)
+								config, err := common.Marshal(system_setting.AssetStorageConfig{AssetStorageFields: dto.AssetStorageFields{Enabled: !tc.storageDisabled}})
+								require.NoError(t, err)
+								require.NoError(t, database.Create(&model.Option{Key: system_setting.AssetStorageOption, Value: string(config)}).Error)
+								group := model.AssetGroup{PublicID: "group-na-route", UserID: 7, ProjectName: "default"}
+								require.NoError(t, database.Create(&group).Error)
+								asset := model.Asset{PublicID: "asset-na-route", UserID: 7, ProjectName: "default", GroupID: group.ID, GroupPublicID: group.PublicID, AssetType: "Image", ObjectState: model.AssetReady}
+								require.NoError(t, database.Create(&asset).Error)
+								for _, channel := range channels {
+									if channel.Type != constant.ChannelTypeTaskPlugin {
+										continue
+									}
+									config, err := common.Marshal(system_setting.AssetChannelConfig{AssetChannelFields: dto.AssetChannelFields{Enabled: true, Endpoint: "https://asset-provider.example", ProjectName: "default", AuthType: "bearer"}, ChannelScope: model.AssetChannelScope(channel)})
+									require.NoError(t, err)
+									require.NoError(t, database.Create(&model.Option{Key: model.AssetChannelOptionKey(channel.Id), Value: string(config)}).Error)
+									if channel.Id != plugin.Id || !tc.pendingAssets {
+										require.NoError(t, database.Create(&model.AssetReplica{AssetID: asset.ID, ChannelID: channel.Id, UpstreamID: fmt.Sprintf("upstream-%d", channel.Id), Status: model.AssetActive, State: model.AssetReady}).Error)
+									}
+								}
+							}
 							if tc.originPin {
 								require.NoError(t, database.Create(&model.Task{TaskID: "task-route-origin", UserId: 7, ChannelId: channels[len(channels)-1].Id, Platform: constant.TaskPlatform(key), Status: model.TaskStatusSuccess}).Error)
 							}
 							model.InitChannelCache()
 							body := []byte(fmt.Sprintf(`{"model":%q,"prompt":"a cat","size":"1024x1024","stream":%t}`, modelName, tc.stream))
+							if tc.assets {
+								body = []byte(fmt.Sprintf(`{"model":%q,"asset":"asset://asset-na-route"}`, modelName))
+							}
 							contentType := "application/json"
 							if tc.multipart {
 								var form bytes.Buffer
@@ -2252,6 +2346,10 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							router.POST(path, func(c *gin.Context) {
 								common.SetContextKey(c, constant.ContextKeyUsingGroup, "route-test")
 								common.SetContextKey(c, constant.ContextKeyUserId, 7)
+								if tc.modelDenied {
+									common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+									common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"another-model": true})
+								}
 								if tc.pinOrdinary || tc.pinPlugin {
 									id := ordinary.Id
 									if tc.pinPlugin {
@@ -2273,7 +2371,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 									} else {
 										assert.Equal(t, key, c.GetString("task_plugin_key"))
 									}
-									if tc.legacy {
+									if tc.legacy || tc.assets {
 										assert.NotNil(t, c.MustGet("task_request"))
 									} else {
 										assert.Equal(t, map[string]any{"normalized": true}, c.MustGet("task_request"))
@@ -2281,7 +2379,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 									if tc.mapped {
 										assert.Equal(t, "channel-route-model", c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint).MappedModel)
 									}
-									if tc.originPin || tc.shared {
+									if tc.originPin || tc.shared || tc.readyAlternate {
 										expected = channels[len(channels)-1]
 									}
 								} else {
@@ -2313,6 +2411,10 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							}
 							assert.Equal(t, status, recorder.Code, recorder.Body.String())
 							assert.Equal(t, status == http.StatusNoContent, reached)
+							if tc.assets && status == http.StatusConflict {
+								assert.Contains(t, recorder.Body.String(), "AssetNotReady")
+								assert.Equal(t, "5", recorder.Header().Get("Retry-After"))
+							}
 							if tc.decoderRejects && status == http.StatusBadRequest {
 								assert.Contains(t, recorder.Body.String(), "plugin rejected this request")
 							}

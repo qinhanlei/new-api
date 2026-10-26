@@ -25,6 +25,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -113,6 +114,7 @@ type TaskAdaptor struct {
 	routeRequest   *pluginruntime.RouteRequestContext
 	requestHeaders map[string]string
 	files          []map[string]any
+	assets         []dto.ResolvedAssetReference
 	// hookRequestBody is hookRequestSource as hooks receive it.
 	hookRequestSource map[string]any
 	hookRequestBody   any
@@ -159,6 +161,25 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, "image_to_video"); taskErr != nil {
 			return taskErr
 		}
+	}
+	body, _ := c.Get("task_request")
+	decoded := map[string]any{"kind": "json", "value": body}
+	assetIDs, assetErr := pluginruntime.ExtractAssetReferences(c.Request.Context(), a.plugin,
+		decoded, "task", "create", info.OriginModelName, true)
+	reserved, reservedErr := pluginruntime.ReservedAssetReferences(decoded)
+	if assetErr != nil || reservedErr != nil || !slices.Equal(assetIDs, reserved) || !slices.Equal(assetIDs, service.TaskAssetReferences(c)) {
+		return service.TaskErrorWrapperLocal(errors.New(i18n.TSource(c, "Invalid gateway asset references")), "InvalidAssetReference", http.StatusBadRequest)
+	}
+	a.assets, assetErr = service.ResolveTaskAssets(c.Request.Context(), c, info.ChannelId, assetIDs, info.PublicTaskID)
+	if assetErr != nil {
+		var typed *service.AssetError
+		if errors.As(assetErr, &typed) {
+			if typed.Retryable {
+				c.Header("Retry-After", "5")
+			}
+			return service.TaskErrorWrapperLocal(errors.New(i18n.TSource(c, typed.Message)), typed.Code, typed.HTTPStatus)
+		}
+		return service.TaskErrorWrapperLocal(errors.New(i18n.TSource(c, "Asset preparation failed")), "AssetUnavailable", http.StatusInternalServerError)
 	}
 	if _, err := a.buildSubmit(c, info); err != nil {
 		// utils.fetch failures in the build hook name the host fetched: the
@@ -493,6 +514,14 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 		defer func() { c.Request.Method = originalMethod }()
 	}
 	return channel.DoTaskApiRequest(a, c, info, body)
+}
+
+// SubmissionStarted is called after URL/header validation, immediately before
+// transport. An uncertain upstream outcome must keep its asset use holds.
+func (a *TaskAdaptor) SubmissionStarted(c *gin.Context) {
+	if len(a.assets) > 0 {
+		c.Set(pluginruntime.ContextKeyAssetSubmissionStarted, true)
+	}
 }
 
 func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (_ *channel.TaskSubmitResponse, taskErr *dto.TaskError) {
@@ -1608,6 +1637,9 @@ func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo)
 	ctx["files"] = files
 	ctx["action"] = info.Action
 	ctx["originTaskId"] = info.OriginTaskID
+	if len(a.assets) > 0 {
+		ctx["assets"] = a.assets
+	}
 	if info.TaskRelayInfo != nil && len(info.OriginTasks) > 0 {
 		originTasks := make([]map[string]any, 0, len(info.OriginTasks))
 		for _, ref := range info.OriginTasks {

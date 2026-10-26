@@ -200,6 +200,38 @@ curl --fail-with-body http://localhost:3000/v1/responses \
   -d '{"model":"your-enabled-model","input":"Hello!"}'
 ```
 
+### 豆包素材库
+
+素材库默认关闭，支持 AIGC 图片、视频和音频。它管理素材及各渠道的审核副本，审核结果仍由上游决定；首版不包含真人核验流程。
+
+1. 在**系统设置 → 运营设置 → 素材存储**填写 S3 兼容 Endpoint、Region、Bucket、Access Key 和 Secret Key，测试读写及删除权限后启用。Bucket 保持私有，New API 为上游生成临时读取链接。火山 TOS 使用 S3 Endpoint，例如 `https://tos-s3-cn-beijing.volces.com`，关闭路径式寻址。
+2. 安装或更新支持 `asset-references@1` 的 doubao 任务插件。在已保存渠道的**素材库**操作中启用素材能力，填写其官方兼容素材接口的完整 URL（含所需路径）。Bearer 模式复用该渠道的 API Key；火山官方控制面使用 AK/SK 模式。渠道必须只有一个 Key。
+3. 在**素材库**页面创建分组、上传文件或导入 URL。素材首先导入一个可用渠道，其他渠道按生成请求需要同步。用户只能访问自己的素材，管理员可选择用户管理素材。
+
+所有节点共用现有数据库和同一 S3 Bucket，无需共享本地目录或新增主节点地址。后台任务使用数据库租约协调；原文件只存储一份。请勿通过 Bucket 生命周期规则提前删除 `new-api-assets/` 下的对象。
+
+下游使用 New API 的 Bearer Key，请求 `POST /doubao/?Action=...&Version=2024-01-01`。支持素材与分组各自的 `Create`、`Get`、`List`、`Update`、`Delete` 共十个 Action，参数采用火山的字段格式：
+
+```bash
+curl --fail-with-body 'http://localhost:3000/doubao/?Action=CreateAssetGroup&Version=2024-01-01' \
+  -H "Authorization: Bearer ${NEW_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"Name":"产品素材","GroupType":"AIGC"}'
+
+curl --fail-with-body 'http://localhost:3000/doubao/?Action=CreateAsset&Version=2024-01-01' \
+  -H "Authorization: Bearer ${NEW_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"GroupId":"group-na-...","AssetType":"Image","URL":"https://example.com/product.png"}'
+```
+
+用 `GetAsset` 查询返回的 `Id`，等待 `Status` 为 `Active` 后，在 `/doubao/api/v3/contents/generations/tasks` 的 `content[].image_url.url` 中填写 `asset://asset-na-...`；视频、音频使用对应的 URL 字段。`/v1/tasks/doubao` 和 doubao 插件承接的 `/v1/videos` 同样支持素材引用。保留本地 ID，New API 会转换为实际选中渠道的 ID；同一请求不可混用本地素材和直接取得的上游素材 ID。
+
+`ListAssetGroups`、`ListAssets` 的 `Filter.GroupType` 填写 `AIGC`；游标分页使用 `MaxResults`、`NextToken`，不可与页码参数混用。`ProjectName` 是用户在本站的逻辑空间；实际上游项目由渠道配置决定。原图最大 30 MiB，视频、音频最大 100 MiB，仍须满足上游格式及配额限制。
+
+当当前合法渠道没有全部素材的就绪副本时，生成请求返回 HTTP `409`、`AssetNotReady` 和 `Retry-After`，不会提交视频任务或预扣额度；稍后重试即可。删除立即禁止新的引用，后台等待在途任务结束后清理上游副本和 S3 对象。无法确认上游素材创建结果时会先查询核对，不会盲目重复创建；删除此类素材先等待五分钟再核对。带素材的视频提交结果不明时停止自动重试，并保留素材占用 73 小时，避免仍在上游运行的任务失去素材。
+
+仍有素材资源时不能切换 Bucket、存储位置或渠道账号身份（包括生成 Key 和接口地址）；先删除并等待清理完成。关闭功能不会迁移或删除现有素材。旧实验版素材库的表和配置不自动迁入本实现。
+
 <a id="deployment"></a>
 
 ## 部署与运维

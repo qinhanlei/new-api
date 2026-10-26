@@ -22,6 +22,7 @@ import {
   ClipboardList,
   CreditCard,
   FileText,
+  FolderOpen,
   FlaskConical,
   Key,
   LayoutDashboard,
@@ -82,6 +83,11 @@ export function useSidebarData(): SidebarData {
             title: t('Dashboard'),
             url: '/dashboard/models',
             icon: LayoutDashboard,
+          },
+          {
+            title: t('Asset library'),
+            url: '/asset-library',
+            icon: FolderOpen,
           },
           {
             title: t('API Keys'),

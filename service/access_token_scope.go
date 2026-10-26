@@ -53,6 +53,10 @@ func accessTokenEdit(description string) authz.ActionDefinition {
 // Casbin permission. Casbin resources come from authz.Catalog() at runtime and
 // must never be duplicated here.
 var accessTokenStaticResources = []AccessTokenResource{
+	{Resource: "asset", LabelKey: "Asset library", group: AccessTokenGroupPersonal, minRole: common.RoleCommonUser, Actions: []authz.ActionDefinition{
+		accessTokenView("View your asset groups and assets."),
+		accessTokenEdit("Create, update, and delete your asset groups and assets."),
+	}},
 	{Resource: "profile", LabelKey: "Profile", group: AccessTokenGroupPersonal, minRole: common.RoleCommonUser, Actions: []authz.ActionDefinition{
 		accessTokenView("View your profile, groups, and available models."),
 		accessTokenEdit("Change your display name and personal settings."),
@@ -217,6 +221,9 @@ func AccessTokenScopeGranted(scopes []string, scope string) bool {
 // scope a PAT needs to obtain its proof. An empty value means PATs can never
 // obtain it; scopes missing from this table are denied too.
 var accessTokenVerificationScopes = map[string]string{
+	VerificationScopeAssetStorageWrite:     "option:write",
+	VerificationScopeAssetStorageTest:      "option:write",
+	VerificationScopeChannelAssetsWrite:    AccessTokenScopeOf(authz.ChannelSensitiveWrite),
 	VerificationScopeChannelKeyRead:        AccessTokenScopeOf(authz.ChannelSecretView),
 	VerificationScopeAdminUserCreate:       "user:write",
 	VerificationScopeAdminUserUpdate:       "user:write",

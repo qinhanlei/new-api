@@ -490,6 +490,10 @@ const AUDIT_TEMPLATES: Record<string, string> = {
   'user.reset_passkey': 'Reset the user passkey',
   'user.oauth_unbind': 'Removed an OAuth binding for the user',
   // System settings
+  'asset.storage.update': 'Updated asset storage settings',
+  'asset.storage.test': 'Tested asset storage access',
+  'channel.assets.update': 'Updated asset settings for channel {{id}}',
+  'asset.manage': 'Performed asset action {{action}}',
   'option.update': 'Updated system setting {{key}}',
   'option.passkey_domains':
     'Updated Passkey domains: removed {{domains}}; affected {{known}}; unknown {{unknown}}',

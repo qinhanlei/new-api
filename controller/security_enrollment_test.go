@@ -29,6 +29,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
@@ -113,6 +114,114 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
 	identity, err := service.ParseAccessToken(bundle.AccessToken)
 	require.NoError(t, err)
 	return user, identity
+}
+
+func TestAssetCredentialsRequireScopedSingleUseVerification(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	for _, scope := range []string{service.VerificationScopeAssetStorageWrite, service.VerificationScopeAssetStorageTest, service.VerificationScopeChannelAssetsWrite} {
+		_, err := service.GetVerificationRequirements(identity, scope)
+		assert.ErrorIs(t, err, service.ErrVerificationForbidden)
+	}
+	require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
+	require.NoError(t, model.PublishUserAuthCache(user.Id))
+	operation := service.VerificationOperation{Scope: service.VerificationScopeAssetStorageWrite}
+	body := `{"enabled":false,"revision":0}`
+	response := securityEnrollmentRequest(http.MethodPut, "/api/option/asset_storage", body, "", identity, UpdateAssetStorage)
+	assert.Equal(t, http.StatusForbidden, response.Code)
+	assert.Contains(t, response.Body.String(), "SECURITY_PROOF_REQUIRED")
+
+	wrongProof := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: service.VerificationScopeAssetStorageTest}, "password")
+	response = securityEnrollmentRequest(http.MethodPut, "/api/option/asset_storage", body, wrongProof, identity, UpdateAssetStorage)
+	assert.Equal(t, http.StatusForbidden, response.Code)
+	assert.Contains(t, response.Body.String(), "SECURITY_PROOF_SCOPE_MISMATCH")
+
+	proof := issueSecurityEnrollmentProof(t, identity, operation, "password")
+	response = securityEnrollmentRequest(http.MethodPut, "/api/option/asset_storage", body, proof, identity, UpdateAssetStorage)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"revision":1`)
+	response = securityEnrollmentRequest(http.MethodPut, "/api/option/asset_storage", body, proof, identity, UpdateAssetStorage)
+	assert.Equal(t, http.StatusForbidden, response.Code)
+	assert.Contains(t, response.Body.String(), "SECURITY_PROOF_CONSUMED")
+
+	channelOperation := service.VerificationOperation{Scope: service.VerificationScopeChannelAssetsWrite, Context: []byte(`{"channel_id":1}`)}
+	channelProof := issueSecurityEnrollmentProof(t, identity, channelOperation, "password")
+	channelOperation.Context = []byte(`{"channel_id":2}`)
+	_, err := service.ConsumeOperationProof(channelProof, identity, channelOperation)
+	assert.ErrorIs(t, err, service.ErrProofContext)
+
+	for _, key := range []string{system_setting.AssetStorageOption, model.AssetChannelOptionKey(1)} {
+		encoded, err := common.Marshal(map[string]string{"key": key, "value": "should-not-be-written"})
+		require.NoError(t, err)
+		response = securityEnrollmentRequest(http.MethodPut, "/api/option/", string(encoded), "", identity, UpdateOption)
+		assert.Contains(t, response.Body.String(), `"success":false`)
+	}
+}
+
+func TestAssetManagementRejectsCrossUserAndReadOnlyTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		query  string
+		role   int
+		scopes []string
+	}{
+		{name: "other owner", query: "&user_id=2", role: common.RoleCommonUser, scopes: []string{"asset:write"}},
+		{name: "read only token", role: common.RoleCommonUser, scopes: []string{"asset:read"}},
+		{name: "admin missing owner scope", query: "&user_id=2", role: common.RoleAdminUser, scopes: []string{"asset:write"}},
+		{name: "all owners cannot write", query: "&all_users=true", role: common.RoleRootUser, scopes: []string{"asset:write", "user:write"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(response)
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/assets/actions?Action=DeleteAsset&Version=2024-01-01"+tc.query, strings.NewReader(`{"Id":"asset-na-other"}`))
+			c.Set("id", 1)
+			c.Set("role", tc.role)
+			c.Set("use_access_token", true)
+			c.Set("access_token_id", 1)
+			c.Set("access_token_scopes", tc.scopes)
+			ManageAssetAction(c)
+			assert.True(t, response.Code == http.StatusForbidden || response.Code == http.StatusBadRequest, response.Body.String())
+			assert.Contains(t, response.Body.String(), `"success":false`)
+		})
+	}
+}
+
+func TestAssetReplicaDetailsRequireChannelReadPermission(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.CasbinRule{}, &model.AuthzRole{}))
+	require.NoError(t, authz.Init(model.DB))
+	response := securityEnrollmentRequest(http.MethodGet, "/api/assets/asset-na-example/replicas", "", "", identity, GetAssetReplicas)
+	assert.Equal(t, http.StatusForbidden, response.Code)
+	require.NoError(t, model.DB.Model(user).Update("role", common.RoleAdminUser).Error)
+	require.NoError(t, authz.SetUserPermissions(user.Id, authz.PermissionsMap{authz.ResourceChannel: {authz.ActionRead: false}}))
+	response = securityEnrollmentRequest(http.MethodGet, "/api/assets/asset-na-example/replicas", "", "", identity, func(c *gin.Context) {
+		c.Set("role", common.RoleAdminUser)
+		GetAssetReplicas(c)
+	})
+	assert.Equal(t, http.StatusForbidden, response.Code)
+	response = securityEnrollmentRequest(http.MethodGet, "/api/assets/asset-na-example/replicas", "", "", identity, func(c *gin.Context) {
+		c.Set("role", common.RoleRootUser)
+		c.Set("use_access_token", true)
+		c.Set("access_token_id", 1)
+		c.Set("access_token_scopes", []string{"asset:read"})
+		GetAssetReplicas(c)
+	})
+	assert.Equal(t, http.StatusForbidden, response.Code)
+}
+
+func TestAssetAdministratorCanCleanUpUnavailableOwners(t *testing.T) {
+	_, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	group := model.AssetGroup{PublicID: "group-na-disabled", UserID: 99, ProjectName: "default", Name: "Former user", GroupType: "AIGC"}
+	require.NoError(t, model.DB.Create(&group).Error)
+	response := securityEnrollmentRequest(http.MethodPost, "/api/assets/actions?Action=DeleteAssetGroup&Version=2024-01-01&user_id=99", `{"Id":"group-na-disabled"}`, "", identity, func(c *gin.Context) {
+		c.Set("role", common.RoleAdminUser)
+		ManageAssetAction(c)
+	})
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"success":true`)
+	require.NoError(t, model.DB.First(&group, group.ID).Error)
+	assert.Positive(t, group.DeletedAt)
 }
 
 func securityEnrollmentRequest(method, path, body, proof string, identity service.AuthIdentity, handler gin.HandlerFunc) *httptest.ResponseRecorder {

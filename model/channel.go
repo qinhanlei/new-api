@@ -355,7 +355,18 @@ func (channel *Channel) GetAutoBan() bool {
 }
 
 func (channel *Channel) Save() error {
-	return DB.Save(channel).Error
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := GuardAssetChannelMutation(tx, channel, nil); err != nil {
+			return err
+		}
+		// Save writes zero values too, unlike Update's partial struct update.
+		if channel.Id > 0 && channel.Key == "" && tx.Migrator().HasTable(&AssetGroupReplica{}) {
+			if err := checkAssetChannelResources(tx, []int{channel.Id}); err != nil {
+				return err
+			}
+		}
+		return tx.Save(channel).Error
+	})
 }
 
 // saveStatusState persists only the fields owned by the channel status flow.
@@ -492,6 +503,14 @@ func BatchDeleteChannels(ids []int) (int64, error) {
 	if tx.Error != nil {
 		return 0, tx.Error
 	}
+	if err := GuardAssetChannelMutation(tx, nil, ids); err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+	if err := deleteAssetChannelOptions(tx, ids); err != nil {
+		tx.Rollback()
+		return 0, err
+	}
 	var deletedCount int64
 	for _, chunk := range lo.Chunk(ids, 200) {
 		result := tx.Where("id in (?)", chunk).Delete(&Channel{})
@@ -600,7 +619,12 @@ func (channel *Channel) Update() error {
 		}
 	}
 	var err error
-	err = DB.Model(channel).Updates(channel).Error
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := GuardAssetChannelMutation(tx, channel, nil); err != nil {
+			return err
+		}
+		return tx.Model(channel).Updates(channel).Error
+	})
 	if err != nil {
 		return err
 	}
@@ -631,7 +655,15 @@ func (channel *Channel) UpdateBalance(balance float64) {
 
 func (channel *Channel) Delete() error {
 	var err error
-	err = DB.Delete(channel).Error
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := GuardAssetChannelMutation(tx, nil, []int{channel.Id}); err != nil {
+			return err
+		}
+		if err := deleteAssetChannelOptions(tx, []int{channel.Id}); err != nil {
+			return err
+		}
+		return tx.Delete(channel).Error
+	})
 	if err != nil {
 		return err
 	}
@@ -924,13 +956,44 @@ func updateChannelUsedQuota(id int, quota int) {
 }
 
 func DeleteChannelByStatus(status int64) (int64, error) {
-	result := DB.Where("status = ?", status).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return deleteChannelsByStatus([]int64{status})
 }
 
 func DeleteDisabledChannel() (int64, error) {
-	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return deleteChannelsByStatus([]int64{common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled})
+}
+
+func deleteChannelsByStatus(statuses []int64) (int64, error) {
+	var count int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := GuardAssetChannelMutation(tx, nil, nil); err != nil {
+			return err
+		}
+		var channels []Channel
+		if err := lockForUpdate(tx).Select("id").Where("status IN ?", statuses).Find(&channels).Error; err != nil {
+			return err
+		}
+		if len(channels) == 0 {
+			return nil
+		}
+		ids := make([]int, 0, len(channels))
+		for _, channel := range channels {
+			ids = append(ids, channel.Id)
+		}
+		if err := GuardAssetChannelMutation(tx, nil, ids); err != nil {
+			return err
+		}
+		if err := deleteAssetChannelOptions(tx, ids); err != nil {
+			return err
+		}
+		result := tx.Where("id IN ?", ids).Delete(&Channel{})
+		if result.Error != nil {
+			return result.Error
+		}
+		count = result.RowsAffected
+		return tx.Where("channel_id IN ?", ids).Delete(&Ability{}).Error
+	})
+	return count, err
 }
 
 func GetPaginatedTags(offset int, limit int) ([]*string, error) {

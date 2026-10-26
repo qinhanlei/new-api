@@ -212,6 +212,9 @@ func SetApiRouter(router *gin.Engine) {
 		optionRoute := apiRouter.Group("/option")
 		optionRoute.Use(middleware.RootAuth())
 		{
+			optionRoute.GET("/asset_storage", middleware.DisableCache(), controller.GetAssetStorage)
+			optionRoute.PUT("/asset_storage", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.UpdateAssetStorage)
+			optionRoute.POST("/asset_storage/test", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.TestAssetStorage)
 			optionRoute.GET("/", controller.GetOptions)
 			optionRoute.GET("/request_policy", controller.GetRequestPolicy)
 			optionRoute.PATCH("/request_policy", controller.UpdateRequestPolicy)
@@ -278,6 +281,7 @@ func SetApiRouter(router *gin.Engine) {
 		}
 		handlePermissionRoute(apiRouter.Group("", middleware.AdminAuth()), http.MethodGet, "/task_plugin_options", authz.TaskPluginBind, controller.GetTaskPluginOptions)
 		registerChannelRoutes(apiRouter)
+		registerAssetManagementRoutes(apiRouter)
 		registerAuthzRoutes(apiRouter)
 		tokenRoute := apiRouter.Group("/token")
 		tokenRoute.Use(middleware.UserAuth())
