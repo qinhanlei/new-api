@@ -19,13 +19,18 @@ For commercial licensing, please contact support@quantumnous.com
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { CellContext, ColumnDef } from '@tanstack/react-table'
 import { Eye, Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { CopyButton } from '@/components/copy-button'
-import { DataTablePage, useDataTable } from '@/components/data-table'
+import {
+  DataTablePage,
+  DataTableToolbar,
+  useDataTable,
+  type DataTablePageProps,
+} from '@/components/data-table'
 import { Dialog } from '@/components/dialog'
 import { ErrorState } from '@/components/error-state'
 import { Button } from '@/components/ui/button'
@@ -46,10 +51,14 @@ export function AssetListTable({
   group,
   scope,
   admin,
+  toolbarProps,
+  emptyState,
 }: {
-  group: AssetGroup
+  group?: AssetGroup
   scope: AssetScope
   admin: boolean
+  toolbarProps?: DataTablePageProps<Asset>['toolbarProps']
+  emptyState?: ReactNode
 }) {
   const { t } = useTranslation()
   const client = useQueryClient()
@@ -66,9 +75,11 @@ export function AssetListTable({
   const [replicas, setReplicas] = useState<Asset | null>(null)
   const [preview, setPreview] = useState<Asset | null>(null)
   const query = useQuery({
-    queryKey: [...assetQueryKeys.all, 'list', group.Id, scope, pagination],
-    queryFn: ({ signal }) =>
-      executeAssetAction<AssetList<Asset>>(
+    queryKey: [...assetQueryKeys.all, 'list', group?.Id, scope, pagination],
+    enabled: Boolean(group),
+    queryFn: ({ signal }) => {
+      if (!group) return { Items: [], TotalCount: 0 }
+      return executeAssetAction<AssetList<Asset>>(
         'ListAssets',
         {
           ProjectName: group.ProjectName,
@@ -78,7 +89,8 @@ export function AssetListTable({
         },
         scope,
         signal
-      ),
+      )
+    },
     refetchInterval: 10_000,
     meta: { errorToast: false },
   })
@@ -129,7 +141,7 @@ export function AssetListTable({
             id: 'owner',
             header: t('User ID'),
             cell: ({ row: { original: asset } }: CellContext<Asset, unknown>) =>
-              asset.UserId ?? group.UserId ?? '—',
+              asset.UserId ?? group?.UserId ?? '—',
           },
         ]
       : []),
@@ -189,6 +201,7 @@ export function AssetListTable({
   const { table } = useDataTable({
     data: query.data?.Items ?? [],
     columns,
+    columnFilters: [],
     totalCount: query.data?.TotalCount ?? 0,
     pagination,
     onPaginationChange: setPagination,
@@ -198,29 +211,39 @@ export function AssetListTable({
     enableRowSelection: false,
     getRowId: (asset) => asset.Id,
   })
-  if (query.isError && !query.data) {
+  if (!group || (query.isError && !query.data)) {
     return (
-      <ErrorState
-        description={getServerErrorMessage(query.error)}
-        onRetry={() => void query.refetch()}
-      />
+      <div className='flex h-full min-h-0 flex-col gap-3'>
+        <DataTableToolbar table={table} {...toolbarProps} />
+        <div className='min-h-0 flex-1 overflow-auto'>
+          {!group ? (
+            emptyState
+          ) : (
+            <ErrorState
+              description={getServerErrorMessage(query.error)}
+              onRetry={() => void query.refetch()}
+            />
+          )}
+        </div>
+      </div>
     )
   }
   return (
     <>
-      {query.isError && (
-        <p role='alert' className='text-destructive text-sm'>
-          {getServerErrorMessage(query.error)}
-        </p>
-      )}
       <DataTablePage
         table={table}
         columns={columns}
         isLoading={query.isPending}
         isFetching={query.isFetching}
-        toolbarProps={null}
-        fixedHeight={false}
+        toolbarProps={toolbarProps}
         emptyTitle={t('No assets')}
+        afterTable={
+          query.isError && (
+            <p role='alert' className='text-destructive text-sm'>
+              {getServerErrorMessage(query.error)}
+            </p>
+          )
+        }
       />
       <ConfirmDialog
         open={Boolean(deleting)}

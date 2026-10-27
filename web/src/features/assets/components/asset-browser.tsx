@@ -21,18 +21,29 @@ import {
   useMutation,
   useQueryClient,
 } from '@tanstack/react-query'
-import { Plus, RefreshCw } from 'lucide-react'
-import { useId, useState } from 'react'
+import { Copy, MoreHorizontal, Plus, RefreshCw } from 'lucide-react'
+import { useId, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
-import { CopyButton } from '@/components/copy-button'
+import { EmptyState } from '@/components/empty-state'
 import { ErrorState } from '@/components/error-state'
+import { SectionPageLayout } from '@/components/layout'
 import { LoadingState } from '@/components/loading-state'
 import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Label } from '@/components/ui/label'
 import { NativeSelect } from '@/components/ui/native-select'
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { getServerErrorMessage } from '@/lib/server-error-message'
 
 import { assetQueryKeys, executeAssetAction } from '../api'
@@ -45,14 +56,21 @@ export function AssetBrowser({
   project,
   scope,
   admin,
+  settingsActions,
+  filterControls,
+  filterActions,
 }: {
   project: string
   scope: AssetScope
   admin: boolean
+  settingsActions?: ReactNode
+  filterControls?: ReactNode
+  filterActions?: ReactNode
 }) {
   const { t } = useTranslation()
   const id = useId()
   const client = useQueryClient()
+  const { copyToClipboard } = useCopyToClipboard()
   const [groupId, setGroupId] = useState('')
   const [groupDialog, setGroupDialog] = useState<'create' | 'rename' | null>(
     null
@@ -93,9 +111,22 @@ export function AssetBrowser({
     },
     meta: { errorToast: false },
   })
-  if (groups.isPending) return <LoadingState />
-  if (groups.isError && !groups.data) {
-    return (
+  let emptyState = (
+    <EmptyState
+      title={t('No asset groups')}
+      action={
+        !scope.allUsers && (
+          <Button onClick={() => setGroupDialog('create')}>
+            {t('Create asset group')}
+          </Button>
+        )
+      }
+    />
+  )
+  if (groups.isPending) {
+    emptyState = <LoadingState />
+  } else if (groups.isError) {
+    emptyState = (
       <ErrorState
         description={getServerErrorMessage(groups.error)}
         onRetry={() => void groups.refetch()}
@@ -103,107 +134,163 @@ export function AssetBrowser({
     )
   }
   return (
-    <div className='space-y-4'>
-      {scope.allUsers && (
-        <p className='text-muted-foreground text-sm'>
-          {t('Select a user ID to create or change assets.')}
-        </p>
-      )}
-      <div className='flex flex-wrap items-end gap-2'>
-        <div className='min-w-0 space-y-1.5'>
-          <Label htmlFor={id}>{t('Asset group')}</Label>
-          <NativeSelect
-            id={id}
-            className='w-full max-w-sm'
-            value={group?.Id ?? ''}
-            onChange={(event) => setGroupId(event.target.value)}
-          >
-            {!items.length && <option value=''>{t('No asset groups')}</option>}
-            {items.map((item) => (
-              <option value={item.Id} key={item.Id}>
-                {scope.allUsers ? `${item.Name} (${item.UserId})` : item.Name}
-              </option>
-            ))}
-          </NativeSelect>
-        </div>
-        {groups.hasNextPage && (
+    <>
+      <SectionPageLayout fixedContent>
+        <SectionPageLayout.Title>{t('Asset library')}</SectionPageLayout.Title>
+        <SectionPageLayout.Actions>
+          {settingsActions}
           <Button
-            variant='outline'
-            disabled={groups.isFetchingNextPage}
-            onClick={() => void groups.fetchNextPage()}
+            disabled={!group || scope.allUsers}
+            onClick={() => setAdding(true)}
           >
-            {t('Load more')}
+            <Plus className='size-4' />
+            {t('Add asset')}
           </Button>
-        )}
-        <Button
-          variant='outline'
-          disabled={scope.allUsers}
-          onClick={() => setGroupDialog('create')}
-        >
-          <Plus className='size-4' />
-          {t('Create asset group')}
-        </Button>
-        <Button
-          variant='outline'
-          disabled={!group || scope.allUsers}
-          onClick={() => setGroupDialog('rename')}
-        >
-          {t('Rename')}
-        </Button>
-        <Button
-          variant='outline'
-          disabled={!group || scope.allUsers}
-          onClick={() => {
-            remove.reset()
-            setDeleting(true)
-          }}
-        >
-          {t('Delete group')}
-        </Button>
-        <Button
-          disabled={!group || scope.allUsers}
-          onClick={() => setAdding(true)}
-        >
-          <Plus className='size-4' />
-          {t('Add asset')}
-        </Button>
-        <Button
-          variant='ghost'
-          size='icon'
-          aria-label={t('Refresh')}
-          disabled={groups.isFetching}
-          onClick={() =>
-            void client.invalidateQueries({ queryKey: assetQueryKeys.all })
-          }
-        >
-          <RefreshCw className='size-4' />
-        </Button>
-      </div>
-      {groups.isError && (
-        <ErrorState
-          className='min-h-0 p-3'
-          description={getServerErrorMessage(groups.error)}
-          onRetry={() =>
-            void (groups.isFetchNextPageError
-              ? groups.fetchNextPage()
-              : groups.refetch())
-          }
-        />
-      )}
-      {group && (
-        <>
-          <div className='text-muted-foreground flex min-w-0 items-center gap-1 text-xs'>
-            <span className='truncate'>{group.Id}</span>
-            <CopyButton value={group.Id} />
+        </SectionPageLayout.Actions>
+        <SectionPageLayout.Content>
+          <div className='flex h-full min-h-0 flex-col gap-3'>
+            {groups.isError && groups.data && (
+              <ErrorState
+                className='min-h-0 shrink-0 p-3'
+                description={getServerErrorMessage(groups.error)}
+                onRetry={() =>
+                  void (groups.isFetchNextPageError
+                    ? groups.fetchNextPage()
+                    : groups.refetch())
+                }
+              />
+            )}
+            <div className='min-h-0 flex-1'>
+              <AssetListTable
+                key={group?.Id ?? 'empty'}
+                group={group}
+                scope={scope}
+                admin={admin}
+                toolbarProps={{
+                  customSearch: filterControls ?? null,
+                  hideViewOptions: true,
+                  additionalSearch: (
+                    <>
+                      <div className='flex min-w-0 items-center gap-2'>
+                        <Label className='sr-only' htmlFor={id}>
+                          {t('Asset group')}
+                        </Label>
+                        <NativeSelect
+                          id={id}
+                          className='w-48 max-w-full'
+                          value={group?.Id ?? ''}
+                          onChange={(event) => setGroupId(event.target.value)}
+                          disabled={groups.isPending}
+                        >
+                          {!items.length && (
+                            <option value=''>{t('No asset groups')}</option>
+                          )}
+                          {items.map((item) => (
+                            <option value={item.Id} key={item.Id}>
+                              {scope.allUsers
+                                ? `${item.Name} (${item.UserId})`
+                                : item.Name}
+                            </option>
+                          ))}
+                        </NativeSelect>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger
+                            render={
+                              <Button
+                                variant='ghost'
+                                size='icon'
+                                aria-label={t('Group actions')}
+                              />
+                            }
+                          >
+                            <MoreHorizontal className='size-4' />
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent className='w-60'>
+                            <DropdownMenuGroup>
+                              {group && (
+                                <DropdownMenuLabel className='break-all'>
+                                  {group.Id}
+                                </DropdownMenuLabel>
+                              )}
+                              <DropdownMenuItem
+                                disabled={!group}
+                                onClick={() =>
+                                  group && void copyToClipboard(group.Id)
+                                }
+                              >
+                                <Copy className='size-4' />
+                                {t('Copy group ID')}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                disabled={scope.allUsers}
+                                onClick={() => setGroupDialog('create')}
+                              >
+                                {t('Create asset group')}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                disabled={!group || scope.allUsers}
+                                onClick={() => setGroupDialog('rename')}
+                              >
+                                {t('Rename')}
+                              </DropdownMenuItem>
+                            </DropdownMenuGroup>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuGroup>
+                              <DropdownMenuItem
+                                variant='destructive'
+                                disabled={!group || scope.allUsers}
+                                onClick={() => {
+                                  remove.reset()
+                                  setDeleting(true)
+                                }}
+                              >
+                                {t('Delete group')}
+                              </DropdownMenuItem>
+                            </DropdownMenuGroup>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                      {groups.hasNextPage && (
+                        <Button
+                          variant='outline'
+                          disabled={groups.isFetchingNextPage}
+                          onClick={() => void groups.fetchNextPage()}
+                        >
+                          {t('Load more')}
+                        </Button>
+                      )}
+                      {scope.allUsers && (
+                        <span className='text-muted-foreground text-xs'>
+                          {t('Select a user ID to create or change assets.')}
+                        </span>
+                      )}
+                    </>
+                  ),
+                  preActions: (
+                    <>
+                      {filterActions}
+                      <Button
+                        variant='ghost'
+                        size='icon'
+                        aria-label={t('Refresh')}
+                        disabled={groups.isFetching}
+                        onClick={() =>
+                          void client.invalidateQueries({
+                            queryKey: assetQueryKeys.all,
+                          })
+                        }
+                      >
+                        <RefreshCw className='size-4' />
+                      </Button>
+                    </>
+                  ),
+                }}
+                emptyState={emptyState}
+              />
+            </div>
           </div>
-          <AssetListTable
-            key={group.Id}
-            group={group}
-            scope={scope}
-            admin={admin}
-          />
-        </>
-      )}
+        </SectionPageLayout.Content>
+      </SectionPageLayout>
       {groupDialog && (
         <AssetGroupDialog
           group={groupDialog === 'rename' ? group : undefined}
@@ -238,6 +325,6 @@ export function AssetBrowser({
           </p>
         )}
       </ConfirmDialog>
-    </div>
+    </>
   )
 }

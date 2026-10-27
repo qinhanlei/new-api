@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
 import { useId, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -28,12 +29,18 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { NativeSelect } from '@/components/ui/native-select'
+import {
+  ADMIN_PERMISSION_ACTIONS,
+  ADMIN_PERMISSION_RESOURCES,
+  hasPermission,
+} from '@/lib/admin-permissions'
 import { ROLE } from '@/lib/roles'
 import { getServerErrorMessage } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { assetQueryKeys, getAssetConfig } from './api'
 import { AssetBrowser } from './components/asset-browser'
+import { AssetChannelSettingsDialog } from './components/asset-channel-settings-dialog'
 import type { AssetScope } from './types'
 
 export function Assets() {
@@ -41,78 +48,121 @@ export function Assets() {
   const id = useId()
   const user = useAuthStore((state) => state.auth.user)
   const admin = (user?.role ?? 0) >= ROLE.ADMIN
+  const canConfigureChannels =
+    admin &&
+    hasPermission(
+      user,
+      ADMIN_PERMISSION_RESOURCES.CHANNEL,
+      ADMIN_PERMISSION_ACTIONS.READ
+    ) &&
+    hasPermission(
+      user,
+      ADMIN_PERMISSION_RESOURCES.CHANNEL,
+      ADMIN_PERMISSION_ACTIONS.SENSITIVE_WRITE
+    )
+  const [channelsOpen, setChannelsOpen] = useState(false)
   const [filters, setFilters] = useState<{
     project: string
     scope: AssetScope
   }>({ project: 'default', scope: {} })
-  const [scopeMode, setScopeMode] = useState('self')
+  const [draft, setDraft] = useState({
+    project: 'default',
+    scope: 'self',
+    userId: '',
+  })
   const config = useQuery({
     queryKey: [...assetQueryKeys.all, 'config'],
     queryFn: ({ signal }) => getAssetConfig(signal),
     meta: { errorToast: false },
   })
+  const settingsActions = (
+    <>
+      {canConfigureChannels && (
+        <Button variant='outline' onClick={() => setChannelsOpen(true)}>
+          {t('Channel settings')}
+        </Button>
+      )}
+      {user?.role === ROLE.SUPER_ADMIN && (
+        <Button
+          variant='outline'
+          render={
+            <Link
+              to='/system-settings/operations/$section'
+              params={{ section: 'assets' }}
+            />
+          }
+        >
+          {t('Storage settings')}
+        </Button>
+      )}
+    </>
+  )
   return (
-    <SectionPageLayout>
-      <SectionPageLayout.Title>{t('Asset library')}</SectionPageLayout.Title>
-      <SectionPageLayout.Content>
-        {config.isPending && <LoadingState />}
-        {config.isError && (
-          <ErrorState
-            description={getServerErrorMessage(config.error)}
-            onRetry={() => void config.refetch()}
-          />
-        )}
-        {config.data && !config.data.enabled && (
-          <EmptyState
-            title={t('Asset library is disabled')}
-            description={t('Ask an administrator to configure asset storage.')}
-          />
-        )}
-        {config.data?.enabled && (
-          <div className='space-y-4'>
+    <>
+      {config.data?.enabled ? (
+        <AssetBrowser
+          key={`${filters.project}:${filters.scope.userId ?? 'self'}:${filters.scope.allUsers ?? false}`}
+          project={filters.project}
+          scope={filters.scope}
+          admin={admin}
+          settingsActions={settingsActions}
+          filterActions={
+            <Button form={`${id}-filters`} type='submit' variant='outline'>
+              {t('Apply')}
+            </Button>
+          }
+          filterControls={
             <form
-              className='flex flex-wrap items-end gap-3'
+              id={`${id}-filters`}
+              className='contents'
               onSubmit={(event) => {
                 event.preventDefault()
                 const values = new FormData(event.currentTarget)
                 const project =
                   String(values.get('project') ?? '').trim() || 'default'
                 let scope: AssetScope = {}
-                if (scopeMode === 'all') scope = { allUsers: true }
-                if (scopeMode === 'user') {
+                if (draft.scope === 'all') scope = { allUsers: true }
+                if (draft.scope === 'user') {
                   scope = { userId: Number(values.get('userId')) }
                 }
                 setFilters({ project, scope })
               }}
             >
-              <div className='space-y-1.5'>
+              <div className='flex items-center gap-2'>
                 <Label htmlFor={`${id}-project`}>{t('Project name')}</Label>
                 <Input
                   id={`${id}-project`}
                   name='project'
-                  defaultValue='default'
+                  value={draft.project}
+                  onChange={(event) =>
+                    setDraft({ ...draft, project: event.target.value })
+                  }
                   required
                   maxLength={64}
-                  className='w-48'
+                  className='w-32'
                 />
               </div>
               {admin && (
                 <>
-                  <div className='space-y-1.5'>
-                    <Label htmlFor={`${id}-scope`}>{t('Owner')}</Label>
-                    <NativeSelect
-                      id={`${id}-scope`}
-                      value={scopeMode}
-                      onChange={(event) => setScopeMode(event.target.value)}
-                    >
-                      <option value='self'>{t('My assets')}</option>
-                      <option value='user'>{t('User ID')}</option>
-                      <option value='all'>{t('All users')}</option>
-                    </NativeSelect>
-                  </div>
-                  {scopeMode === 'user' && (
-                    <div className='space-y-1.5'>
-                      <Label htmlFor={`${id}-user`}>{t('User ID')}</Label>
+                  <Label className='sr-only' htmlFor={`${id}-scope`}>
+                    {t('Owner')}
+                  </Label>
+                  <NativeSelect
+                    id={`${id}-scope`}
+                    value={draft.scope}
+                    onChange={(event) =>
+                      setDraft({ ...draft, scope: event.target.value })
+                    }
+                  >
+                    <option value='self'>{t('My assets')}</option>
+                    <option value='user'>{t('User ID')}</option>
+                    <option value='all'>{t('All users')}</option>
+                  </NativeSelect>
+                  {draft.scope === 'user' && (
+                    <>
+                      <Label className='sr-only' htmlFor={`${id}-user`}>
+                        {t('User ID')}
+                      </Label>
                       <Input
                         id={`${id}-user`}
                         name='userId'
@@ -120,25 +170,50 @@ export function Assets() {
                         min={1}
                         step={1}
                         required
-                        className='w-32'
+                        value={draft.userId}
+                        onChange={(event) =>
+                          setDraft({ ...draft, userId: event.target.value })
+                        }
+                        placeholder={t('User ID')}
+                        className='w-24'
                       />
-                    </div>
+                    </>
                   )}
                 </>
               )}
-              <Button type='submit' variant='outline'>
-                {t('Apply')}
-              </Button>
             </form>
-            <AssetBrowser
-              key={`${filters.project}:${filters.scope.userId ?? 'self'}:${filters.scope.allUsers ?? false}`}
-              project={filters.project}
-              scope={filters.scope}
-              admin={admin}
-            />
-          </div>
-        )}
-      </SectionPageLayout.Content>
-    </SectionPageLayout>
+          }
+        />
+      ) : (
+        <SectionPageLayout fixedContent>
+          <SectionPageLayout.Title>
+            {t('Asset library')}
+          </SectionPageLayout.Title>
+          <SectionPageLayout.Actions>
+            {settingsActions}
+          </SectionPageLayout.Actions>
+          <SectionPageLayout.Content>
+            {config.isPending && <LoadingState />}
+            {config.isError && (
+              <ErrorState
+                description={getServerErrorMessage(config.error)}
+                onRetry={() => void config.refetch()}
+              />
+            )}
+            {config.data && !config.data.enabled && (
+              <EmptyState
+                title={t('Asset library is disabled')}
+                description={t(
+                  'Ask an administrator to configure asset storage.'
+                )}
+              />
+            )}
+          </SectionPageLayout.Content>
+        </SectionPageLayout>
+      )}
+      {channelsOpen && canConfigureChannels && (
+        <AssetChannelSettingsDialog onClose={() => setChannelsOpen(false)} />
+      )}
+    </>
   )
 }

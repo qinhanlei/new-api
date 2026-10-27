@@ -17,6 +17,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRoute,
+  createRouter,
+  RouterProvider,
+} from '@tanstack/react-router'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, afterEach, expect, test, vi } from 'vitest'
@@ -40,6 +47,29 @@ const group: AssetGroup = {
   UserId: 23,
 }
 let client: QueryClient
+
+async function renderAssetsPage() {
+  const root = createRootRoute()
+  const route = createRoute({
+    getParentRoute: () => root,
+    path: '/asset-library',
+    component: Assets,
+  })
+  const storage = createRoute({
+    getParentRoute: () => root,
+    path: '/system-settings/operations/$section',
+  })
+  const router = createRouter({
+    routeTree: root.addChildren([route, storage]),
+    history: createMemoryHistory({ initialEntries: ['/asset-library'] }),
+  })
+  await router.load()
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>
+  )
+}
 
 beforeEach(() => {
   client = new QueryClient({
@@ -230,6 +260,7 @@ test('group selection survives refresh and failed deletion leaves confirmation o
       <AssetBrowser project='default' scope={{}} admin={false} />
     </QueryClientProvider>
   )
+  await screen.findByRole('option', { name: 'Products' })
   await user.selectOptions(
     await screen.findByLabelText('Asset group'),
     'group-two'
@@ -282,7 +313,9 @@ test('group deletion warns that all assets and their URIs are removed before con
       <AssetBrowser project='default' scope={{ userId: 23 }} admin />
     </QueryClientProvider>
   )
-  await user.click(await screen.findByRole('button', { name: 'Delete group' }))
+  await screen.findByRole('option', { name: 'Avatars' })
+  await user.click(screen.getByRole('button', { name: 'Group actions' }))
+  await user.click(screen.getByRole('menuitem', { name: 'Delete group' }))
   const dialog = screen.getByRole('alertdialog')
   expect(dialog).toHaveTextContent(
     'Delete Avatars and all assets in this group? Their asset URIs will no longer work.'
@@ -290,7 +323,8 @@ test('group deletion warns that all assets and their URIs are removed before con
   expect(deleted).toBe(false)
   await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
   expect(deleted).toBe(false)
-  await user.click(screen.getByRole('button', { name: 'Delete group' }))
+  await user.click(screen.getByRole('button', { name: 'Group actions' }))
+  await user.click(screen.getByRole('menuitem', { name: 'Delete group' }))
   await user.click(
     within(screen.getByRole('alertdialog')).getByRole('button', {
       name: 'Delete',
@@ -424,13 +458,19 @@ test.each([false, true])(
         <AssetBrowser project='default' scope={{ allUsers: true }} admin />
       </QueryClientProvider>
     )
-    expect(
-      await screen.findByRole('button', { name: 'Create asset group' })
-    ).toBeDisabled()
+    await screen.findByRole('option', { name: 'Avatars (23)' })
     expect(screen.getByRole('button', { name: 'Add asset' })).toBeDisabled()
     expect(
       await screen.findByRole('button', { name: 'Delete Avatar' })
     ).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Group actions' }))
+    expect(
+      screen.getByRole('menuitem', { name: 'Create asset group' })
+    ).toHaveAttribute('aria-disabled', 'true')
+    expect(
+      screen.getByRole('menuitem', { name: 'Delete group' })
+    ).toHaveAttribute('aria-disabled', 'true')
+    await user.keyboard('{Escape}')
     if (!canReadChannel) {
       expect(
         screen.queryByRole('button', { name: 'Channel replicas' })
@@ -463,4 +503,198 @@ test('a disabled asset library exposes no creation or browsing requests', async 
     screen.queryByRole('button', { name: 'Create asset group' })
   ).not.toBeInTheDocument()
   expect(post).not.toHaveBeenCalled()
+})
+
+test.each([
+  [ROLE.SUPER_ADMIN, {}, true, true],
+  [ROLE.ADMIN, { read: true, sensitive_write: true }, true, false],
+  [ROLE.ADMIN, { read: true, sensitive_write: false }, false, false],
+  [ROLE.USER, {}, false, false],
+])(
+  'disabled library keeps only authorized settings accessible for role %s and permissions %j',
+  async (role, channel, channelsVisible, storageVisible) => {
+    useAuthStore.getState().auth.setUser({
+      id: 1,
+      username: 'viewer',
+      role,
+      permissions: { admin_permissions: { channel } },
+    })
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: { success: true, data: { enabled: false } },
+    })
+    const post = vi.spyOn(api, 'post')
+    await renderAssetsPage()
+    expect(await screen.findByText('Asset library is disabled')).toBeVisible()
+    expect(
+      Boolean(screen.queryByRole('button', { name: 'Channel settings' }))
+    ).toBe(channelsVisible)
+    const storage = screen.queryByRole('button', { name: 'Storage settings' })
+    expect(Boolean(storage)).toBe(storageVisible)
+    if (storage) {
+      expect(storage).toHaveAttribute(
+        'href',
+        '/system-settings/operations/assets'
+      )
+    }
+    expect(post).not.toHaveBeenCalled()
+  }
+)
+
+test('draft ownership changes do not change the upload target until applied', async () => {
+  const user = userEvent.setup()
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'admin', role: ROLE.ADMIN })
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: { enabled: true } },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockImplementation(async (_url, body, options) => {
+      const action = (options?.params as { Action?: string } | undefined)
+        ?.Action
+      if (action === 'ListAssetGroups') {
+        return {
+          data: {
+            success: true,
+            data: {
+              Items: [
+                {
+                  ...group,
+                  ProjectName: (body as { ProjectName: string }).ProjectName,
+                },
+              ],
+            },
+          },
+        }
+      }
+      return {
+        data: {
+          success: true,
+          data: { Items: [], TotalCount: 0, Id: 'asset-one' },
+        },
+      }
+    })
+  await renderAssetsPage()
+  await screen.findByRole('option', { name: 'Avatars' })
+  await user.selectOptions(screen.getByLabelText('Owner'), 'user')
+  await user.type(screen.getByLabelText('User ID'), '23')
+  await user.clear(screen.getByLabelText('Project name'))
+  await user.type(screen.getByLabelText('Project name'), 'studio')
+  await user.click(screen.getByRole('button', { name: 'Add asset' }))
+  const dialog = screen.getByRole('dialog')
+  await user.type(within(dialog).getByLabelText('Name'), 'Avatar')
+  await user.type(
+    within(dialog).getByLabelText('Asset URL'),
+    'https://example.com/avatar.png'
+  )
+  await user.click(within(dialog).getByRole('button', { name: 'Add asset' }))
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  expect(post).toHaveBeenCalledWith(
+    '/api/assets/actions',
+    expect.objectContaining({ ProjectName: 'default', Name: 'Avatar' }),
+    expect.objectContaining({
+      params: expect.objectContaining({
+        Action: 'CreateAsset',
+        user_id: undefined,
+      }),
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Apply' }))
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith(
+      '/api/assets/actions',
+      expect.objectContaining({ ProjectName: 'studio' }),
+      expect.objectContaining({
+        params: expect.objectContaining({
+          Action: 'ListAssetGroups',
+          user_id: 23,
+        }),
+      })
+    )
+  )
+})
+
+test('group actions are available from one menu and an empty library offers group creation', async () => {
+  const user = userEvent.setup()
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: { Items: [] } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetBrowser project='default' scope={{}} admin={false} />
+    </QueryClientProvider>
+  )
+  expect(
+    await screen.findByRole('button', { name: 'Create asset group' })
+  ).toBeVisible()
+  expect(screen.getByRole('button', { name: 'Add asset' })).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Group actions' }))
+  expect(
+    screen.getByRole('menuitem', { name: 'Create asset group' })
+  ).toBeEnabled()
+  expect(screen.getByRole('menuitem', { name: 'Rename' })).toHaveAttribute(
+    'aria-disabled',
+    'true'
+  )
+  await user.keyboard('{Escape}')
+  await user.click(screen.getByRole('button', { name: 'Create asset group' }))
+  expect(
+    await screen.findByRole('dialog', { name: 'Create asset group' })
+  ).toBeVisible()
+})
+
+test('a failed list refresh keeps existing assets and pagination available', async () => {
+  const user = userEvent.setup()
+  let failList = false
+  vi.spyOn(api, 'post').mockImplementation(async (_url, _body, options) => {
+    if (
+      (options?.params as { Action?: string } | undefined)?.Action ===
+      'ListAssetGroups'
+    ) {
+      return { data: { success: true, data: { Items: [group] } } }
+    }
+    if (failList) {
+      return { data: { success: false, message: 'Assets unavailable' } }
+    }
+    return {
+      data: {
+        success: true,
+        data: {
+          Items: [
+            {
+              Id: 'asset-one',
+              Name: 'Avatar',
+              ProjectName: 'default',
+              GroupId: group.Id,
+              Status: 'Active',
+              AssetType: 'Image',
+              URL: '',
+            },
+          ],
+          TotalCount: 21,
+        },
+      },
+    }
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetBrowser project='default' scope={{}} admin={false} />
+    </QueryClientProvider>
+  )
+  expect(await screen.findByText('Avatar')).toBeVisible()
+  failList = true
+  await user.click(screen.getByRole('button', { name: 'Refresh' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Assets unavailable'
+  )
+  expect(screen.getByText('Avatar')).toBeVisible()
+  expect(screen.getByRole('button', { name: 'Go to next page' })).toBeEnabled()
+  failList = false
+  await user.click(screen.getByRole('button', { name: 'Refresh' }))
+  await waitFor(() =>
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  )
 })

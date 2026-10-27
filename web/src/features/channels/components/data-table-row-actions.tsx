@@ -280,16 +280,6 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
             </DropdownMenuShortcut>
           </DropdownMenuItem>
 
-          <DropdownMenuItem
-            disabled={!canEditSensitive}
-            onClick={() => {
-              setCurrentRow(channel)
-              setOpen('asset-library')
-            }}
-          >
-            {t('Asset library')}
-          </DropdownMenuItem>
-
           {/* Query Balance */}
           <DropdownMenuItem onClick={handleQueryBalance}>
             {t('Query Balance')}

@@ -200,38 +200,6 @@ curl --fail-with-body http://localhost:3000/v1/responses \
   -d '{"model":"your-enabled-model","input":"Hello!"}'
 ```
 
-### Doubao asset library
-
-The asset library is disabled by default and supports AIGC images, video, and audio. Upstreams still review imported materials; human identity verification is outside this first implementation.
-
-1. Open **System settings → Operations → Asset storage**, select the S3 provider, configure the endpoint, region, bucket, and credentials, test access, and enable storage. Selecting a provider sets the addressing default, which can be adjusted for your deployment; existing configurations keep their addressing mode. Endpoints without a scheme receive `https://`; self-hosted services can explicitly use `http://`. Do not include a bucket or path in the endpoint. Keep the bucket private. The gateway signs temporary read URLs for upstreams, so they must be able to reach this endpoint. For Volcengine TOS, use its S3 endpoint (for example, `https://tos-s3-cn-beijing.volces.com`) with path-style addressing disabled. Testing and saving use the existing root administrator authentication without another password prompt. HTTP storage supports server-side operations, but browsers may block its previews on an HTTPS dashboard as mixed content; a successful connection test does not verify browser previews.
-2. Install or update the doubao task plugin with `asset-references@1`. Open **Asset library** on a saved channel and configure its full Ark-compatible material API URL, including any path prefix. Bearer authentication reuses the channel key; the official Volcengine control plane uses AK/SK signing. Only single-key channels are supported.
-3. Open **Asset library** to create groups and upload files or import URLs. The first eligible channel imports the asset immediately; further channels synchronize when needed. Users own their assets, and administrators can explicitly select an owner to manage.
-
-Cluster nodes share the existing database and one S3 bucket. Database leases coordinate work without shared local directories or a master URL. Each original is stored once. Do not expire objects under `new-api-assets/` with bucket lifecycle rules while they are in use.
-
-Clients authenticate with a New API Bearer key and call `POST /doubao/?Action=...&Version=2024-01-01`. The ten supported actions are Create, Get, List, Update, and Delete for both Asset and AssetGroup, using Ark field names and response envelopes:
-
-```bash
-curl --fail-with-body 'http://localhost:3000/doubao/?Action=CreateAssetGroup&Version=2024-01-01' \
-  -H "Authorization: Bearer ${NEW_API_KEY}" \
-  -H 'Content-Type: application/json' \
-  -d '{"Name":"Products","GroupType":"AIGC"}'
-
-curl --fail-with-body 'http://localhost:3000/doubao/?Action=CreateAsset&Version=2024-01-01' \
-  -H "Authorization: Bearer ${NEW_API_KEY}" \
-  -H 'Content-Type: application/json' \
-  -d '{"GroupId":"group-na-...","AssetType":"Image","URL":"https://example.com/product.png"}'
-```
-
-Poll `GetAsset` with the returned `Id`. Once `Status` is `Active`, set `content[].image_url.url` to `asset://asset-na-...` when calling `/doubao/api/v3/contents/generations/tasks`; use the corresponding URL fields for video and audio. `/v1/tasks/doubao` and doubao-plugin requests to `/v1/videos` also support these references. Keep the gateway ID; the host translates it for the selected channel. Do not mix gateway assets and raw upstream asset IDs in one request.
-
-List requests require `Filter.GroupType: "AIGC"`. Use either cursor pagination (`MaxResults`, `NextToken`) or supported page-number pagination, never both. Client `ProjectName` is a per-user gateway namespace; each channel fixes the actual upstream project. Images are limited to 30 MiB, video and audio to 100 MiB, subject to upstream restrictions.
-
-If no eligible channel has every referenced asset ready, generation returns HTTP `409`, `AssetNotReady`, and `Retry-After` before video submission or quota reservation. Retry later. Deleting an asset immediately prevents new references; background cleanup waits for in-flight tasks before removing replicas and S3 objects. Ambiguous upstream material creation is reconciled without blindly repeating it; deletion waits five minutes before reconciliation. An uncertain video submission using assets stops automatic retries and retains its asset references for 73 hours so an upstream task cannot lose its inputs prematurely.
-
-Existing asset resources prevent changes to their storage location or channel account identity, including the generation key and endpoint. Delete resources and wait for cleanup first. Disabling the feature does not migrate or delete assets. Tables and settings from earlier experimental asset implementations are not migrated automatically.
-
 <a id="deployment"></a>
 
 ## Deployment

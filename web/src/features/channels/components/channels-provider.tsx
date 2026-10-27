@@ -37,7 +37,6 @@ import type { Channel } from '../types'
 // ============================================================================
 
 type DialogType =
-  | 'asset-library'
   | 'create-channel'
   | 'update-channel'
   | 'test-channel'

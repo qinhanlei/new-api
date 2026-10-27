@@ -22,13 +22,13 @@ import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import { ChannelAssetsDialog } from '@/features/channels/components/dialogs/channel-assets-dialog'
 import { channelSchema } from '@/features/channels/types'
 import { SettingsPageProvider } from '@/features/system-settings/components/settings-page-context'
 import { AssetStorageSection } from '@/features/system-settings/operations/asset-storage-section'
 import { api } from '@/lib/api'
 
-import type { AssetStorageConfig } from '../types'
+import { AssetChannelSettingsDialog } from '../components/asset-channel-settings-dialog'
+import type { AssetChannelConfig, AssetStorageConfig } from '../types'
 
 const config: AssetStorageConfig = {
   enabled: true,
@@ -51,6 +51,9 @@ const channel = channelSchema.parse({
   response_time: 0,
   balance_updated_time: 0,
 })
+const otherChannel = { ...channel, id: 8, name: 'Second channel' }
+let channels = [channel, otherChannel]
+let channelConfigs: Record<number, AssetChannelConfig>
 let client: QueryClient
 
 function StorageFixture() {
@@ -66,6 +69,29 @@ function StorageFixture() {
 }
 
 beforeEach(() => {
+  channels = [channel, otherChannel]
+  channelConfigs = {
+    7: {
+      channel_id: 7,
+      enabled: false,
+      endpoint: 'https://upstream.example.com',
+      project_name: 'default',
+      auth_type: 'bearer',
+      access_key: '',
+      has_secret: false,
+      revision: 0,
+    },
+    8: {
+      channel_id: 8,
+      enabled: true,
+      endpoint: 'https://second.example.com/assets',
+      project_name: 'second',
+      auth_type: 'aksk',
+      access_key: 'second-access',
+      has_secret: true,
+      revision: 3,
+    },
+  }
   client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
@@ -86,21 +112,19 @@ beforeEach(() => {
     if (url === '/api/option/asset_storage') {
       return { data: { success: true, data: config } }
     }
-    return {
-      data: {
-        success: true,
-        data: {
-          channel_id: 7,
-          enabled: false,
-          endpoint: 'https://upstream.example.com',
-          project_name: 'default',
-          auth_type: 'bearer',
-          access_key: '',
-          has_secret: false,
-          revision: 0,
-        },
-      },
+    if (url === '/api/channel' || url === '/api/channel/search') {
+      const keyword = String(
+        (options?.params as { keyword?: string })?.keyword ?? ''
+      )
+      const items = channels.filter(
+        (item) =>
+          item.name.toLowerCase().includes(keyword.toLowerCase()) ||
+          String(item.id) === keyword
+      )
+      return { data: { success: true, data: { items, total: items.length } } }
     }
+    const id = Number(String(url).split('/')[3])
+    return { data: { success: true, data: channelConfigs[id] } }
   })
   vi.spyOn(api, 'post').mockImplementation(async (url, body) => ({
     data: {
@@ -185,23 +209,37 @@ test('connection testing needs no verification and keeps unsaved configuration',
   expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled()
 })
 
-test('single-key channel uses its existing key and binds verification to the channel ID', async () => {
+test('selecting a channel fetches only its settings and saves with verification bound to its ID', async () => {
   const user = userEvent.setup()
   const close = vi.fn()
-  const put = vi
-    .spyOn(api, 'put')
-    .mockResolvedValue({ data: { success: true, data: {} } })
+  const put = vi.spyOn(api, 'put').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...channelConfigs[7], enabled: true, revision: 1 },
+    },
+  })
   render(
     <QueryClientProvider client={client}>
-      <ChannelAssetsDialog channel={channel} onClose={close} />
+      <AssetChannelSettingsDialog onClose={close} />
     </QueryClientProvider>
   )
+  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  expect(api.get).not.toHaveBeenCalledWith(
+    '/api/channel/7/assets',
+    expect.anything()
+  )
+  await user.selectOptions(screen.getByLabelText('Channel'), '7')
   await user.click(
     await screen.findByRole('switch', { name: 'Enable asset library' })
   )
   expect(screen.queryByLabelText('Secret key')).not.toBeInTheDocument()
+  expect(api.get).not.toHaveBeenCalledWith(
+    '/api/channel/8/assets',
+    expect.anything()
+  )
   await user.click(screen.getByRole('button', { name: 'Save' }))
-  await waitFor(() => expect(close).toHaveBeenCalledOnce())
+  await waitFor(() => expect(put).toHaveBeenCalledOnce())
+  expect(close).not.toHaveBeenCalled()
   expect(api.post).toHaveBeenCalledWith(
     '/api/verify',
     {
@@ -221,32 +259,409 @@ test('single-key channel uses its existing key and binds verification to the cha
       access_key: '',
       revision: 0,
     },
-    expect.objectContaining({ singleUseAuthorization: true })
+    expect.objectContaining({
+      singleUseAuthorization: true,
+      headers: { 'X-Security-Proof': 'single-use-proof' },
+    })
+  )
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
   )
 })
 
-test('multi-key channels cannot enable assets', async () => {
+test('switching a dirty channel requires confirmation and clears the previous credentials', async () => {
+  const user = userEvent.setup()
+  channelConfigs[7] = {
+    ...channelConfigs[7],
+    auth_type: 'aksk',
+    access_key: 'first-access',
+    has_secret: true,
+  }
   render(
     <QueryClientProvider client={client}>
-      <ChannelAssetsDialog
-        channel={{
-          ...channel,
-          channel_info: {
-            ...channel.channel_info,
-            is_multi_key: true,
-            multi_key_size: 2,
-          },
-        }}
-        onClose={vi.fn()}
-      />
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
     </QueryClientProvider>
   )
+  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.type(await screen.findByLabelText('Secret key'), 'first-secret')
+  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  expect(await screen.findByRole('alertdialog')).toHaveTextContent(
+    'Unsaved changes'
+  )
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+  expect(screen.getByLabelText('Channel')).toHaveValue('7')
+  expect(screen.getByLabelText('Secret key')).toHaveValue('first-secret')
+  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  await user.click(
+    await screen.findByRole('button', { name: 'Discard changes' })
+  )
+  expect(
+    await screen.findByDisplayValue('https://second.example.com/assets')
+  ).toBeVisible()
+  expect(screen.getByLabelText('Secret key')).toHaveValue('')
+  expect(screen.getByLabelText('Access key')).toHaveValue('second-access')
+  expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+})
+
+test('channel settings can search by name or ID without fetching each result configuration', async () => {
+  const user = userEvent.setup()
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  await user.type(
+    screen.getByRole('searchbox', { name: 'Search channels' }),
+    '8'
+  )
+  await user.click(screen.getByRole('button', { name: 'Search' }))
+  await waitFor(() =>
+    expect(
+      screen.queryByRole('option', { name: 'Video channel (#7)' })
+    ).not.toBeInTheDocument()
+  )
+  expect(
+    screen.getByRole('option', { name: 'Second channel (#8)' })
+  ).toBeInTheDocument()
+  expect(api.get).toHaveBeenCalledWith(
+    '/api/channel/search',
+    expect.objectContaining({
+      params: expect.objectContaining({ keyword: '8', p: 1, page_size: 20 }),
+    })
+  )
+  expect(api.get).not.toHaveBeenCalledWith(
+    '/api/channel/8/assets',
+    expect.anything()
+  )
+})
+
+test('switching search results preserves the search draft and applied keyword while clearing credentials', async () => {
+  const user = userEvent.setup()
+  channels = [channel, otherChannel, { ...channel, id: 9, name: 'Unrelated' }]
+  channelConfigs[7] = {
+    ...channelConfigs[7],
+    auth_type: 'aksk',
+    access_key: 'first-access',
+    has_secret: true,
+  }
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Unrelated (#9)' })
+  await user.type(
+    screen.getByRole('searchbox', { name: 'Search channels' }),
+    'channel'
+  )
+  await user.click(screen.getByRole('button', { name: 'Search' }))
+  await waitFor(() =>
+    expect(
+      screen.queryByRole('option', { name: 'Unrelated (#9)' })
+    ).not.toBeInTheDocument()
+  )
+  await user.type(
+    screen.getByRole('searchbox', { name: 'Search channels' }),
+    '-draft'
+  )
+  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.type(await screen.findByLabelText('Secret key'), 'first-secret')
+  expect(
+    screen.getByRole('searchbox', { name: 'Search channels' })
+  ).toHaveValue('channel-draft')
+  expect(
+    screen.queryByRole('option', { name: 'Unrelated (#9)' })
+  ).not.toBeInTheDocument()
+  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  await user.click(
+    await screen.findByRole('button', { name: 'Discard changes' })
+  )
+  await screen.findByDisplayValue('https://second.example.com/assets')
+  expect(
+    screen.getByRole('searchbox', { name: 'Search channels' })
+  ).toHaveValue('channel-draft')
+  expect(
+    screen.queryByRole('option', { name: 'Unrelated (#9)' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByRole('option', { name: 'Video channel (#7)' })
+  ).toBeInTheDocument()
+  expect(screen.getByLabelText('Secret key')).toHaveValue('')
+  expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+})
+
+test('a failed channel list can be retried and an empty result cannot submit a configuration', async () => {
+  const user = userEvent.setup()
+  channels = []
+  vi.mocked(api.get).mockRejectedValueOnce(new Error('Channels unavailable'))
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  expect(await screen.findByText('Channels unavailable')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Retry' }))
+  expect(await screen.findByText('No Channels Found')).toBeVisible()
+  expect(screen.getByLabelText('Channel')).toHaveValue('')
+  expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument()
+})
+
+test('multi-key channels cannot enable assets', async () => {
+  const user = userEvent.setup()
+  channels = [
+    {
+      ...channel,
+      channel_info: {
+        ...channel.channel_info,
+        is_multi_key: true,
+        multi_key_size: 2,
+      },
+    },
+  ]
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  await user.selectOptions(screen.getByLabelText('Channel'), '7')
   expect(
     await screen.findByRole('switch', { name: 'Enable asset library' })
   ).toHaveAttribute('aria-disabled', 'true')
   expect(screen.getByRole('alert')).toHaveTextContent(
     'Asset libraries require a single-key channel.'
   )
+})
+
+test('channel selection pages on the server and keeps the current channel selectable', async () => {
+  const user = userEvent.setup()
+  const thirdChannel = { ...channel, id: 9, name: 'Third channel' }
+  channelConfigs[9] = {
+    ...channelConfigs[8],
+    channel_id: 9,
+    endpoint: 'https://third.example.com/assets',
+  }
+  const get = vi.mocked(api.get).getMockImplementation()
+  if (!get) throw new Error('Channel request fixture is missing')
+  vi.mocked(api.get).mockImplementation(async (url, options) => {
+    if (url === '/api/channel') {
+      const page = (options?.params as { p?: number } | undefined)?.p ?? 1
+      return {
+        data: {
+          success: true,
+          data: {
+            items: page === 1 ? [channel] : [otherChannel, thirdChannel],
+            total: 22,
+          },
+        },
+      }
+    }
+    return get(url, options)
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await screen.findByLabelText('Asset API endpoint')
+  await user.click(screen.getByRole('button', { name: 'Next page' }))
+  await screen.findByRole('option', { name: 'Second channel (#8)' })
+  expect(screen.getByLabelText('Channel')).toHaveValue('7')
+  expect(
+    screen.getByRole('option', { name: 'Video channel (#7)' })
+  ).toBeInTheDocument()
+  expect(api.get).toHaveBeenCalledWith(
+    '/api/channel',
+    expect.objectContaining({
+      params: expect.objectContaining({ p: 2, page_size: 20 }),
+    })
+  )
+  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  expect(
+    await screen.findByDisplayValue('https://second.example.com/assets')
+  ).toBeVisible()
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Previous page' })).toBeEnabled()
+  )
+  expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled()
+  expect(
+    screen.queryByRole('option', { name: 'Video channel (#7)' })
+  ).not.toBeInTheDocument()
+  await user.selectOptions(screen.getByLabelText('Channel'), '9')
+  await screen.findByDisplayValue('https://third.example.com/assets')
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Previous page' })).toBeEnabled()
+  )
+  expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled()
+  expect(
+    screen.queryByRole('option', { name: 'Video channel (#7)' })
+  ).not.toBeInTheDocument()
+})
+
+test('verification and saving lock channel selection and clear a replacement secret on success', async () => {
+  const user = userEvent.setup()
+  let resolveVerification: (
+    value: Awaited<ReturnType<typeof api.post>>
+  ) => void = () => {
+    throw new Error('Verification is not pending')
+  }
+  let resolveSave: (
+    value: Awaited<ReturnType<typeof api.put>>
+  ) => void = () => {
+    throw new Error('Save is not pending')
+  }
+  vi.mocked(api.post).mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveVerification = resolve
+      })
+  )
+  const put = vi.spyOn(api, 'put').mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveSave = resolve
+      })
+  )
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Second channel (#8)' })
+  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  await user.type(
+    await screen.findByLabelText('Secret key'),
+    'replacement-secret'
+  )
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledOnce())
+  expect(screen.getByLabelText('Channel')).toBeDisabled()
+  expect(put).not.toHaveBeenCalled()
+  resolveVerification({
+    data: {
+      success: true,
+      data: {
+        proof_token: 'fresh-proof',
+        scope: 'channel.assets.write',
+        method: 'session',
+        expires_at: Math.floor(Date.now() / 1000) + 60,
+      },
+    },
+  })
+  await waitFor(() => expect(put).toHaveBeenCalledOnce())
+  expect(screen.getByLabelText('Channel')).toBeDisabled()
+  expect(put).toHaveBeenCalledWith(
+    '/api/channel/8/assets',
+    expect.objectContaining({ secret_key: 'replacement-secret', revision: 3 }),
+    expect.objectContaining({ headers: { 'X-Security-Proof': 'fresh-proof' } })
+  )
+  resolveSave({
+    data: { success: true, data: { ...channelConfigs[8], revision: 4 } },
+  })
+  await waitFor(() => expect(screen.getByLabelText('Channel')).toBeEnabled())
+  expect(screen.getByLabelText('Secret key')).toHaveValue('')
+  expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+})
+
+test('a rejected verification never saves channel settings and cancelling retains the draft', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.post).mockResolvedValue({
+    data: { success: false, message: 'Verification failed' },
+  })
+  const put = vi.spyOn(api, 'put')
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.type(
+    await screen.findByLabelText('Upstream project name'),
+    '-draft'
+  )
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(api.post).toHaveBeenCalledOnce())
+  await user.click(await screen.findByRole('button', { name: 'Cancel' }))
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+  )
+  expect(screen.getByLabelText('Upstream project name')).toHaveValue(
+    'default-draft'
+  )
+  expect(put).not.toHaveBeenCalled()
+})
+
+test('a failed channel save retains the draft and a blank saved secret is never sent', async () => {
+  const user = userEvent.setup()
+  const put = vi.spyOn(api, 'put').mockResolvedValue({
+    data: {
+      success: false,
+      message: 'Asset settings changed. Reload and try again.',
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Second channel (#8)' })
+  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  await user.type(
+    await screen.findByLabelText('Upstream project name'),
+    '-draft'
+  )
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(put).toHaveBeenCalledOnce())
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+  )
+  expect(screen.getByLabelText('Upstream project name')).toHaveValue(
+    'second-draft'
+  )
+  expect(put).toHaveBeenCalledWith(
+    '/api/channel/8/assets',
+    {
+      enabled: true,
+      endpoint: 'https://second.example.com/assets',
+      project_name: 'second-draft',
+      auth_type: 'aksk',
+      access_key: 'second-access',
+      revision: 3,
+    },
+    expect.objectContaining({ singleUseAuthorization: true })
+  )
+})
+
+test('closing a dirty channel requires confirmation and preserves input when cancelled', async () => {
+  const user = userEvent.setup()
+  const close = vi.fn()
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={close} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.type(
+    await screen.findByLabelText('Upstream project name'),
+    '-draft'
+  )
+  await user.keyboard('{Escape}')
+  await user.click(await screen.findByRole('button', { name: 'Cancel' }))
+  expect(close).not.toHaveBeenCalled()
+  expect(screen.getByLabelText('Upstream project name')).toHaveValue(
+    'default-draft'
+  )
+  await user.keyboard('{Escape}')
+  await user.click(
+    await screen.findByRole('button', { name: 'Discard changes' })
+  )
+  expect(close).toHaveBeenCalledOnce()
 })
 
 test('storage errors preserve unsaved secrets and an invalid endpoint prevents saving', async () => {
