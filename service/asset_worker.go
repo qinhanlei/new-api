@@ -391,16 +391,24 @@ func findUpstreamAssetGroup(ctx context.Context, channel *model.Channel, config 
 			Name      *string `json:"Name"`
 			GroupType string  `json:"GroupType"`
 		} `json:"Items"`
-		NextToken string `json:"NextToken"`
+		TotalCount *int   `json:"TotalCount"`
+		PageNumber *int   `json:"PageNumber"`
+		PageSize   *int   `json:"PageSize"`
+		NextToken  string `json:"NextToken"`
 	}
 	id := ""
-	payload := map[string]any{"Filter": map[string]any{"GroupType": "AIGC", "Name": name}, "MaxResults": 100}
-	for range 20 {
+	payload := map[string]any{"Filter": map[string]any{"GroupType": "AIGC", "Name": name}, "PageSize": 100}
+	for page := range 20 {
+		payload["PageNumber"] = page + 1
 		var result groupPage
 		if err := callAssetUpstream(ctx, channel, config, "ListAssetGroups", payload, &result); err != nil {
 			return "", err
 		}
-		if result.Items == nil {
+		if result.Items == nil || len(result.Items) > 100 || result.NextToken != "" ||
+			(result.PageNumber != nil && *result.PageNumber != page+1) || (result.PageSize != nil && *result.PageSize != 100) {
+			return "", assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material list was invalid")
+		}
+		if result.TotalCount != nil && (*result.TotalCount < page*100 || len(result.Items) != min(100, *result.TotalCount-page*100)) {
 			return "", assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material list was invalid")
 		}
 		for _, item := range result.Items {
@@ -415,10 +423,9 @@ func findUpstreamAssetGroup(ctx context.Context, channel *model.Channel, config 
 			}
 			id = item.ID
 		}
-		if result.NextToken == "" {
+		if len(result.Items) < 100 || (result.TotalCount != nil && *result.TotalCount == (page+1)*100) {
 			return id, nil
 		}
-		payload["NextToken"] = result.NextToken
 	}
 	return "", assetError(http.StatusConflict, "UpstreamResultUnknown", "The upstream group result is ambiguous")
 }
@@ -431,16 +438,24 @@ func findUpstreamAsset(ctx context.Context, channel *model.Channel, config syste
 			AssetType string  `json:"AssetType"`
 			GroupID   string  `json:"GroupId"`
 		} `json:"Items"`
-		NextToken string `json:"NextToken"`
+		TotalCount *int   `json:"TotalCount"`
+		PageNumber *int   `json:"PageNumber"`
+		PageSize   *int   `json:"PageSize"`
+		NextToken  string `json:"NextToken"`
 	}
 	id := ""
-	payload := map[string]any{"Filter": map[string]any{"GroupType": "AIGC", "GroupIds": []string{groupID}, "Name": asset.PublicID}, "MaxResults": 100}
-	for range 20 {
+	payload := map[string]any{"Filter": map[string]any{"GroupType": "AIGC", "GroupIds": []string{groupID}, "Name": asset.PublicID}, "PageSize": 100}
+	for page := range 20 {
+		payload["PageNumber"] = page + 1
 		var result assetPage
 		if err := callAssetUpstream(ctx, channel, config, "ListAssets", payload, &result); err != nil {
 			return "", err
 		}
-		if result.Items == nil {
+		if result.Items == nil || len(result.Items) > 100 || result.NextToken != "" ||
+			(result.PageNumber != nil && *result.PageNumber != page+1) || (result.PageSize != nil && *result.PageSize != 100) {
+			return "", assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material list was invalid")
+		}
+		if result.TotalCount != nil && (*result.TotalCount < page*100 || len(result.Items) != min(100, *result.TotalCount-page*100)) {
 			return "", assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material list was invalid")
 		}
 		for _, item := range result.Items {
@@ -455,10 +470,9 @@ func findUpstreamAsset(ctx context.Context, channel *model.Channel, config syste
 			}
 			id = item.ID
 		}
-		if result.NextToken == "" {
+		if len(result.Items) < 100 || (result.TotalCount != nil && *result.TotalCount == (page+1)*100) {
 			return id, nil
 		}
-		payload["NextToken"] = result.NextToken
 	}
 	return "", assetError(http.StatusConflict, "UpstreamResultUnknown", "The upstream material result is ambiguous")
 }

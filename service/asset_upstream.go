@@ -87,7 +87,7 @@ func UpdateAssetChannelConfig(ctx context.Context, channelID int, input dto.Asse
 		var page struct {
 			Items []any `json:"Items"`
 		}
-		if err = callAssetUpstream(ctx, channel, next, "ListAssetGroups", map[string]any{"Filter": map[string]any{"GroupType": "AIGC"}, "MaxResults": 1}, &page); err != nil {
+		if err = callAssetUpstream(ctx, channel, next, "ListAssetGroups", map[string]any{"Filter": map[string]any{"GroupType": "AIGC"}, "PageNumber": 1, "PageSize": 1}, &page); err != nil {
 			return dto.AssetChannelView{}, err
 		}
 		if page.Items == nil {
@@ -146,7 +146,7 @@ func safeAssetMessage(message string, secrets ...string) string {
 }
 
 // All actions use the configured management endpoint. Generation credentials
-// are sent only to that administrator-selected host; redirects are rejected.
+// stay on that administrator-selected host; only a trailing slash is corrected.
 func callAssetUpstream(ctx context.Context, channel *model.Channel, config system_setting.AssetChannelConfig, action string, payload map[string]any, result any) error {
 	endpoint, err := url.Parse(config.Endpoint)
 	if err != nil || endpoint.Host == "" {
@@ -161,17 +161,6 @@ func callAssetUpstream(ctx context.Context, channel *model.Channel, config syste
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(data))
-	if err != nil {
-		return assetError(http.StatusBadGateway, "UpstreamConfigurationInvalid", "The material endpoint is invalid")
-	}
-	request.Header.Set("Content-Type", "application/json")
-	if config.AuthType == "aksk" {
-		credential := volcbase.Credentials{AccessKeyID: config.AccessKey, SecretAccessKey: config.SecretKey, Region: "cn-beijing", Service: "ark"}
-		credential.Sign(request)
-	} else {
-		request.Header.Set("Authorization", "Bearer "+channel.Key)
-	}
 	baseClient, err := GetHttpClientWithProxySettings(channel.GetSetting().Proxy, channel.GetSetting())
 	if err != nil {
 		return assetError(http.StatusBadGateway, "UpstreamConfigurationInvalid", "The channel transport is unavailable")
@@ -179,13 +168,43 @@ func callAssetUpstream(ctx context.Context, channel *model.Channel, config syste
 	client := *baseClient
 	client.Timeout = 30 * time.Second
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	response, err := client.Do(request)
-	if err != nil {
-		code := "UpstreamUnavailable"
-		if strings.HasPrefix(action, "Create") {
-			code = "UpstreamResultUnknown"
+	var response *http.Response
+	for attempt := range 2 {
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(data))
+		if err != nil {
+			return assetError(http.StatusBadGateway, "UpstreamConfigurationInvalid", "The material endpoint is invalid")
 		}
-		return assetError(http.StatusBadGateway, code, "The upstream material response could not be confirmed")
+		request.Header.Set("Content-Type", "application/json")
+		if config.AuthType == "aksk" {
+			credential := volcbase.Credentials{AccessKeyID: config.AccessKey, SecretAccessKey: config.SecretKey, Region: "cn-beijing", Service: "ark"}
+			credential.Sign(request)
+		} else {
+			request.Header.Set("Authorization", "Bearer "+channel.Key)
+		}
+		response, err = client.Do(request)
+		if err != nil {
+			code := "UpstreamUnavailable"
+			if strings.HasPrefix(action, "Create") {
+				code = "UpstreamResultUnknown"
+			}
+			return assetError(http.StatusBadGateway, code, "The upstream material response could not be confirmed")
+		}
+		redirect := response.StatusCode == http.StatusMovedPermanently || response.StatusCode == http.StatusFound || response.StatusCode == http.StatusTemporaryRedirect || response.StatusCode == http.StatusPermanentRedirect
+		if attempt != 0 || !redirect || endpoint.Scheme != "https" || strings.HasSuffix(endpoint.Path, "/") {
+			break
+		}
+		location, locationErr := response.Location()
+		if locationErr != nil || location.User != nil || location.Fragment != "" || location.Host != endpoint.Host ||
+			(location.Scheme != "https" && location.Scheme != "http") || location.RawQuery != endpoint.RawQuery || location.EscapedPath() != endpoint.EscapedPath()+"/" {
+			break
+		}
+		// Some proxies advertise HTTP behind TLS termination. Correct only our
+		// original HTTPS path, preserving POST and re-signing it on the next attempt.
+		response.Body.Close()
+		endpoint.Path += "/"
+		if endpoint.RawPath != "" {
+			endpoint.RawPath += "/"
+		}
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))

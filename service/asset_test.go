@@ -381,6 +381,132 @@ func TestAssetChannelSaveValidatesUpstream(t *testing.T) {
 	}
 }
 
+func TestAssetChannelReenableUsesPageNumbers(t *testing.T) {
+	assetTestDatabase(t)
+	config, err := model.LoadAssetChannelConfig(t.Context(), 1)
+	require.NoError(t, err)
+	calls := 0
+	httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+		calls++
+		assert.Equal(t, "ListAssetGroups", request.URL.Query().Get("Action"))
+		var payload map[string]any
+		require.NoError(t, common.DecodeJson(request.Body, &payload))
+		assert.Equal(t, "actual-project", payload["ProjectName"])
+		assert.Equal(t, map[string]any{"GroupType": "AIGC"}, payload["Filter"])
+		assert.NotContains(t, payload, "MaxResults")
+		assert.NotContains(t, payload, "NextToken")
+		status, body := http.StatusOK, `{"Result":{"Items":[],"TotalCount":0,"PageNumber":1,"PageSize":1}}`
+		if payload["PageNumber"] != float64(1) || payload["PageSize"] != float64(1) {
+			status, body = http.StatusBadRequest, `{"error":{"message":"PageNumber is required and must be >= 1"}}`
+		}
+		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	})
+	input := dto.AssetChannelUpdate{AssetChannelFields: config.AssetChannelFields}
+	input.Enabled = false
+	disabled, err := UpdateAssetChannelConfig(t.Context(), 1, input)
+	require.NoError(t, err)
+	assert.Zero(t, calls)
+	input.AssetChannelFields = disabled.AssetChannelFields
+	input.Enabled = true
+	saved, err := UpdateAssetChannelConfig(t.Context(), 1, input)
+	require.NoError(t, err)
+	assert.True(t, saved.Enabled)
+	assert.Equal(t, 1, calls)
+}
+
+func TestAssetUpstreamCanonicalEndpoint(t *testing.T) {
+	assetTestDatabase(t)
+	for _, tc := range []struct {
+		name         string
+		path         string
+		status       int
+		location     string
+		authType     string
+		action       string
+		failNext     bool
+		redirectNext bool
+		wantCode     string
+		calls        int
+	}{
+		{name: "unchanged endpoint", path: "/ark", status: 200, calls: 1},
+		{name: "trailing slash", path: "/ark/", status: 200, calls: 1},
+		{name: "301 preserves HTTPS", path: "/ark", status: 301, location: "http://upstream.example/ark/?%s", calls: 2},
+		{name: "302 preserves POST", path: "/ark", status: 302, location: "/ark/?%s", calls: 2},
+		{name: "307 relative path", path: "/ark", status: 307, location: "ark/?%s", calls: 2},
+		{name: "308 signed create", path: "/ark", status: 308, location: "https://upstream.example/ark/?%s", authType: "aksk", action: "CreateAssetGroup", calls: 2},
+		{name: "escaped path", path: "/ark%20api", status: 301, location: "/ark%%20api/?%s", calls: 2},
+		{name: "foreign host", path: "/ark", status: 301, location: "https://other.example/ark/?%s", wantCode: "UpstreamInvalidResponse", calls: 1},
+		{name: "different port", path: "/ark", status: 301, location: "https://upstream.example:8443/ark/?%s", wantCode: "UpstreamInvalidResponse", calls: 1},
+		{name: "other path", path: "/ark", status: 301, location: "/other/?%s", wantCode: "UpstreamInvalidResponse", calls: 1},
+		{name: "changed query", path: "/ark", status: 301, location: "/ark/?Action=DeleteAsset&original=%s", wantCode: "UpstreamInvalidResponse", calls: 1},
+		{name: "userinfo", path: "/ark", status: 301, location: "https://user:password@upstream.example/ark/?%s", wantCode: "UpstreamInvalidResponse", calls: 1},
+		{name: "fragment", path: "/ark", status: 301, location: "/ark/?%s#fragment", wantCode: "UpstreamInvalidResponse", calls: 1},
+		{name: "303 not replayed", path: "/ark", status: 303, location: "/ark/?%s", wantCode: "UpstreamInvalidResponse", calls: 1},
+		{name: "second redirect stops", path: "/ark", status: 301, location: "/ark/?%s", redirectNext: true, wantCode: "UpstreamInvalidResponse", calls: 2},
+		{name: "server error not replayed", path: "/ark", status: 503, location: "/ark/?%s", action: "CreateAssetGroup", wantCode: "UpstreamResultUnknown", calls: 1},
+		{name: "create failure remains unknown", path: "/ark", status: 301, location: "/ark/?%s", action: "CreateAssetGroup", failNext: true, wantCode: "UpstreamResultUnknown", calls: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := system_setting.AssetChannelConfig{AssetChannelFields: dto.AssetChannelFields{Endpoint: "https://upstream.example" + tc.path, ProjectName: "actual-project", AuthType: tc.authType, AccessKey: "test-access"}, SecretKey: "test-secret"}
+			action := tc.action
+			if action == "" {
+				action = "GetAsset"
+			}
+			calls := 0
+			var signatures []string
+			httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+				calls++
+				assert.Equal(t, "https", request.URL.Scheme)
+				assert.Equal(t, "upstream.example", request.URL.Host)
+				assert.Equal(t, http.MethodPost, request.Method)
+				assert.Equal(t, action, request.URL.Query().Get("Action"))
+				assert.Equal(t, AssetAPIVersion, request.URL.Query().Get("Version"))
+				var payload map[string]any
+				require.NoError(t, common.DecodeJson(request.Body, &payload))
+				assert.Equal(t, map[string]any{"Id": "remote-asset", "ProjectName": "actual-project"}, payload)
+				if tc.authType == "aksk" {
+					assert.Contains(t, request.Header.Get("Authorization"), "HMAC-SHA256 ")
+					signatures = append(signatures, request.Header.Get("Authorization"))
+				} else {
+					assert.Equal(t, "Bearer test-key", request.Header.Get("Authorization"))
+				}
+				if calls > 1 {
+					assert.Equal(t, tc.path+"/", request.URL.EscapedPath())
+					if tc.failNext {
+						return nil, io.ErrUnexpectedEOF
+					}
+				}
+				status, body, header := http.StatusOK, `{"Result":{"Id":"remote-asset"}}`, http.Header{}
+				if calls == 1 && tc.status != http.StatusOK {
+					status, body = tc.status, "<html>upstream redirect or error</html>"
+					header.Set("Location", fmt.Sprintf(tc.location, request.URL.RawQuery))
+				} else if tc.redirectNext {
+					status, body = http.StatusMovedPermanently, "<html>redirect again</html>"
+					header.Set("Location", request.URL.Path+"/?"+request.URL.RawQuery)
+				}
+				return &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+			})
+			var result struct {
+				ID string `json:"Id"`
+			}
+			err := callAssetUpstream(t.Context(), &model.Channel{Key: "test-key"}, config, action, map[string]any{"Id": "remote-asset"}, &result)
+			if tc.wantCode == "" {
+				require.NoError(t, err)
+				assert.Equal(t, "remote-asset", result.ID)
+			} else {
+				var failure *AssetError
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, tc.wantCode, failure.Code)
+			}
+			assert.Equal(t, tc.calls, calls)
+			if tc.authType == "aksk" {
+				require.Len(t, signatures, 2)
+				assert.NotEqual(t, signatures[0], signatures[1], "the canonical path must be signed again")
+			}
+		})
+	}
+}
+
 func TestAssetChannelRepairsFailedEndpointPath(t *testing.T) {
 	assetTestDatabase(t)
 	ctx := t.Context()
@@ -550,6 +676,9 @@ func TestAssetReplicaRetryRejectsUncertainLists(t *testing.T) {
 			{"empty identifier", `{"Result":{"Items":[{"Id":"","Name":%q,"GroupType":"AIGC","GroupId":"remote-group","AssetType":"Image"}]}}`},
 			{"duplicate match", `{"Result":{"Items":[{"Id":"one","Name":%[1]q,"GroupType":"AIGC","GroupId":"remote-group","AssetType":"Image"},{"Id":"two","Name":%[1]q,"GroupType":"AIGC","GroupId":"remote-group","AssetType":"Image"}]}}`},
 			{"incomplete pages", `{"Result":{"Items":[],"NextToken":"unending"}}`},
+			{"incomplete numbered page", `{"Result":{"Items":[],"TotalCount":101}}`},
+			{"unexpected page", `{"Result":{"Items":[],"TotalCount":0,"PageNumber":2}}`},
+			{"unexpected page size", `{"Result":{"Items":[],"TotalCount":0,"PageSize":10}}`},
 		} {
 			t.Run(fmt.Sprintf("asset=%t/%s", assetList, tc.name), func(t *testing.T) {
 				group, asset := assetRetryFixture(t)
@@ -579,6 +708,68 @@ func TestAssetReplicaRetryRejectsUncertainLists(t *testing.T) {
 				afterGroup, err := model.GetAssetGroupReplica(t.Context(), group.ID, 1)
 				require.NoError(t, err)
 				assert.Equal(t, beforeGroup, afterGroup)
+			})
+		}
+	}
+}
+
+func TestAssetUpstreamLookupUsesPageNumbers(t *testing.T) {
+	assetTestDatabase(t)
+	config, err := model.LoadAssetChannelConfig(t.Context(), 1)
+	require.NoError(t, err)
+	channel, err := model.GetChannelById(1, true)
+	require.NoError(t, err)
+	for _, action := range []string{"ListAssetGroups", "ListAssets"} {
+		for _, tc := range []struct {
+			name      string
+			total     int
+			duplicate bool
+			wantID    string
+			wantError bool
+			calls     int
+		}{
+			{name: "match on second page", total: 101, wantID: "remote-match", calls: 2},
+			{name: "full final page", total: 100, calls: 1},
+			{name: "duplicate across pages", total: 101, duplicate: true, wantError: true, calls: 2},
+			{name: "scan limit", total: 2001, wantError: true, calls: 20},
+		} {
+			t.Run(action+"/"+tc.name, func(t *testing.T) {
+				calls := 0
+				httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+					calls++
+					assert.Equal(t, action, request.URL.Query().Get("Action"))
+					var payload map[string]any
+					require.NoError(t, common.DecodeJson(request.Body, &payload))
+					assert.Equal(t, float64(calls), payload["PageNumber"])
+					assert.Equal(t, float64(100), payload["PageSize"])
+					assert.NotContains(t, payload, "MaxResults")
+					assert.NotContains(t, payload, "NextToken")
+					items := []map[string]any{}
+					for i := range min(100, tc.total-(calls-1)*100) {
+						id, name := fmt.Sprintf("other-%d-%d", calls, i), "unrelated"
+						if tc.total == 101 && (calls == 2 || tc.duplicate && i == 0) {
+							id, name = "remote-match", "managed-name"
+						}
+						items = append(items, map[string]any{"Id": id, "Name": name, "GroupType": "AIGC", "GroupId": "remote-group", "AssetType": "Image"})
+					}
+					body, err := common.Marshal(map[string]any{"Result": map[string]any{"Items": items, "TotalCount": tc.total, "PageNumber": calls, "PageSize": 100}})
+					require.NoError(t, err)
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(body)), Request: request}, nil
+				})
+				var id string
+				var err error
+				if action == "ListAssetGroups" {
+					id, err = findUpstreamAssetGroup(t.Context(), channel, config, "managed-name")
+				} else {
+					id, err = findUpstreamAsset(t.Context(), channel, config, &model.Asset{PublicID: "managed-name", AssetType: "Image"}, "remote-group")
+				}
+				if tc.wantError {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+				assert.Equal(t, tc.wantID, id)
+				assert.Equal(t, tc.calls, calls)
 			})
 		}
 	}
