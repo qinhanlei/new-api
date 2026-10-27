@@ -47,10 +47,6 @@ import type {
   AssetChannelConfig,
   AssetChannelUpdate,
 } from '@/features/assets/types'
-import {
-  SecureVerificationDialog,
-  useSecureVerification,
-} from '@/features/auth/secure-verification'
 import { isMultiKeyChannel } from '@/features/channels/lib'
 import type { Channel } from '@/features/channels/types'
 import {
@@ -58,7 +54,6 @@ import {
   SettingsSwitchItem,
 } from '@/features/system-settings/components/settings-form-layout'
 import { handleServerError } from '@/lib/handle-server-error'
-import { AuthOperationError } from '@/lib/secure-verification'
 
 import {
   AssetChannelSelect,
@@ -80,7 +75,6 @@ export function ChannelAssetsForm(props: {
   const { t } = useTranslation()
   const id = useId()
   const client = useQueryClient()
-  const verification = useSecureVerification()
   const multiKey = isMultiKeyChannel(channel)
   const schema = assetChannelSchema(t, config.has_secret, multiKey)
   const { has_secret: _secret, channel_id: _channelId, ...defaults } = config
@@ -91,13 +85,8 @@ export function ChannelAssetsForm(props: {
   const authType = form.watch('auth_type')
   const mutation = useMutation({
     gcTime: 0,
-    mutationFn: ({
-      values,
-      proof,
-    }: {
-      values: AssetChannelUpdate
-      proof: string
-    }) => saveAssetChannel(channel.id, values, proof),
+    mutationFn: (values: AssetChannelUpdate) =>
+      saveAssetChannel(channel.id, values),
     onSuccess: (saved) => {
       client.setQueryData(assetQueryKeys.channel(channel.id), saved)
       toast.success(t('Saved successfully'))
@@ -111,26 +100,13 @@ export function ChannelAssetsForm(props: {
     onError: (error) => handleServerError(error),
     onSettled: (): void => mutation.reset(),
   })
-  const busy =
-    mutation.isPending || verification.isActive || form.formState.isSubmitting
-  const onSubmit = form.handleSubmit(async (values) => {
-    try {
-      const proof = await verification.requestVerification({
-        scope: 'channel.assets.write',
-        context: { channel_id: channel.id },
-      })
-      if (!proof) return
-      const { secret_key, ...fields } = values
-      mutation.mutate({
-        values: {
-          ...fields,
-          ...(authType === 'aksk' && secret_key ? { secret_key } : {}),
-        },
-        proof: proof.proof_token,
-      })
-    } catch (error) {
-      handleServerError(AuthOperationError.from(error))
-    }
+  const busy = mutation.isPending || form.formState.isSubmitting
+  const onSubmit = form.handleSubmit((values) => {
+    const { secret_key, ...fields } = values
+    mutation.mutate({
+      ...fields,
+      ...(authType === 'aksk' && secret_key ? { secret_key } : {}),
+    })
   })
   const requestChange = (target: Channel | 'close') => {
     if (busy || (target !== 'close' && target.id === channel.id)) return
@@ -327,7 +303,6 @@ export function ChannelAssetsForm(props: {
           else if (target) props.onChannelChange(target)
         }}
       />
-      <SecureVerificationDialog {...verification.dialogProps} />
     </>
   )
 }

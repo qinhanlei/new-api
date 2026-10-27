@@ -131,19 +131,11 @@ export async function getAssetChannel(id: number, signal?: AbortSignal) {
   return requireServerSuccess(data).data
 }
 
-export async function saveAssetChannel(
-  id: number,
-  values: AssetChannelUpdate,
-  proof: string
-) {
+export async function saveAssetChannel(id: number, values: AssetChannelUpdate) {
   const { data } = await api.put<AssetResponse<AssetChannelConfig>>(
     `/api/channel/${id}/assets`,
     values,
-    {
-      ...authRequestOptions,
-      headers: { 'X-Security-Proof': proof },
-      singleUseAuthorization: true,
-    }
+    authRequestOptions
   )
   return requireServerSuccess(data).data
 }

@@ -96,19 +96,6 @@ beforeEach(() => {
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
   vi.spyOn(api, 'get').mockImplementation(async (url, options) => {
-    if (url === '/api/verify/methods') {
-      return {
-        data: {
-          success: true,
-          data: {
-            scope: (options?.params as { scope?: string } | undefined)?.scope,
-            methods: [{ method: 'session', available: true }],
-            oauth_providers: [],
-            password_encryption_enabled: false,
-          },
-        },
-      }
-    }
     if (url === '/api/option/asset_storage') {
       return { data: { success: true, data: config } }
     }
@@ -128,20 +115,9 @@ beforeEach(() => {
     const id = Number(String(url).split('/')[3])
     return { data: { success: true, data: channelConfigs[id] } }
   })
-  vi.spyOn(api, 'post').mockImplementation(async (url, body) => ({
-    data: {
-      success: true,
-      data:
-        url === '/api/verify'
-          ? {
-              proof_token: 'single-use-proof',
-              scope: (body as { scope: string }).scope,
-              method: 'session',
-              expires_at: Math.floor(Date.now() / 1000) + 60,
-            }
-          : {},
-    },
-  }))
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: {} },
+  })
 })
 afterEach(() => client.clear())
 
@@ -211,7 +187,7 @@ test('connection testing needs no verification and keeps unsaved configuration',
   expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled()
 })
 
-test('selecting a channel fetches only its settings and saves with verification bound to its ID', async () => {
+test('selecting a channel fetches only its settings and saves without extra verification', async () => {
   const user = userEvent.setup()
   const close = vi.fn()
   const put = vi.spyOn(api, 'put').mockResolvedValue({
@@ -242,13 +218,9 @@ test('selecting a channel fetches only its settings and saves with verification 
   await user.click(screen.getByRole('button', { name: 'Save' }))
   await waitFor(() => expect(put).toHaveBeenCalledOnce())
   expect(close).not.toHaveBeenCalled()
-  expect(api.post).toHaveBeenCalledWith(
-    '/api/verify',
-    {
-      method: 'session',
-      scope: 'channel.assets.write',
-      context: { channel_id: 7 },
-    },
+  expect(api.post).not.toHaveBeenCalled()
+  expect(api.get).not.toHaveBeenCalledWith(
+    '/api/verify/methods',
     expect.anything()
   )
   expect(put).toHaveBeenCalledWith(
@@ -261,10 +233,7 @@ test('selecting a channel fetches only its settings and saves with verification 
       access_key: '',
       revision: 0,
     },
-    expect.objectContaining({
-      singleUseAuthorization: true,
-      headers: { 'X-Security-Proof': 'single-use-proof' },
-    })
+    { skipBusinessError: true, skipErrorHandler: true }
   )
   await waitFor(() =>
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
@@ -547,24 +516,13 @@ test('channel selection pages on the server and keeps the current channel select
   ).not.toBeInTheDocument()
 })
 
-test('verification and saving lock channel selection and clear a replacement secret on success', async () => {
+test('saving locks channel selection and clears a replacement secret on success', async () => {
   const user = userEvent.setup()
-  let resolveVerification: (
-    value: Awaited<ReturnType<typeof api.post>>
-  ) => void = () => {
-    throw new Error('Verification is not pending')
-  }
   let resolveSave: (
     value: Awaited<ReturnType<typeof api.put>>
   ) => void = () => {
     throw new Error('Save is not pending')
   }
-  vi.mocked(api.post).mockImplementation(
-    () =>
-      new Promise((resolve) => {
-        resolveVerification = resolve
-      })
-  )
   const put = vi.spyOn(api, 'put').mockImplementation(
     () =>
       new Promise((resolve) => {
@@ -583,26 +541,15 @@ test('verification and saving lock channel selection and clear a replacement sec
     'replacement-secret'
   )
   await user.click(screen.getByRole('button', { name: 'Save' }))
-  await waitFor(() => expect(api.post).toHaveBeenCalledOnce())
-  expect(screen.getByLabelText('Channel')).toBeDisabled()
-  expect(put).not.toHaveBeenCalled()
-  resolveVerification({
-    data: {
-      success: true,
-      data: {
-        proof_token: 'fresh-proof',
-        scope: 'channel.assets.write',
-        method: 'session',
-        expires_at: Math.floor(Date.now() / 1000) + 60,
-      },
-    },
-  })
   await waitFor(() => expect(put).toHaveBeenCalledOnce())
   expect(screen.getByLabelText('Channel')).toBeDisabled()
+  expect(screen.getByRole('button', { name: 'Saving...' })).toBeDisabled()
+  expect(screen.getByLabelText('Upstream project name')).toBeDisabled()
+  expect(api.post).not.toHaveBeenCalled()
   expect(put).toHaveBeenCalledWith(
     '/api/channel/8/assets',
     expect.objectContaining({ secret_key: 'replacement-secret', revision: 3 }),
-    expect.objectContaining({ headers: { 'X-Security-Proof': 'fresh-proof' } })
+    { skipBusinessError: true, skipErrorHandler: true }
   )
   resolveSave({
     data: { success: true, data: { ...channelConfigs[8], revision: 4 } },
@@ -610,35 +557,6 @@ test('verification and saving lock channel selection and clear a replacement sec
   await waitFor(() => expect(screen.getByLabelText('Channel')).toBeEnabled())
   expect(screen.getByLabelText('Secret key')).toHaveValue('')
   expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
-})
-
-test('a rejected verification never saves channel settings and cancelling retains the draft', async () => {
-  const user = userEvent.setup()
-  vi.mocked(api.post).mockResolvedValue({
-    data: { success: false, message: 'Verification failed' },
-  })
-  const put = vi.spyOn(api, 'put')
-  render(
-    <QueryClientProvider client={client}>
-      <AssetChannelSettingsDialog onClose={vi.fn()} />
-    </QueryClientProvider>
-  )
-  await screen.findByRole('option', { name: 'Video channel (#7)' })
-  await user.selectOptions(screen.getByLabelText('Channel'), '7')
-  await user.type(
-    await screen.findByLabelText('Upstream project name'),
-    '-draft'
-  )
-  await user.click(screen.getByRole('button', { name: 'Save' }))
-  await waitFor(() => expect(api.post).toHaveBeenCalledOnce())
-  await user.click(await screen.findByRole('button', { name: 'Cancel' }))
-  await waitFor(() =>
-    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
-  )
-  expect(screen.getByLabelText('Upstream project name')).toHaveValue(
-    'default-draft'
-  )
-  expect(put).not.toHaveBeenCalled()
 })
 
 test('a failed channel save retains the draft and a blank saved secret is never sent', async () => {
@@ -678,7 +596,7 @@ test('a failed channel save retains the draft and a blank saved secret is never 
       access_key: 'second-access',
       revision: 3,
     },
-    expect.objectContaining({ singleUseAuthorization: true })
+    { skipBusinessError: true, skipErrorHandler: true }
   )
 })
 

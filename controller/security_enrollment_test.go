@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
@@ -119,20 +120,127 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
 	return user, identity
 }
 
-func TestAssetChannelCredentialsRequireScopedVerification(t *testing.T) {
+func TestAssetChannelConfigurationAuthorizationWithoutSecurityProof(t *testing.T) {
 	user, identity := setupSecurityEnrollmentTest(t)
 	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
-	_, err := service.GetVerificationRequirements(identity, service.VerificationScopeChannelAssetsWrite)
-	assert.ErrorIs(t, err, service.ErrVerificationForbidden)
-	require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
-	require.NoError(t, model.PublishUserAuthCache(user.Id))
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.CasbinRule{}, &model.AuthzRole{}))
+	wasMaster := common.IsMasterNode
+	common.IsMasterNode = true
+	t.Cleanup(func() { common.IsMasterNode = wasMaster })
+	require.NoError(t, authz.Init(model.DB))
+	channel := model.Channel{Type: constant.ChannelTypeVolcEngine, Key: "channel-test-key", Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	token, _, err := service.IssueAccessToken(identity)
+	require.NoError(t, err)
+	writeScope := service.AccessTokenScopeOf(authz.ChannelSensitiveWrite)
+	writeToken, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), writeScope)
+	readToken, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "channel:read")
+	expiredToken, _ := createScopedAccessToken(t, user.Id, time.Now().Add(-time.Hour).Unix(), writeScope)
+	revokedToken, revoked := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), writeScope)
+	_, err = model.DeleteUserAccessToken(user.Id, revoked.Id)
+	require.NoError(t, err)
+	bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "asset-channel-test")
+	require.NoError(t, err)
+	revokedIdentity, err := service.ParseAccessToken(bundle.AccessToken)
+	require.NoError(t, err)
+	_, err = model.RevokeUserSession(user.Id, revokedIdentity.SessionID, "test")
+	require.NoError(t, err)
+	cookieBundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "asset-channel-cookie-test")
+	require.NoError(t, err)
 
-	channelOperation := service.VerificationOperation{Scope: service.VerificationScopeChannelAssetsWrite, Context: []byte(`{"channel_id":1}`)}
-	channelProof := issueSecurityEnrollmentProof(t, identity, channelOperation, "password")
-	channelOperation.Context = []byte(`{"channel_id":2}`)
-	_, err = service.ConsumeOperationProof(channelProof, identity, channelOperation)
-	assert.ErrorIs(t, err, service.ErrProofContext)
+	engine := gin.New()
+	middleware.DeclareAccessTokenPermissionRoute(http.MethodPut, "/api/channel/:id/assets", authz.ChannelSensitiveWrite)
+	engine.PUT("/api/channel/:id/assets", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelSensitiveWrite), UpdateChannelAssets)
+	secret := "asset-channel-test-secret"
+	input := dto.AssetChannelUpdate{
+		AssetChannelFields: dto.AssetChannelFields{Enabled: true, Endpoint: "https://assets.example.com", AuthType: "aksk", AccessKey: "asset-access-key"},
+		SecretKey:          &secret,
+	}
+	for _, tc := range []struct {
+		name       string
+		role       int
+		token      string
+		cookie     string
+		permission bool
+		status     int
+	}{
+		{name: "anonymous", role: common.RoleRootUser, status: http.StatusUnauthorized},
+		{name: "refresh cookie only", role: common.RoleRootUser, cookie: cookieBundle.RefreshToken, status: http.StatusUnauthorized},
+		{name: "ordinary user", role: common.RoleCommonUser, token: token, permission: true, status: http.StatusForbidden},
+		{name: "admin without permission", role: common.RoleAdminUser, token: token, status: http.StatusForbidden},
+		{name: "PAT cannot widen account permissions", role: common.RoleAdminUser, token: writeToken, status: http.StatusForbidden},
+		{name: "read-only PAT", role: common.RoleRootUser, token: readToken, status: http.StatusForbidden},
+		{name: "expired PAT", role: common.RoleAdminUser, token: expiredToken, permission: true, status: http.StatusUnauthorized},
+		{name: "revoked PAT", role: common.RoleAdminUser, token: revokedToken, permission: true, status: http.StatusUnauthorized},
+		{name: "revoked session", role: common.RoleAdminUser, token: bundle.AccessToken, permission: true, status: http.StatusUnauthorized},
+		{name: "authorized admin session", role: common.RoleAdminUser, token: token, permission: true, status: http.StatusOK},
+		{name: "authorized admin PAT", role: common.RoleAdminUser, token: writeToken, permission: true, status: http.StatusOK},
+		{name: "root session", role: common.RoleRootUser, token: token, status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(user).Update("role", tc.role).Error)
+			require.NoError(t, model.PublishUserAuthCache(user.Id))
+			require.NoError(t, authz.SetUserPermissions(user.Id, authz.PermissionsMap{authz.ResourceChannel: {authz.ActionSensitiveWrite: tc.permission}}))
+			before, err := model.LoadAssetChannelConfig(t.Context(), channel.Id)
+			require.NoError(t, err)
+			input.Revision = before.Revision
+			body, err := common.Marshal(input)
+			require.NoError(t, err)
+			request := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/channel/%d/assets", channel.Id), bytes.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			if tc.token != "" {
+				request.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			if tc.cookie != "" {
+				request.AddCookie(&http.Cookie{Name: service.RefreshCookieName, Value: tc.cookie})
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			require.Equal(t, tc.status, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), secret)
+			after, err := model.LoadAssetChannelConfig(t.Context(), channel.Id)
+			require.NoError(t, err)
+			if tc.status != http.StatusOK {
+				assert.Equal(t, before, after, "rejected writes must leave the configuration unchanged")
+				return
+			}
+			var result struct {
+				Success bool                 `json:"success"`
+				Data    dto.AssetChannelView `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			assert.True(t, result.Success)
+			assert.True(t, result.Data.HasSecret)
+			assert.Equal(t, before.Revision+1, result.Data.Revision)
+			assert.Equal(t, result.Data.Revision, after.Revision)
+			assert.Equal(t, secret, after.SecretKey)
+			input.SecretKey = nil
 
+			request = httptest.NewRequest(http.MethodPut, request.URL.String(), bytes.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+tc.token)
+			response = httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			assert.Equal(t, http.StatusConflict, response.Code, "replaying a stale revision must fail")
+			stored, err := model.LoadAssetChannelConfig(t.Context(), channel.Id)
+			require.NoError(t, err)
+			assert.Equal(t, after, stored)
+		})
+	}
+	var logs []model.AuditLog
+	require.NoError(t, model.LOG_DB.Find(&logs).Error)
+	encoded, err := common.Marshal(logs)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), "channel.assets.update")
+	for _, value := range []string{secret, token, writeToken} {
+		assert.NotContains(t, string(encoded), value)
+	}
+	_, err = service.GetVerificationRequirements(identity, "channel.assets.write")
+	assert.ErrorIs(t, err, service.ErrProofScope)
+}
+
+func TestAssetConfigurationCannotBeWrittenThroughGenericOptions(t *testing.T) {
+	_, identity := setupSecurityEnrollmentTest(t)
 	for _, key := range []string{system_setting.AssetStorageOption, model.AssetChannelOptionKey(1)} {
 		encoded, err := common.Marshal(map[string]string{"key": key, "value": "should-not-be-written"})
 		require.NoError(t, err)

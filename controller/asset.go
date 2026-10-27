@@ -10,7 +10,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
-	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -266,14 +265,6 @@ func UpdateChannelAssets(c *gin.Context) {
 	var input dto.AssetChannelUpdate
 	if err != nil || id <= 0 || common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10), &input) != nil {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
-		return
-	}
-	context, err := common.Marshal(service.ChannelKeyReadContext{ChannelID: id})
-	if err != nil {
-		writeAssetManagementError(c, err)
-		return
-	}
-	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeChannelAssetsWrite, Context: context}) == nil {
 		return
 	}
 	view, err := service.UpdateAssetChannelConfig(c.Request.Context(), id, input)
