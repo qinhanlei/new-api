@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
@@ -28,7 +28,11 @@ import { AssetStorageSection } from '@/features/system-settings/operations/asset
 import { api } from '@/lib/api'
 
 import { AssetChannelSettingsDialog } from '../components/asset-channel-settings-dialog'
-import type { AssetChannelConfig, AssetStorageConfig } from '../types'
+import type {
+  AssetChannelConfig,
+  AssetChannelUpdate,
+  AssetStorageConfig,
+} from '../types'
 
 const config: AssetStorageConfig = {
   enabled: true,
@@ -232,6 +236,7 @@ test('selecting a channel fetches only its settings and saves without extra veri
       auth_type: 'bearer',
       access_key: '',
       revision: 0,
+      size_limits_mb: { image: 0, video: 0, audio: 0 },
     },
     { skipBusinessError: true, skipErrorHandler: true }
   )
@@ -273,6 +278,80 @@ test('switching a dirty channel requires confirmation and clears the previous cr
   expect(screen.getByLabelText('Secret key')).toHaveValue('')
   expect(screen.getByLabelText('Access key')).toHaveValue('second-access')
   expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+})
+
+test('channel size overrides save together and clearing restores official defaults', async () => {
+  const user = userEvent.setup()
+  const put = vi.spyOn(api, 'put').mockImplementation(async (_url, body) => ({
+    data: {
+      success: true,
+      data: {
+        ...channelConfigs[7],
+        ...(body as AssetChannelUpdate),
+        revision: 1,
+      },
+    },
+  }))
+  client.setQueryData(['assets', 'config'], {
+    enabled: true,
+    size_limits_mb: { image: 30, video: 200, audio: 15 },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  const image = await screen.findByLabelText('Image limit (MB)')
+  const video = screen.getByLabelText('Video limit (MB)')
+  const audio = screen.getByLabelText('Audio limit (MB)')
+  expect(image).toHaveValue(null)
+  expect(image).toHaveAttribute('placeholder', '30')
+  expect(video).toHaveAttribute('placeholder', '200')
+  expect(audio).toHaveAttribute('placeholder', '15')
+  await user.type(image, '20')
+  await user.type(video, '50')
+  await user.type(audio, '10')
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(put).toHaveBeenCalledOnce())
+  expect(put.mock.calls[0][1]).toEqual(
+    expect.objectContaining({
+      size_limits_mb: { image: 20, video: 50, audio: 10 },
+    })
+  )
+  expect(client.getQueryState(['assets', 'config'])?.isInvalidated).toBe(true)
+  await user.clear(video)
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(put).toHaveBeenCalledTimes(2))
+  expect(put.mock.calls[1][1]).toEqual(
+    expect.objectContaining({
+      size_limits_mb: { image: 20, video: 0, audio: 10 },
+    })
+  )
+})
+
+test('invalid channel size limit associates its validation error with the input', async () => {
+  const user = userEvent.setup()
+  const put = vi.spyOn(api, 'put')
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  const image = await screen.findByLabelText('Image limit (MB)')
+  await user.type(image, '-1')
+  const form = image.closest('form')
+  if (!form) throw new Error('Channel form not found')
+  fireEvent.submit(form)
+  expect(
+    await screen.findByText('Enter a non-negative whole number')
+  ).toBeVisible()
+  expect(image).toHaveAttribute('aria-invalid', 'true')
+  expect(image).toHaveAccessibleDescription(/Enter a non-negative whole number/)
+  expect(put).not.toHaveBeenCalled()
 })
 
 test('channel settings can search by name or ID without fetching each result configuration', async () => {
@@ -595,6 +674,7 @@ test('a failed channel save retains the draft and a blank saved secret is never 
       auth_type: 'aksk',
       access_key: 'second-access',
       revision: 3,
+      size_limits_mb: { image: 0, video: 0, audio: 0 },
     },
     { skipBusinessError: true, skipErrorHandler: true }
   )

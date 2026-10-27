@@ -18,6 +18,12 @@ For commercial licensing, please contact support@quantumnous.com
 */
 export type AssetType = 'Image' | 'Video' | 'Audio'
 
+export interface AssetSizeLimits {
+  image: number
+  video: number
+  audio: number
+}
+
 export interface AssetScope {
   userId?: number
   allUsers?: boolean
@@ -57,6 +63,8 @@ export interface AssetReplica {
   error_message: string
   last_attempt_at: number
   can_retry: boolean
+  file_size_bytes?: number
+  current_limit_bytes?: number
 }
 
 export interface AssetStorageConfig {
@@ -84,6 +92,7 @@ export interface AssetChannelConfig {
   access_key: string
   has_secret: boolean
   revision: number
+  size_limits_mb?: AssetSizeLimits
 }
 
 export type AssetChannelUpdate = Omit<

@@ -173,7 +173,13 @@ func UploadAsset(c *gin.Context) {
 	if !ok {
 		return
 	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, service.MaxAssetBytes+(1<<20))
+	limits, err := service.GetAssetSizeLimits(c.Request.Context())
+	if err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
+	maxBytes := max(limits.ByteLimit("Image"), limits.ByteLimit("Video"), limits.ByteLimit("Audio"))
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes+(1<<20))
 	if err := c.Request.ParseMultipartForm(8 << 20); err != nil {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("The asset upload is invalid or too large."))
 		return
@@ -204,7 +210,12 @@ func GetAssetAvailability(c *gin.Context) {
 		writeAssetManagementError(c, err)
 		return
 	}
-	common.ApiSuccess(c, gin.H{"enabled": config.Enabled})
+	limits, err := service.GetAssetSizeLimits(c.Request.Context())
+	if err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"enabled": config.Enabled, "size_limits_mb": limits})
 }
 
 func GetAssetStorage(c *gin.Context) {

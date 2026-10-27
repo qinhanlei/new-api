@@ -25,6 +25,7 @@ import type {
   AssetChannelUpdate,
   AssetReplica,
   AssetScope,
+  AssetSizeLimits,
   AssetStorageConfig,
   AssetStorageUpdate,
 } from './types'
@@ -37,15 +38,15 @@ interface AssetResponse<T> {
 
 export const assetQueryKeys = {
   all: ['assets'] as const,
+  config: ['assets', 'config'] as const,
   storage: ['asset-storage'] as const,
   channel: (id: number) => ['channel-assets', id] as const,
 }
 
 export async function getAssetConfig(signal?: AbortSignal) {
-  const { data } = await api.get<AssetResponse<{ enabled: boolean }>>(
-    '/api/assets/config',
-    { ...authRequestOptions, signal }
-  )
+  const { data } = await api.get<
+    AssetResponse<{ enabled: boolean; size_limits_mb: AssetSizeLimits }>
+  >('/api/assets/config', { ...authRequestOptions, signal })
   return requireServerSuccess(data).data
 }
 

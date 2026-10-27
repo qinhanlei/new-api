@@ -116,6 +116,11 @@ export function assetChannelSchema(
   hasSecret: boolean,
   multiKey: boolean
 ) {
+  const sizeLimit = z
+    .number()
+    .int(t('Enter a non-negative whole number'))
+    .min(0, t('Enter a non-negative whole number'))
+    .max(9007199253, t('Value is too large'))
   return z
     .object({
       enabled: z.boolean(),
@@ -128,6 +133,11 @@ export function assetChannelSchema(
       access_key: z.string().trim(),
       secret_key: z.string(),
       revision: z.number(),
+      size_limits_mb: z.object({
+        image: sizeLimit,
+        video: sizeLimit,
+        audio: sizeLimit,
+      }),
     })
     .superRefine((values, context) => {
       if (!values.enabled) return

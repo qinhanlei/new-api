@@ -71,7 +71,7 @@ export function Assets() {
     userId: '',
   })
   const config = useQuery({
-    queryKey: [...assetQueryKeys.all, 'config'],
+    queryKey: assetQueryKeys.config,
     queryFn: ({ signal }) => getAssetConfig(signal),
     meta: { errorToast: false },
   })

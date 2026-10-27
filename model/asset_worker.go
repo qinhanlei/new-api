@@ -43,7 +43,17 @@ func GetAssetReplicaViews(ctx context.Context, userID int, publicID string) ([]d
 		if replica.State == AssetUnknown {
 			status = "Unknown"
 		}
-		result = append(result, dto.AssetReplicaView{ChannelID: replica.ChannelID, ChannelName: name, Status: status, ErrorCode: replica.ErrorCode, ErrorMessage: replica.ErrorMessage, LastAttemptAt: replica.UpdatedAt, CanRetry: replica.Status == AssetFailed && replica.State != AssetDeleted && replica.LeaseExpiresAt <= time.Now().Unix()})
+		view := dto.AssetReplicaView{ChannelID: replica.ChannelID, ChannelName: name, Status: status, ErrorCode: replica.ErrorCode, ErrorMessage: replica.ErrorMessage, LastAttemptAt: replica.UpdatedAt, CanRetry: replica.Status == AssetFailed && replica.State != AssetDeleted && replica.LeaseExpiresAt <= time.Now().Unix()}
+		if replica.ErrorCode == "FileSizeTooLarge" && replica.ErrorMessage == "Material exceeds this channel's size limit" {
+			config, err := LoadAssetChannelConfig(ctx, replica.ChannelID)
+			if err != nil {
+				return nil, err
+			}
+			limit := config.SizeLimitsMB.ByteLimit(asset.AssetType)
+			view.FileSizeBytes = &asset.Size
+			view.CurrentLimitBytes = &limit
+		}
+		result = append(result, view)
 	}
 	return result, nil
 }

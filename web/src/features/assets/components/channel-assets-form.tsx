@@ -80,7 +80,15 @@ export function ChannelAssetsForm(props: {
   const { has_secret: _secret, channel_id: _channelId, ...defaults } = config
   const form = useForm<z.infer<typeof schema>>({
     resolver: zodResolver(schema),
-    defaultValues: { ...defaults, secret_key: '' },
+    defaultValues: {
+      ...defaults,
+      size_limits_mb: defaults.size_limits_mb ?? {
+        image: 0,
+        video: 0,
+        audio: 0,
+      },
+      secret_key: '',
+    },
   })
   const authType = form.watch('auth_type')
   const mutation = useMutation({
@@ -89,13 +97,22 @@ export function ChannelAssetsForm(props: {
       saveAssetChannel(channel.id, values),
     onSuccess: (saved) => {
       client.setQueryData(assetQueryKeys.channel(channel.id), saved)
+      void client.invalidateQueries({ queryKey: assetQueryKeys.config })
       toast.success(t('Saved successfully'))
       const {
         has_secret: _savedSecret,
         channel_id: _savedChannel,
         ...values
       } = saved
-      form.reset({ ...values, secret_key: '' })
+      form.reset({
+        ...values,
+        size_limits_mb: values.size_limits_mb ?? {
+          image: 0,
+          video: 0,
+          audio: 0,
+        },
+        secret_key: '',
+      })
     },
     onError: (error) => handleServerError(error),
     onSettled: (): void => mutation.reset(),
@@ -215,6 +232,70 @@ export function ChannelAssetsForm(props: {
                   </FormItem>
                 )}
               />
+              <div className='space-y-2'>
+                <div className='grid grid-cols-3 gap-3'>
+                  {[
+                    {
+                      name: 'image' as const,
+                      label: t('Image limit (MB)'),
+                      placeholder: '30',
+                    },
+                    {
+                      name: 'video' as const,
+                      label: t('Video limit (MB)'),
+                      placeholder: '200',
+                    },
+                    {
+                      name: 'audio' as const,
+                      label: t('Audio limit (MB)'),
+                      placeholder: '15',
+                    },
+                  ].map((item) => (
+                    <FormField
+                      key={item.name}
+                      control={form.control}
+                      name={`size_limits_mb.${item.name}`}
+                      render={({ field, fieldState }) => (
+                        <FormItem>
+                          <FormLabel>{item.label}</FormLabel>
+                          <FormControl>
+                            <Input
+                              {...field}
+                              type='number'
+                              min={0}
+                              max={9007199253}
+                              step={1}
+                              value={field.value || ''}
+                              onChange={(event) =>
+                                field.onChange(Number(event.target.value))
+                              }
+                              placeholder={item.placeholder}
+                              disabled={busy}
+                              aria-describedby={
+                                fieldState.error
+                                  ? `${id}-size-limits ${id}-${item.name}-error`
+                                  : `${id}-size-limits`
+                              }
+                            />
+                          </FormControl>
+                          <FormMessage id={`${id}-${item.name}-error`} />
+                        </FormItem>
+                      )}
+                    />
+                  ))}
+                </div>
+                <p
+                  id={`${id}-size-limits`}
+                  className='text-muted-foreground text-xs'
+                >
+                  {t(
+                    'Blank uses official limits. Enabled asset channels share the lowest limit.'
+                  )}{' '}
+                  {t(
+                    'Image < limit; video/audio ≤ limit. 1 MB = 1,000,000 bytes.'
+                  )}
+                </p>
+              </div>
               <FormField
                 control={form.control}
                 name='auth_type'

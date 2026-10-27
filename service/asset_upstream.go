@@ -56,6 +56,9 @@ func UpdateAssetChannelConfig(ctx context.Context, channelID int, input dto.Asse
 		return dto.AssetChannelView{}, err
 	}
 	next := system_setting.AssetChannelConfig{AssetChannelFields: input.AssetChannelFields, SecretKey: current.SecretKey, ChannelScope: model.AssetChannelScope(channel)}
+	if err = validateAssetSizeLimits(next.SizeLimitsMB); err != nil {
+		return dto.AssetChannelView{}, err
+	}
 	next.Endpoint = strings.TrimSpace(next.Endpoint)
 	next.ProjectName = strings.TrimSpace(next.ProjectName)
 	if next.ProjectName == "" {

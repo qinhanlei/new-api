@@ -229,6 +229,11 @@ func processAssetReplica(ctx context.Context, replica *model.AssetReplica) error
 			replica.UpstreamID = id
 			replica.State = model.AssetReady
 		} else {
+			// Reconcile uncertain groups and materials before applying new limits.
+			// Existing upstream resources remain usable after a limit is lowered.
+			if err = validateAssetSize(asset.Size, asset.AssetType, config.SizeLimitsMB); err != nil {
+				return finishAssetReplicaError(ctx, replica, assetError(http.StatusUnprocessableEntity, "FileSizeTooLarge", "Material exceeds this channel's size limit"))
+			}
 			sourceURL, urlErr := signedAssetURL(ctx, asset)
 			if urlErr != nil {
 				return finishAssetReplicaError(ctx, replica, urlErr)

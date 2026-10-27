@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -21,7 +22,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-const MaxAssetBytes int64 = 100 << 20
 const assetURLLifetime = 12 * time.Hour
 
 func assetS3(config system_setting.AssetStorageConfig) *s3.Client {
@@ -182,16 +182,48 @@ func signedAssetURL(ctx context.Context, asset *model.Asset) (string, error) {
 }
 
 func storeAssetContent(ctx context.Context, asset *model.Asset, reader io.Reader) error {
-	limit := MaxAssetBytes
-	if asset.AssetType == "Image" {
-		limit = 30 << 20
+	limits, err := GetAssetSizeLimits(ctx)
+	if err != nil {
+		return err
 	}
-	data, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	// Multipart uploads are already seekable (large parts are spooled by net/http).
+	// Only URL imports need another temporary file, so S3 retries can rewind
+	// without keeping the whole material in memory. S3 remains the durable copy.
+	body, seekable := reader.(io.ReadSeeker)
+	sum := sha256.New()
+	var destination io.Writer = sum
+	var start int64
+	if seekable {
+		start, err = body.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return assetError(http.StatusBadGateway, "DownloadFailed", "Unable to read the material source")
+		}
+	} else {
+		file, err := os.CreateTemp("", "new-api-asset-*")
+		if err != nil {
+			return assetError(http.StatusBadGateway, "StorageWriteFailed", "Unable to save the original material")
+		}
+		defer os.Remove(file.Name())
+		defer file.Close()
+		body = file
+		destination = io.MultiWriter(file, sum)
+	}
+	limited := io.LimitReader(reader, limits.ByteLimit(asset.AssetType)+1)
+	data := make([]byte, 512)
+	n, err := io.ReadFull(limited, data)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return assetError(http.StatusBadGateway, "DownloadFailed", "Unable to read the material source")
+	}
+	data = data[:n]
+	size, err := io.Copy(destination, io.MultiReader(bytes.NewReader(data), limited))
 	if err != nil {
 		return assetError(http.StatusBadGateway, "DownloadFailed", "Unable to read the material source")
 	}
-	if len(data) == 0 || int64(len(data)) > limit {
+	if size == 0 {
 		return assetError(http.StatusBadRequest, "FileSizeTooLarge", "Material is empty or exceeds the size limit")
+	}
+	if err = validateAssetSize(size, asset.AssetType, limits); err != nil {
+		return err
 	}
 	detected := http.DetectContentType(data)
 	// net/http recognizes only a subset of common media signatures. Inspect
@@ -230,14 +262,16 @@ func storeAssetContent(ctx context.Context, asset *model.Asset, reader io.Reader
 	if err != nil {
 		return err
 	}
-	_, err = assetS3(config).PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(config.Bucket), Key: aws.String(asset.ObjectKey), Body: bytes.NewReader(data), ContentLength: aws.Int64(int64(len(data))), ContentType: aws.String(detected)})
+	if _, err = body.Seek(start, io.SeekStart); err != nil {
+		return assetError(http.StatusBadGateway, "StorageWriteFailed", "Unable to save the original material")
+	}
+	_, err = assetS3(config).PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(config.Bucket), Key: aws.String(asset.ObjectKey), Body: body, ContentLength: aws.Int64(size), ContentType: aws.String(detected)})
 	if err != nil {
 		return assetError(http.StatusBadGateway, "StorageWriteFailed", "Unable to save the original material")
 	}
-	sum := sha256.Sum256(data)
-	asset.Size = int64(len(data))
+	asset.Size = size
 	asset.ContentType = detected
-	asset.SHA256 = hex.EncodeToString(sum[:])
+	asset.SHA256 = hex.EncodeToString(sum.Sum(nil))
 	asset.ObjectState = model.AssetReady
 	asset.SourceURL = ""
 	return nil

@@ -17,13 +17,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useId, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { Dialog } from '@/components/dialog'
+import { ErrorState } from '@/components/error-state'
+import { LoadingState } from '@/components/loading-state'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -35,11 +37,24 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { NativeSelect } from '@/components/ui/native-select'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatNumber } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
+import { getServerErrorMessage } from '@/lib/server-error-message'
 
-import { assetQueryKeys, executeAssetAction, uploadAsset } from '../api'
+import {
+  assetQueryKeys,
+  executeAssetAction,
+  getAssetConfig,
+  uploadAsset,
+} from '../api'
 import { assetCreateSchema } from '../lib/schemas'
-import type { AssetGroup, AssetScope, AssetType } from '../types'
+import type {
+  AssetGroup,
+  AssetScope,
+  AssetSizeLimits,
+  AssetType,
+} from '../types'
 
 interface AssetFormValues {
   name: string
@@ -62,7 +77,7 @@ export function AssetCreateDialog({
   scope: AssetScope
   onClose: () => void
 }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const id = useId()
   const client = useQueryClient()
   const [file, setFile] = useState<File | null>(null)
@@ -73,6 +88,29 @@ export function AssetCreateDialog({
   })
   const source = form.watch('source')
   const type = form.watch('type')
+  const config = useQuery({
+    queryKey: assetQueryKeys.config,
+    queryFn: ({ signal }) => getAssetConfig(signal),
+    meta: { errorToast: false },
+  })
+  const limit =
+    config.data?.size_limits_mb?.[type.toLowerCase() as keyof AssetSizeLimits]
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const sizeHint =
+    type === 'Image'
+      ? t('File size must be less than {{limit}} MB.', {
+          limit: formatNumber(limit, locale),
+        })
+      : t('File size must not exceed {{limit}} MB.', {
+          limit: formatNumber(limit, locale),
+        })
+  let currentFileError = fileError
+  if (file && file.size === 0) {
+    currentFileError = t('The file is empty.')
+  } else if (file && limit !== undefined) {
+    const maxBytes = limit * 1000000 - (type === 'Image' ? 1 : 0)
+    if (file.size > maxBytes) currentFileError = sizeHint
+  }
   const mutation = useMutation({
     mutationFn: (values: AssetFormValues) => {
       const fields = {
@@ -117,7 +155,16 @@ export function AssetCreateDialog({
           >
             {t('Cancel')}
           </Button>
-          <Button type='submit' form={id} disabled={mutation.isPending}>
+          <Button
+            type='submit'
+            form={id}
+            disabled={
+              mutation.isPending ||
+              !config.data?.enabled ||
+              limit === undefined ||
+              config.isError
+            }
+          >
             {mutation.isPending ? t('Uploading...') : t('Add asset')}
           </Button>
         </>
@@ -128,10 +175,18 @@ export function AssetCreateDialog({
           id={id}
           className='space-y-4'
           onSubmit={form.handleSubmit((values) => {
+            if (
+              !config.data?.enabled ||
+              limit === undefined ||
+              config.isError
+            ) {
+              return
+            }
             if (values.source === 'file' && !file) {
               setFileError(t('Select a file'))
               return
             }
+            if (values.source === 'file' && currentFileError) return
             mutation.mutate(values)
           })}
         >
@@ -196,6 +251,27 @@ export function AssetCreateDialog({
               </FormItem>
             )}
           />
+          {config.isPending && (
+            <LoadingState inline size='sm' message={t('Loading...')} />
+          )}
+          {config.isError && (
+            <ErrorState
+              className='min-h-0 p-3'
+              description={getServerErrorMessage(config.error)}
+              onRetry={() => void config.refetch()}
+            />
+          )}
+          {limit !== undefined && (
+            <p
+              id={`${id}-size-limit`}
+              className='text-muted-foreground text-sm'
+            >
+              {sizeHint}{' '}
+              {t(
+                '1 MB = 1,000,000 bytes. Other requirements are checked by the upstream.'
+              )}
+            </p>
+          )}
           {source === 'url' ? (
             <FormField
               control={form.control}
@@ -220,20 +296,24 @@ export function AssetCreateDialog({
                 id={`${id}-file`}
                 type='file'
                 accept={assetAccept[type]}
-                aria-invalid={Boolean(fileError)}
-                aria-describedby={fileError ? `${id}-file-error` : undefined}
+                aria-invalid={Boolean(currentFileError)}
+                aria-describedby={
+                  currentFileError
+                    ? `${id}-size-limit ${id}-file-error`
+                    : `${id}-size-limit`
+                }
                 onChange={(event) => {
                   setFile(event.target.files?.[0] ?? null)
                   setFileError('')
                 }}
               />
-              {fileError && (
+              {currentFileError && (
                 <p
                   id={`${id}-file-error`}
                   role='alert'
                   className='text-destructive text-sm'
                 >
-                  {fileError}
+                  {currentFileError}
                 </p>
               )}
             </div>

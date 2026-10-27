@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
@@ -611,6 +612,13 @@ func TestAssetReplicaRetryPreservesExistingReferences(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			group, asset := assetRetryFixture(t)
 			ctx := t.Context()
+			if tc.groupFound {
+				config, err := model.LoadAssetChannelConfig(ctx, 1)
+				require.NoError(t, err)
+				config.SizeLimitsMB.Image = 1
+				require.NoError(t, model.SaveAssetChannelConfig(ctx, 1, config))
+				require.NoError(t, model.DB.Model(&model.Asset{}).Where("id = ?", asset.ID).Update("size", 2_000_000).Error)
+			}
 			require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Add(-6 * time.Minute).Unix(), "error_code": "UpstreamInvalidResponse"}).Error)
 			if tc.groupFound {
 				require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Add(-6 * time.Minute).Unix()}).Error)
@@ -680,6 +688,18 @@ func TestAssetReplicaRetryPreservesExistingReferences(t *testing.T) {
 			preserved, err := model.GetAssetReplica(ctx, asset.ID, 2)
 			require.NoError(t, err)
 			assert.Equal(t, other, preserved)
+			if tc.groupFound && !tc.assetFound {
+				leases, err := model.ClaimAssetReplicas(ctx, time.Now().Unix(), 1)
+				require.NoError(t, err)
+				require.Len(t, leases, 1)
+				require.NoError(t, processAssetReplica(ctx, &leases[0]))
+				failed, err := model.GetAssetReplica(ctx, asset.ID, 1)
+				require.NoError(t, err)
+				assert.Equal(t, model.AssetFailed, failed.Status)
+				assert.Equal(t, "FileSizeTooLarge", failed.ErrorCode)
+				assert.Zero(t, failed.NextAttemptAt)
+				assert.Equal(t, []string{"ListAssetGroups", "ListAssets"}, actions)
+			}
 		})
 	}
 }
@@ -974,9 +994,12 @@ func TestAssetExpiredUsesSkipActiveHeadOfBatch(t *testing.T) {
 }
 
 func TestAssetUnknownCreateReconcilesBeforeFailing(t *testing.T) {
-	for _, tc := range []struct{ unknownGroup, expired bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+	for _, tc := range []struct{ unknownGroup, expired, lowerGroupLimit bool }{
+		{false, false, false}, {true, false, false}, {false, true, false}, {true, true, false},
+		{true, false, true},
+	} {
 		unknownGroup := tc.unknownGroup
-		t.Run(fmt.Sprintf("group=%t/expired=%t", unknownGroup, tc.expired), func(t *testing.T) {
+		t.Run(fmt.Sprintf("group=%t/expired=%t/lower_group_limit=%t", unknownGroup, tc.expired, tc.lowerGroupLimit), func(t *testing.T) {
 			assetTestDatabase(t)
 			previousRegistry := jsplugin.DefaultRegistry
 			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
@@ -1055,6 +1078,14 @@ func TestAssetUnknownCreateReconcilesBeforeFailing(t *testing.T) {
 				steps = 2
 			}
 			for step := range steps {
+				if (!unknownGroup || tc.lowerGroupLimit) && step == 1 {
+					// A lower limit must not prevent recovery of an already-created resource.
+					config, err := model.LoadAssetChannelConfig(t.Context(), 1)
+					require.NoError(t, err)
+					config.SizeLimitsMB.Image = 1
+					require.NoError(t, model.SaveAssetChannelConfig(t.Context(), 1, config))
+					require.NoError(t, model.DB.Model(&model.Asset{}).Where("id = ?", asset.ID).Update("size", 2_000_000).Error)
+				}
 				if tc.expired && step == 1 {
 					if unknownGroup {
 						require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Update("create_started_at", time.Now().Add(-6*time.Minute).Unix()).Error)
@@ -1076,18 +1107,32 @@ func TestAssetUnknownCreateReconcilesBeforeFailing(t *testing.T) {
 					assert.Equal(t, model.AssetFailed, stored.Status)
 				} else if step < 2 {
 					assert.Equal(t, model.AssetProcessing, stored.Status)
+				} else if tc.lowerGroupLimit {
+					assert.Equal(t, model.AssetFailed, stored.Status)
+					assert.Equal(t, "FileSizeTooLarge", stored.ErrorCode)
 				} else {
 					assert.Equal(t, model.AssetActive, stored.Status)
 				}
 			}
 			mu.Lock()
 			assert.Equal(t, 1, counts["CreateAssetGroup"])
-			if tc.expired && unknownGroup {
+			if unknownGroup && (tc.expired || tc.lowerGroupLimit) {
 				assert.Zero(t, counts["CreateAsset"])
 			} else {
 				assert.Equal(t, 1, counts["CreateAsset"])
 			}
 			mu.Unlock()
+			if tc.lowerGroupLimit {
+				groupReplica, err := model.GetAssetGroupReplica(t.Context(), group.ID, 1)
+				require.NoError(t, err)
+				assert.Equal(t, model.AssetReady, groupReplica.State)
+				assert.Equal(t, "remote-group", groupReplica.UpstreamID)
+				replica, err := model.GetAssetReplica(t.Context(), asset.ID, 1)
+				require.NoError(t, err)
+				assert.Equal(t, model.AssetFailed, replica.Status)
+				assert.Equal(t, "FileSizeTooLarge", replica.ErrorCode)
+				assert.Zero(t, replica.NextAttemptAt)
+			}
 		})
 	}
 }
@@ -1096,6 +1141,286 @@ type assetRoundTripper func(*http.Request) (*http.Response, error)
 
 func (transport assetRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
 	return transport(request)
+}
+
+func assetTestMediaFile(t *testing.T, assetType string, size int64) *os.File {
+	t.Helper()
+	file, err := os.CreateTemp(t.TempDir(), "material-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, file.Close()) })
+	header := map[string]string{
+		"Image": "\x89PNG\r\n\x1a\n",
+		"Video": "\x00\x00\x00\x18ftypqt  ",
+		"Audio": "ID3\x03\x00\x00\x00\x00\x00\x00",
+	}[assetType]
+	_, err = file.WriteString(header)
+	require.NoError(t, err)
+	require.NoError(t, file.Truncate(size))
+	_, err = file.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	return file
+}
+
+func TestAssetDefaultSizeLimitsUploadAndURL(t *testing.T) {
+	assetTestDatabase(t)
+	previousFetch := *system_setting.GetFetchSetting()
+	*system_setting.GetFetchSetting() = system_setting.FetchSetting{EnableSSRFProtection: true, AllowedPorts: []string{"443"}}
+	t.Cleanup(func() { *system_setting.GetFetchSetting() = previousFetch })
+	for _, source := range []string{"upload", "URL"} {
+		for _, tc := range []struct {
+			name      string
+			assetType string
+			size      int64
+			allowed   bool
+			other     dto.AssetSizeLimits
+		}{
+			{name: "image below limit", assetType: "Image", size: 30_000_000 - 1, allowed: true},
+			{name: "image at limit", assetType: "Image", size: 30_000_000},
+			{name: "video at limit", assetType: "Video", size: 200_000_000, allowed: true},
+			{name: "video over limit", assetType: "Video", size: 200_000_000 + 1},
+			{name: "audio at limit", assetType: "Audio", size: 15_000_000, allowed: true},
+			{name: "audio over limit", assetType: "Audio", size: 15_000_000 + 1},
+			{name: "another channel constrains all users", assetType: "Image", size: 2_000_000, other: dto.AssetSizeLimits{Image: 1}},
+			{name: "empty material", assetType: "Image"},
+		} {
+			t.Run(source+"/"+tc.name, func(t *testing.T) {
+				config, err := model.LoadAssetChannelConfig(t.Context(), 2)
+				require.NoError(t, err)
+				config.SizeLimitsMB = tc.other
+				require.NoError(t, model.SaveAssetChannelConfig(t.Context(), 2, config))
+				file := assetTestMediaFile(t, tc.assetType, tc.size)
+				spoolDirectory := t.TempDir()
+				t.Setenv("TMPDIR", spoolDirectory)
+				puts := 0
+				uploadedDigest := ""
+				httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+					if request.Method == http.MethodGet {
+						assert.Equal(t, "https://8.8.8.8/material", request.URL.String())
+						// Incorrect source metadata must not bypass actual-byte admission.
+						return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(file), ContentLength: 1, Request: request}, nil
+					}
+					puts++
+					assert.Equal(t, http.MethodPut, request.Method)
+					sum := sha256.New()
+					n, err := io.Copy(sum, request.Body)
+					require.NoError(t, err)
+					assert.Equal(t, tc.size, n)
+					uploadedDigest = fmt.Sprintf("%x", sum.Sum(nil))
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+				})
+				group := assetTestGroup(t, 1, "sized-material")
+				actor := dto.AssetActor{UserID: 1, ChannelIDs: []int{1}}
+				input := dto.AssetUpload{GroupID: group.PublicID, AssetType: tc.assetType, Size: 1}
+				var asset *model.Asset
+				if source == "upload" {
+					_, err = CreateUploadedAsset(t.Context(), actor, input, file)
+					var stored model.Asset
+					require.NoError(t, model.DB.Where("group_id = ?", group.ID).First(&stored).Error)
+					asset = &stored
+				} else {
+					asset, err = reserveAsset(t.Context(), actor, input, "https://8.8.8.8/material")
+					require.NoError(t, err)
+					err = fetchAssetContent(t.Context(), asset)
+				}
+				remaining, listErr := os.ReadDir(spoolDirectory)
+				require.NoError(t, listErr)
+				assert.Empty(t, remaining, "successful and rejected operations must remove temporary source files")
+				if !tc.allowed {
+					var failure *AssetError
+					require.ErrorAs(t, err, &failure)
+					assert.Equal(t, "FileSizeTooLarge", failure.Code)
+					assert.Zero(t, puts)
+					return
+				}
+				require.NoError(t, err)
+				assert.Equal(t, tc.size, asset.Size)
+				assert.Equal(t, model.AssetReady, asset.ObjectState)
+				assert.Equal(t, uploadedDigest, asset.SHA256)
+				assert.Equal(t, 1, puts)
+			})
+		}
+	}
+}
+
+func TestAssetChannelSizeLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		first  dto.AssetSizeLimits
+		second dto.AssetSizeLimits
+		omit   string
+		want   dto.AssetSizeLimits
+	}{
+		{name: "official defaults", want: dto.AssetSizeLimits{Image: 30, Video: 200, Audio: 15}},
+		{name: "minimum per type", first: dto.AssetSizeLimits{Image: 25, Video: 100}, second: dto.AssetSizeLimits{Video: 50, Audio: 10}, want: dto.AssetSizeLimits{Image: 25, Video: 50, Audio: 10}},
+		{name: "all channels allow larger files", first: dto.AssetSizeLimits{Image: 50, Video: 300, Audio: 25}, second: dto.AssetSizeLimits{Image: 40, Video: 400, Audio: 20}, want: dto.AssetSizeLimits{Image: 40, Video: 300, Audio: 20}},
+		{name: "disabled material config", second: dto.AssetSizeLimits{Image: 1, Video: 1, Audio: 1}, omit: "config", want: dto.AssetSizeLimits{Image: 30, Video: 200, Audio: 15}},
+		{name: "disabled channel", second: dto.AssetSizeLimits{Image: 1, Video: 1, Audio: 1}, omit: "channel", want: dto.AssetSizeLimits{Image: 30, Video: 200, Audio: 15}},
+		{name: "unconfigured channel", second: dto.AssetSizeLimits{Image: 1, Video: 1, Audio: 1}, omit: "missing", want: dto.AssetSizeLimits{Image: 30, Video: 200, Audio: 15}},
+		{name: "changed channel account", second: dto.AssetSizeLimits{Image: 1, Video: 1, Audio: 1}, omit: "scope", want: dto.AssetSizeLimits{Image: 30, Video: 200, Audio: 15}},
+		{name: "no enabled channel", first: dto.AssetSizeLimits{Image: 1, Video: 1, Audio: 1}, omit: "all", want: dto.AssetSizeLimits{Image: 30, Video: 200, Audio: 15}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assetTestDatabase(t)
+			for i, limits := range []dto.AssetSizeLimits{tc.first, tc.second} {
+				config, err := model.LoadAssetChannelConfig(t.Context(), i+1)
+				require.NoError(t, err)
+				config.SizeLimitsMB = limits
+				if (tc.omit == "config" && i == 1) || tc.omit == "all" {
+					config.Enabled = false
+				}
+				require.NoError(t, model.SaveAssetChannelConfig(t.Context(), i+1, config))
+			}
+			switch tc.omit {
+			case "channel":
+				require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", 2).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			case "missing":
+				require.NoError(t, model.DB.Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: model.AssetChannelOptionKey(2)}).Delete(&model.Option{}).Error)
+			case "scope":
+				require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", 2).Update("key", "other-account-key").Error)
+			}
+			limits, err := GetAssetSizeLimits(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, limits)
+		})
+	}
+}
+
+func TestAssetChannelSizeLimitConfiguration(t *testing.T) {
+	assetTestDatabase(t)
+	checks := 0
+	httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+		checks++
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"Result":{"Items":[]}}`)), Request: request}, nil
+	})
+	for _, tc := range []struct {
+		name    string
+		limits  dto.AssetSizeLimits
+		invalid bool
+	}{
+		{name: "custom limits", limits: dto.AssetSizeLimits{Image: 20, Video: 50, Audio: 10}},
+		{name: "reset to defaults"},
+		{name: "negative", limits: dto.AssetSizeLimits{Audio: -1}, invalid: true},
+		{name: "numeric precision overflow", limits: dto.AssetSizeLimits{Video: 9_007_199_254}, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, err := model.LoadAssetChannelConfig(t.Context(), 1)
+			require.NoError(t, err)
+			input := dto.AssetChannelUpdate{AssetChannelFields: before.AssetChannelFields}
+			input.SizeLimitsMB = tc.limits
+			previousChecks := checks
+			view, err := UpdateAssetChannelConfig(t.Context(), 1, input)
+			if tc.invalid {
+				require.Error(t, err)
+				assert.Equal(t, previousChecks, checks)
+				stored, loadErr := model.LoadAssetChannelConfig(t.Context(), 1)
+				require.NoError(t, loadErr)
+				assert.Equal(t, before, stored)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.limits, view.SizeLimitsMB)
+			stored, err := model.LoadAssetChannelConfig(t.Context(), 1)
+			require.NoError(t, err)
+			assert.Equal(t, tc.limits, stored.SizeLimitsMB)
+			assert.Equal(t, before.SecretKey, stored.SecretKey)
+		})
+	}
+	// Unreadable active configuration must not silently relax admission limits.
+	require.NoError(t, model.DB.Model(&model.Option{}).Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: model.AssetChannelOptionKey(1)}).Update("value", "{").Error)
+	_, err := GetAssetSizeLimits(t.Context())
+	require.Error(t, err)
+}
+
+func TestAssetReplicaSizeLimitKeepsOtherReadyCopies(t *testing.T) {
+	group, asset := assetRetryFixture(t)
+	ctx := t.Context()
+	asset.Size = 2_000_000
+	require.NoError(t, model.DB.Model(&asset).Update("size", asset.Size).Error)
+	require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Updates(map[string]any{"state": model.AssetReady, "upstream_id": "remote-group"}).Error)
+	require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Update("status", model.AssetProcessing).Error)
+	require.NoError(t, model.EnsureAssetReplicas(ctx, []model.Asset{asset}, 2, 1))
+	require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ? AND channel_id = ?", asset.ID, 2).Updates(map[string]any{"state": model.AssetReady, "status": model.AssetActive, "upstream_id": "other-material"}).Error)
+	other, err := model.GetAssetReplica(ctx, asset.ID, 2)
+	require.NoError(t, err)
+	config, err := model.LoadAssetChannelConfig(ctx, 1)
+	require.NoError(t, err)
+	config.SizeLimitsMB.Image = 1
+	require.NoError(t, model.SaveAssetChannelConfig(ctx, 1, config))
+	var actions []string
+	httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+		action := request.URL.Query().Get("Action")
+		actions = append(actions, action)
+		body := `{"Result":{"Id":"new-material"}}`
+		if action == "GetAsset" {
+			body = `{"Result":{"Id":"new-material","Status":"Active"}}`
+		} else {
+			assert.Equal(t, "CreateAsset", action)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	})
+	leases, err := model.ClaimAssetReplicas(ctx, time.Now().Unix(), 1)
+	require.NoError(t, err)
+	require.Len(t, leases, 1)
+	require.NoError(t, processAssetReplica(ctx, &leases[0]))
+	failed, err := model.GetAssetReplica(ctx, asset.ID, 1)
+	require.NoError(t, err)
+	assert.Equal(t, model.AssetFailed, failed.Status)
+	assert.Equal(t, "FileSizeTooLarge", failed.ErrorCode)
+	assert.Zero(t, failed.NextAttemptAt)
+	assert.Empty(t, actions)
+	views, err := model.GetAssetReplicaViews(ctx, 1, asset.PublicID)
+	require.NoError(t, err)
+	require.Len(t, views, 2)
+	for _, view := range views {
+		if view.ChannelID == 1 {
+			require.NotNil(t, view.FileSizeBytes)
+			require.NotNil(t, view.CurrentLimitBytes)
+			assert.Equal(t, asset.Size, *view.FileSizeBytes)
+			assert.Equal(t, int64(999_999), *view.CurrentLimitBytes)
+		} else {
+			assert.Nil(t, view.FileSizeBytes)
+			assert.Nil(t, view.CurrentLimitBytes)
+		}
+	}
+	require.NoError(t, RetryAssetReplica(ctx, 1, asset.PublicID, 1))
+	leases, err = model.ClaimAssetReplicas(ctx, time.Now().Unix(), 1)
+	require.NoError(t, err)
+	require.Len(t, leases, 1)
+	require.NoError(t, processAssetReplica(ctx, &leases[0]))
+	failed, err = model.GetAssetReplica(ctx, asset.ID, 1)
+	require.NoError(t, err)
+	assert.Equal(t, model.AssetFailed, failed.Status)
+	assert.Equal(t, "FileSizeTooLarge", failed.ErrorCode)
+	assert.Zero(t, failed.NextAttemptAt)
+	assert.Empty(t, actions)
+	stored, err := model.GetAssetByID(ctx, asset.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.AssetReady, stored.ObjectState)
+	assert.Equal(t, asset.ObjectKey, stored.ObjectKey)
+	ready, err := PrepareAssetRouting(ctx, dto.AssetActor{UserID: 1, ChannelIDs: []int{1, 2}}, []string{asset.PublicID}, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []int{2}, ready)
+	preserved, err := model.GetAssetReplica(ctx, asset.ID, 2)
+	require.NoError(t, err)
+	assert.Equal(t, other, preserved)
+
+	config, err = model.LoadAssetChannelConfig(ctx, 1)
+	require.NoError(t, err)
+	config.SizeLimitsMB.Image = 3
+	require.NoError(t, model.SaveAssetChannelConfig(ctx, 1, config))
+	require.NoError(t, RetryAssetReplica(ctx, 1, asset.PublicID, 1))
+	leases, err = model.ClaimAssetReplicas(ctx, time.Now().Unix(), 1)
+	require.NoError(t, err)
+	require.Len(t, leases, 1)
+	require.NoError(t, processAssetReplica(ctx, &leases[0]))
+	assert.Equal(t, []string{"CreateAsset", "GetAsset"}, actions)
+	config, err = model.LoadAssetChannelConfig(ctx, 1)
+	require.NoError(t, err)
+	config.SizeLimitsMB.Image = 1
+	require.NoError(t, model.SaveAssetChannelConfig(ctx, 1, config))
+	ready, err = PrepareAssetRouting(ctx, dto.AssetActor{UserID: 1, ChannelIDs: []int{1, 2}}, []string{asset.PublicID}, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []int{1, 2}, ready)
 }
 
 func TestAssetUploadDeadlineFinalizesWithoutCallerContext(t *testing.T) {

@@ -25,11 +25,13 @@ import { Dialog } from '@/components/dialog'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
 import { Button } from '@/components/ui/button'
+import { toIntlLocale } from '@/i18n/languages'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
   hasPermission,
 } from '@/lib/admin-permissions'
+import { formatNumber } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
 import { ROLE } from '@/lib/roles'
 import { getServerErrorMessage } from '@/lib/server-error-message'
@@ -48,7 +50,8 @@ export function AssetReplicasDialog({
   scope: AssetScope
   onClose: () => void
 }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const client = useQueryClient()
   const currentUser = useAuthStore((state) => state.auth.user)
   const canWriteChannel =
@@ -143,11 +146,28 @@ export function AssetReplicasDialog({
               header: t('Error'),
               cellClassName: 'align-top whitespace-normal',
               cell: (replica) => (
-                <span className='block break-words whitespace-normal'>
-                  {[replica.error_code, t(replica.error_message)]
-                    .filter(Boolean)
-                    .join(': ') || '—'}
-                </span>
+                <div className='space-y-1 break-words whitespace-normal'>
+                  <span className='block'>
+                    {[replica.error_code, t(replica.error_message)]
+                      .filter(Boolean)
+                      .join(': ') || '—'}
+                  </span>
+                  {replica.file_size_bytes !== undefined &&
+                    replica.current_limit_bytes !== undefined && (
+                      <span className='text-muted-foreground block text-xs'>
+                        {t(
+                          'File: {{size}} bytes; current channel limit: {{limit}} bytes',
+                          {
+                            size: formatNumber(replica.file_size_bytes, locale),
+                            limit: formatNumber(
+                              replica.current_limit_bytes,
+                              locale
+                            ),
+                          }
+                        )}
+                      </span>
+                    )}
+                </div>
               ),
             },
           ]}

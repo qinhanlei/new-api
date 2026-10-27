@@ -96,6 +96,15 @@ beforeEach(() => {
   client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        enabled: true,
+        size_limits_mb: { image: 30, video: 200, audio: 15 },
+      },
+    },
+  })
 })
 afterEach(() => {
   client.clear()
@@ -229,6 +238,42 @@ test('rejected replica resync keeps the stored error visible and allows another 
   await waitFor(() => expect(post).toHaveBeenCalledTimes(2))
 })
 
+test('a size-rejected replica shows the file size and current channel limit', async () => {
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [
+        {
+          ...failedReplica,
+          error_code: 'FileSizeTooLarge',
+          error_message: "Material exceeds this channel's size limit",
+          file_size_bytes: 50000001,
+          current_limit_bytes: 50000000,
+        },
+      ],
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetReplicasDialog
+        asset={replicaAsset}
+        scope={{ userId: 23 }}
+        onClose={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  expect(
+    await screen.findByText(
+      'File: 50,000,001 bytes; current channel limit: 50,000,000 bytes'
+    )
+  ).toBeVisible()
+  expect(
+    screen.getByText(
+      "FileSizeTooLarge: Material exceeds this channel's size limit"
+    )
+  ).toBeVisible()
+})
+
 test.each([
   { role: ROLE.ADMIN, write: false },
   { role: ROLE.USER, write: true },
@@ -340,6 +385,65 @@ test('file upload requires a file and sends multipart with the selected media ty
   expect((body as FormData).get('GroupId')).toBe('group-one')
 })
 
+test.each([
+  { type: 'Image', mime: 'image/png', size: 999999, allowed: true },
+  { type: 'Image', mime: 'image/png', size: 1000000, allowed: false },
+  { type: 'Video', mime: 'video/mp4', size: 1000000, allowed: true },
+  { type: 'Video', mime: 'video/mp4', size: 1000001, allowed: false },
+  { type: 'Audio', mime: 'audio/wav', size: 1000000, allowed: true },
+  { type: 'Audio', mime: 'audio/wav', size: 1000001, allowed: false },
+  { type: 'Audio', mime: 'audio/wav', size: 0, allowed: false },
+])(
+  'file admission uses the server limit ($type, $size bytes)',
+  async ({ type, mime, size, allowed }) => {
+    const user = userEvent.setup()
+    vi.mocked(api.get).mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          enabled: true,
+          size_limits_mb: { image: 1, video: 1, audio: 1 },
+        },
+      },
+    })
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: { success: true, data: { Id: 'asset-one' } },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <AssetCreateDialog group={group} scope={{}} onClose={vi.fn()} />
+      </QueryClientProvider>
+    )
+    await user.type(screen.getByLabelText('Name'), 'Media')
+    await user.selectOptions(screen.getByLabelText('Asset type'), type)
+    const hint =
+      type === 'Image'
+        ? 'File size must be less than 1 MB.'
+        : 'File size must not exceed 1 MB.'
+    expect(await screen.findByText(hint, { exact: false })).toBeVisible()
+    await user.selectOptions(screen.getByLabelText('Source'), 'file')
+    expect(screen.getByText(hint, { exact: false })).toBeVisible()
+    await user.upload(
+      screen.getByLabelText('File'),
+      new File([new Uint8Array(size)], 'media', { type: mime })
+    )
+    await user.click(screen.getByRole('button', { name: 'Add asset' }))
+    if (allowed) {
+      await waitFor(() => expect(post).toHaveBeenCalledOnce())
+      expect(post.mock.calls[0][0]).toBe('/api/assets/upload')
+    } else {
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        size === 0 ? 'The file is empty.' : hint
+      )
+      expect(screen.getByLabelText('File')).toHaveAttribute(
+        'aria-invalid',
+        'true'
+      )
+      expect(post).not.toHaveBeenCalled()
+    }
+  }
+)
+
 test('switching away from file upload clears the previously selected file', async () => {
   const user = userEvent.setup()
   const post = vi
@@ -360,6 +464,29 @@ test('switching away from file upload clears the previously selected file', asyn
   await user.selectOptions(screen.getByLabelText('Source'), 'file')
   await user.click(screen.getByRole('button', { name: 'Add asset' }))
   expect(await screen.findByRole('alert')).toHaveTextContent('Select a file')
+  expect(post).not.toHaveBeenCalled()
+})
+
+test('failed limit loading blocks submission and retry preserves the asset draft', async () => {
+  const user = userEvent.setup()
+  const post = vi.spyOn(api, 'post')
+  vi.mocked(api.get).mockRejectedValueOnce(new Error('Limits unavailable'))
+  render(
+    <QueryClientProvider client={client}>
+      <AssetCreateDialog group={group} scope={{}} onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await user.type(screen.getByLabelText('Name'), 'Media')
+  expect(await screen.findByText('Limits unavailable')).toBeVisible()
+  expect(screen.getByRole('button', { name: 'Add asset' })).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Retry' }))
+  expect(
+    await screen.findByText('File size must be less than 30 MB.', {
+      exact: false,
+    })
+  ).toBeVisible()
+  expect(screen.getByLabelText('Name')).toHaveValue('Media')
+  expect(screen.getByRole('button', { name: 'Add asset' })).toBeEnabled()
   expect(post).not.toHaveBeenCalled()
 })
 
@@ -727,7 +854,13 @@ test('draft ownership changes do not change the upload target until applied', as
     .getState()
     .auth.setUser({ id: 1, username: 'admin', role: ROLE.ADMIN })
   vi.spyOn(api, 'get').mockResolvedValue({
-    data: { success: true, data: { enabled: true } },
+    data: {
+      success: true,
+      data: {
+        enabled: true,
+        size_limits_mb: { image: 30, video: 200, audio: 15 },
+      },
+    },
   })
   const post = vi
     .spyOn(api, 'post')
