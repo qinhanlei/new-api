@@ -94,6 +94,56 @@ func assetTestAsset(t *testing.T, group model.AssetGroup) model.Asset {
 	return asset
 }
 
+func TestAssetStorageEndpointConfiguration(t *testing.T) {
+	assetTestDatabase(t)
+	for _, tc := range []struct {
+		name     string
+		endpoint string
+		want     string
+	}{
+		{"cloud without scheme", " tos-s3-cn-beijing.volces.com/ ", "https://tos-s3-cn-beijing.volces.com"},
+		{"explicit HTTP", "http://127.0.0.1:9000/", "http://127.0.0.1:9000"},
+		{"private host without scheme", "minio.internal:9000", "https://minio.internal:9000"},
+		{"HTTPS", "https://s3.example.com/", "https://s3.example.com"},
+		{"unsupported scheme", "ftp://s3.example.com", ""},
+		{"credentials in URL", "https://user:secret@s3.example.com", ""},
+		{"bucket in path", "https://s3.example.com/assets", ""},
+		{"query", "https://s3.example.com?region=cn-beijing", ""},
+		{"empty query", "https://s3.example.com?", ""},
+		{"fragment", "https://s3.example.com#bucket", ""},
+		{"missing host", "http://", ""},
+		{"incomplete HTTP scheme", "http:", ""},
+		{"incomplete HTTPS scheme", "https:", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, err := model.LoadAssetStorageConfig(t.Context())
+			require.NoError(t, err)
+			input := dto.AssetStorageUpdate{AssetStorageFields: before.AssetStorageFields}
+			input.Endpoint = tc.endpoint
+			input.Provider = "minio"
+			view, err := UpdateAssetStorageConfig(t.Context(), input)
+			if tc.want == "" {
+				var failure *AssetError
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, "InvalidParameter.Endpoint", failure.Code)
+				stored, loadErr := model.LoadAssetStorageConfig(t.Context())
+				require.NoError(t, loadErr)
+				assert.Equal(t, before, stored)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, view.Endpoint)
+			assert.Equal(t, before.Revision+1, view.Revision)
+			stored, err := model.LoadAssetStorageConfig(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, stored.Endpoint)
+			assert.Equal(t, "minio", stored.Provider)
+			assert.Equal(t, before.SecretKey, stored.SecretKey)
+			assert.Equal(t, before.CursorSecret, stored.CursorSecret)
+		})
+	}
+}
+
 func TestAssetActionsPaginationAndOwnership(t *testing.T) {
 	assetTestDatabase(t)
 	actor := dto.AssetActor{UserID: 1, ChannelIDs: []int{1, 2}}

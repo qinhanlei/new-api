@@ -37,6 +37,13 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import {
   assetQueryKeys,
@@ -45,16 +52,16 @@ import {
   testAssetStorage,
 } from '@/features/assets/api'
 import { assetStorageSchema } from '@/features/assets/lib/schemas'
+import {
+  assetStoragePathStyle,
+  assetStorageProviders,
+  normalizeAssetStorageEndpoint,
+} from '@/features/assets/lib/storage-providers'
 import type {
   AssetStorageConfig,
   AssetStorageUpdate,
 } from '@/features/assets/types'
-import {
-  SecureVerificationDialog,
-  useSecureVerification,
-} from '@/features/auth/secure-verification'
 import { handleServerError } from '@/lib/handle-server-error'
-import { AuthOperationError } from '@/lib/secure-verification'
 import { getServerErrorMessage } from '@/lib/server-error-message'
 
 import {
@@ -84,28 +91,30 @@ export function AssetStorageSection() {
   return <AssetStorageForm config={query.data} />
 }
 
-function AssetStorageForm({ config }: { config: AssetStorageConfig }) {
+function AssetStorageForm(props: { config: AssetStorageConfig }) {
   const { t } = useTranslation()
   const client = useQueryClient()
-  const verification = useSecureVerification()
-  const schema = assetStorageSchema(t, config.has_secret)
-  const { has_secret: _hasSecret, ...defaults } = config
+  const schema = assetStorageSchema(t, props.config.has_secret)
+  const { has_secret: _hasSecret, ...defaults } = props.config
   const form = useForm<z.infer<typeof schema>>({
     resolver: zodResolver(schema),
-    defaultValues: { ...defaults, secret_key: '' },
+    defaultValues: {
+      ...defaults,
+      provider:
+        assetStorageProviders.find((value) => value === defaults.provider) ??
+        'other',
+      secret_key: '',
+    },
   })
   const mutation = useMutation({
     gcTime: 0,
     mutationFn: async ({
       values,
-      proof,
       test,
     }: {
       values: AssetStorageUpdate
-      proof: string
       test: boolean
-    }) =>
-      test ? testAssetStorage(values, proof) : saveAssetStorage(values, proof),
+    }) => (test ? testAssetStorage(values) : saveAssetStorage(values)),
     onSuccess: (saved, { test }) => {
       if (test) {
         toast.success(t('Storage connection verified'))
@@ -114,7 +123,13 @@ function AssetStorageForm({ config }: { config: AssetStorageConfig }) {
       if (saved) {
         client.setQueryData(assetQueryKeys.storage, saved)
         const { has_secret: _savedSecret, ...fields } = saved
-        form.reset({ ...fields, secret_key: '' })
+        form.reset({
+          ...fields,
+          provider:
+            assetStorageProviders.find((value) => value === fields.provider) ??
+            'other',
+          secret_key: '',
+        })
       }
       void client.invalidateQueries({ queryKey: assetQueryKeys.all })
       toast.success(t('Saved successfully'))
@@ -122,9 +137,19 @@ function AssetStorageForm({ config }: { config: AssetStorageConfig }) {
     onError: (error) => handleServerError(error),
     onSettled: (): void => mutation.reset(),
   })
-  const busy = mutation.isPending || verification.isActive
+  const busy = mutation.isPending
+  const providers = [
+    { value: 'other', label: t('Other S3-compatible storage') },
+    { value: 'aws', label: t('Amazon S3') },
+    { value: 'tos', label: t('Volcengine TOS') },
+    { value: 'oss', label: t('Alibaba Cloud OSS') },
+    { value: 'cos', label: t('Tencent Cloud COS') },
+    { value: 'minio', label: t('MinIO') },
+    { value: 'ceph', label: t('Ceph RGW') },
+    { value: 'oci', label: t('Oracle Cloud OCI') },
+  ]
   const submit = (test: boolean) =>
-    form.handleSubmit(async (values) => {
+    form.handleSubmit((values) => {
       if (test) {
         const validation = schema.safeParse({ ...values, enabled: true })
         if (!validation.success) {
@@ -136,20 +161,12 @@ function AssetStorageForm({ config }: { config: AssetStorageConfig }) {
           return
         }
       }
-      try {
-        const proof = await verification.requestVerification({
-          scope: test ? 'asset.storage.test' : 'asset.storage.write',
-        })
-        if (!proof) return
-        const { secret_key, ...fields } = values
-        mutation.mutate({
-          values: { ...fields, ...(secret_key ? { secret_key } : {}) },
-          proof: proof.proof_token,
-          test,
-        })
-      } catch (error) {
-        handleServerError(AuthOperationError.from(error))
-      }
+      form.setValue('endpoint', values.endpoint, { shouldDirty: true })
+      const { secret_key, ...fields } = values
+      mutation.mutate({
+        values: { ...fields, ...(secret_key ? { secret_key } : {}) },
+        test,
+      })
     })
   return (
     <SettingsSection title={t('Asset storage')}>
@@ -184,38 +201,134 @@ function AssetStorageForm({ config }: { config: AssetStorageConfig }) {
               </SettingsSwitchItem>
             )}
           />
-          {(['endpoint', 'region', 'bucket', 'access_key'] as const).map(
-            (name) => (
+          <FormField
+            control={form.control}
+            name='provider'
+            render={({ field }) => (
+              <FormItem data-settings-form-span='full'>
+                <FormLabel>{t('S3 provider')}</FormLabel>
+                <Select
+                  items={providers}
+                  value={field.value}
+                  onValueChange={(value) => {
+                    const provider = assetStorageProviders.find(
+                      (item) => item === value
+                    )
+                    if (!provider) return
+                    field.onChange(provider)
+                    form.setValue(
+                      'force_path_style',
+                      assetStoragePathStyle(
+                        provider,
+                        form.getValues('endpoint'),
+                        form.getValues('force_path_style')
+                      ),
+                      { shouldDirty: true }
+                    )
+                  }}
+                  disabled={busy}
+                >
+                  <FormControl>
+                    <SelectTrigger className='w-full'>
+                      <SelectValue />
+                    </SelectTrigger>
+                  </FormControl>
+                  <SelectContent>
+                    {providers.map((provider) => (
+                      <SelectItem key={provider.value} value={provider.value}>
+                        {provider.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <div className='grid min-w-0 gap-x-5 gap-y-6 lg:grid-cols-4'>
+            <FormField
+              control={form.control}
+              name='endpoint'
+              render={({ field }) => (
+                <FormItem className='min-w-0 lg:col-span-2'>
+                  <FormLabel>{t('S3 endpoint')}</FormLabel>
+                  <FormControl>
+                    <Input
+                      {...field}
+                      inputMode='url'
+                      disabled={busy}
+                      autoComplete='off'
+                      onChange={(event) => {
+                        const endpoint = event.target.value
+                        if (form.getValues('provider') === 'oci') {
+                          const current = form.getValues('force_path_style')
+                          const previous = assetStoragePathStyle(
+                            'oci',
+                            field.value,
+                            current
+                          )
+                          const next = assetStoragePathStyle(
+                            'oci',
+                            endpoint,
+                            current
+                          )
+                          if (previous !== next) {
+                            form.setValue('force_path_style', next, {
+                              shouldDirty: true,
+                            })
+                          }
+                        }
+                        field.onChange(endpoint)
+                      }}
+                      onBlur={() => {
+                        field.onChange(
+                          normalizeAssetStorageEndpoint(field.value)
+                        )
+                        field.onBlur()
+                      }}
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    {t(
+                      'HTTPS is added if omitted. Use http:// for storage without TLS.'
+                    )}
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            {(['region', 'bucket'] as const).map((name) => (
               <FormField
                 key={name}
                 control={form.control}
                 name={name}
                 render={({ field }) => (
-                  <FormItem>
+                  <FormItem className='min-w-0 content-start'>
                     <FormLabel>
-                      {t(
-                        {
-                          endpoint: 'S3 endpoint',
-                          region: 'Region',
-                          bucket: 'Bucket',
-                          access_key: 'Access key',
-                        }[name]
-                      )}
+                      {name === 'region' ? t('Region') : t('Bucket')}
                     </FormLabel>
                     <FormControl>
-                      <Input
-                        {...field}
-                        disabled={busy}
-                        type={name === 'endpoint' ? 'url' : 'text'}
-                        autoComplete='off'
-                      />
+                      <Input {...field} disabled={busy} autoComplete='off' />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
                 )}
               />
-            )
-          )}
+            ))}
+          </div>
+          <FormField
+            control={form.control}
+            name='access_key'
+            render={({ field }) => (
+              <FormItem className='content-start'>
+                <FormLabel>{t('Access key')}</FormLabel>
+                <FormControl>
+                  <Input {...field} disabled={busy} autoComplete='off' />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
           <FormField
             control={form.control}
             name='secret_key'
@@ -230,7 +343,7 @@ function AssetStorageForm({ config }: { config: AssetStorageConfig }) {
                   />
                 </FormControl>
                 <FormDescription>
-                  {config.has_secret
+                  {props.config.has_secret
                     ? t('A secret is saved. Leave blank to keep it.')
                     : t('No secret is saved.')}
                 </FormDescription>
@@ -238,34 +351,29 @@ function AssetStorageForm({ config }: { config: AssetStorageConfig }) {
               </FormItem>
             )}
           />
-          <details className='space-y-3'>
-            <summary className='cursor-pointer text-sm font-medium'>
-              {t('Advanced settings')}
-            </summary>
-            <FormField
-              control={form.control}
-              name='force_path_style'
-              render={({ field }) => (
-                <SettingsSwitchItem>
-                  <SettingsSwitchContent>
-                    <FormLabel>{t('Use path-style addressing')}</FormLabel>
-                    <FormDescription>
-                      {t(
-                        'Enable only if your S3-compatible service requires it.'
-                      )}
-                    </FormDescription>
-                  </SettingsSwitchContent>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                      disabled={busy}
-                    />
-                  </FormControl>
-                </SettingsSwitchItem>
-              )}
-            />
-          </details>
+          <FormField
+            control={form.control}
+            name='force_path_style'
+            render={({ field }) => (
+              <SettingsSwitchItem>
+                <SettingsSwitchContent>
+                  <FormLabel>{t('Use path-style addressing')}</FormLabel>
+                  <FormDescription>
+                    {t(
+                      'Set automatically for the selected provider. Adjust if your deployment requires it.'
+                    )}
+                  </FormDescription>
+                </SettingsSwitchContent>
+                <FormControl>
+                  <Switch
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                    disabled={busy}
+                  />
+                </FormControl>
+              </SettingsSwitchItem>
+            )}
+          />
           <div className='flex flex-wrap items-center gap-3'>
             <Button
               type='button'
@@ -283,7 +391,6 @@ function AssetStorageForm({ config }: { config: AssetStorageConfig }) {
           </div>
         </SettingsForm>
       </Form>
-      <SecureVerificationDialog {...verification.dialogProps} />
     </SettingsSection>
   )
 }

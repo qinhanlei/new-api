@@ -11,6 +11,7 @@ type AssetActor struct {
 
 type AssetStorageFields struct {
 	Enabled        bool   `json:"enabled"`
+	Provider       string `json:"provider,omitempty"`
 	Endpoint       string `json:"endpoint"`
 	Region         string `json:"region"`
 	Bucket         string `json:"bucket"`

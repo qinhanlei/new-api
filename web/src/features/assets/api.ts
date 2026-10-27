@@ -105,34 +105,20 @@ export async function getAssetStorage(signal?: AbortSignal) {
   return requireServerSuccess(data).data
 }
 
-export async function saveAssetStorage(
-  values: AssetStorageUpdate,
-  proof: string
-) {
+export async function saveAssetStorage(values: AssetStorageUpdate) {
   const { data } = await api.put<AssetResponse<AssetStorageConfig>>(
     '/api/option/asset_storage',
     values,
-    {
-      ...authRequestOptions,
-      headers: { 'X-Security-Proof': proof },
-      singleUseAuthorization: true,
-    }
+    authRequestOptions
   )
   return requireServerSuccess(data).data
 }
 
-export async function testAssetStorage(
-  values: AssetStorageUpdate,
-  proof: string
-) {
+export async function testAssetStorage(values: AssetStorageUpdate) {
   const { data } = await api.post<AssetResponse<unknown>>(
     '/api/option/asset_storage/test',
     values,
-    {
-      ...authRequestOptions,
-      headers: { 'X-Security-Proof': proof },
-      singleUseAuthorization: true,
-    }
+    authRequestOptions
   )
   requireServerSuccess(data)
 }

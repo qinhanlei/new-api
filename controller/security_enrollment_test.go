@@ -15,15 +15,18 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -116,46 +119,133 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
 	return user, identity
 }
 
-func TestAssetCredentialsRequireScopedSingleUseVerification(t *testing.T) {
+func TestAssetChannelCredentialsRequireScopedVerification(t *testing.T) {
 	user, identity := setupSecurityEnrollmentTest(t)
 	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
-	for _, scope := range []string{service.VerificationScopeAssetStorageWrite, service.VerificationScopeAssetStorageTest, service.VerificationScopeChannelAssetsWrite} {
-		_, err := service.GetVerificationRequirements(identity, scope)
-		assert.ErrorIs(t, err, service.ErrVerificationForbidden)
-	}
+	_, err := service.GetVerificationRequirements(identity, service.VerificationScopeChannelAssetsWrite)
+	assert.ErrorIs(t, err, service.ErrVerificationForbidden)
 	require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
 	require.NoError(t, model.PublishUserAuthCache(user.Id))
-	operation := service.VerificationOperation{Scope: service.VerificationScopeAssetStorageWrite}
-	body := `{"enabled":false,"revision":0}`
-	response := securityEnrollmentRequest(http.MethodPut, "/api/option/asset_storage", body, "", identity, UpdateAssetStorage)
-	assert.Equal(t, http.StatusForbidden, response.Code)
-	assert.Contains(t, response.Body.String(), "SECURITY_PROOF_REQUIRED")
-
-	wrongProof := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: service.VerificationScopeAssetStorageTest}, "password")
-	response = securityEnrollmentRequest(http.MethodPut, "/api/option/asset_storage", body, wrongProof, identity, UpdateAssetStorage)
-	assert.Equal(t, http.StatusForbidden, response.Code)
-	assert.Contains(t, response.Body.String(), "SECURITY_PROOF_SCOPE_MISMATCH")
-
-	proof := issueSecurityEnrollmentProof(t, identity, operation, "password")
-	response = securityEnrollmentRequest(http.MethodPut, "/api/option/asset_storage", body, proof, identity, UpdateAssetStorage)
-	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-	assert.Contains(t, response.Body.String(), `"revision":1`)
-	response = securityEnrollmentRequest(http.MethodPut, "/api/option/asset_storage", body, proof, identity, UpdateAssetStorage)
-	assert.Equal(t, http.StatusForbidden, response.Code)
-	assert.Contains(t, response.Body.String(), "SECURITY_PROOF_CONSUMED")
 
 	channelOperation := service.VerificationOperation{Scope: service.VerificationScopeChannelAssetsWrite, Context: []byte(`{"channel_id":1}`)}
 	channelProof := issueSecurityEnrollmentProof(t, identity, channelOperation, "password")
 	channelOperation.Context = []byte(`{"channel_id":2}`)
-	_, err := service.ConsumeOperationProof(channelProof, identity, channelOperation)
+	_, err = service.ConsumeOperationProof(channelProof, identity, channelOperation)
 	assert.ErrorIs(t, err, service.ErrProofContext)
 
 	for _, key := range []string{system_setting.AssetStorageOption, model.AssetChannelOptionKey(1)} {
 		encoded, err := common.Marshal(map[string]string{"key": key, "value": "should-not-be-written"})
 		require.NoError(t, err)
-		response = securityEnrollmentRequest(http.MethodPut, "/api/option/", string(encoded), "", identity, UpdateOption)
+		response := securityEnrollmentRequest(http.MethodPut, "/api/option/", string(encoded), "", identity, UpdateOption)
 		assert.Contains(t, response.Body.String(), `"success":false`)
 	}
+}
+
+func TestAssetStorageRejectsUnauthorizedConfiguration(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	token, _, err := service.IssueAccessToken(identity)
+	require.NoError(t, err)
+	readOnly, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "option:read")
+	bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "storage-test")
+	require.NoError(t, err)
+	engine := gin.New()
+	engine.Use(middleware.RootAuth())
+	engine.PUT("/api/option/asset_storage", UpdateAssetStorage)
+	engine.POST("/api/option/asset_storage/test", TestAssetStorage)
+	for _, tc := range []struct {
+		name   string
+		role   int
+		token  string
+		cookie string
+		status int
+	}{
+		{"anonymous", common.RoleRootUser, "", "", http.StatusUnauthorized},
+		{"refresh cookie only", common.RoleRootUser, "", bundle.RefreshToken, http.StatusUnauthorized},
+		{"user", common.RoleCommonUser, token, "", http.StatusForbidden},
+		{"admin", common.RoleAdminUser, token, "", http.StatusForbidden},
+		{"root read-only PAT", common.RoleRootUser, readOnly, "", http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(user).Update("role", tc.role).Error)
+			require.NoError(t, model.PublishUserAuthCache(user.Id))
+			for _, route := range []struct{ method, path string }{{http.MethodPut, "/api/option/asset_storage"}, {http.MethodPost, "/api/option/asset_storage/test"}} {
+				request := httptest.NewRequest(route.method, route.path, strings.NewReader(`{"enabled":false,"revision":0}`))
+				request.Header.Set("Content-Type", "application/json")
+				if tc.token != "" {
+					request.Header.Set("Authorization", "Bearer "+tc.token)
+				}
+				if tc.cookie != "" {
+					request.AddCookie(&http.Cookie{Name: service.RefreshCookieName, Value: tc.cookie})
+				}
+				response := httptest.NewRecorder()
+				engine.ServeHTTP(response, request)
+				assert.Equal(t, tc.status, response.Code, route.path+": "+response.Body.String())
+			}
+		})
+	}
+	var count int64
+	require.NoError(t, model.DB.Model(&model.Option{}).Where(&model.Option{Key: system_setting.AssetStorageOption}).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestAssetStorageRootCanSaveAndTestWithoutSecurityProof(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	service.InitHttpClient()
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
+	require.NoError(t, model.PublishUserAuthCache(user.Id))
+	token, _, err := service.IssueAccessToken(identity)
+	require.NoError(t, err)
+	var object []byte
+	var mu sync.Mutex
+	store := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		assert.True(t, strings.HasPrefix(r.URL.Path, "/assets/new-api-assets/check/"))
+		switch r.Method {
+		case http.MethodPut:
+			var readErr error
+			object, readErr = io.ReadAll(r.Body)
+			assert.NoError(t, readErr)
+		case http.MethodGet:
+			assert.NotEmpty(t, r.URL.Query().Get("X-Amz-Signature"))
+			_, _ = w.Write(object)
+		case http.MethodDelete:
+			object = nil
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected storage method %s", r.Method)
+		}
+	}))
+	defer store.Close()
+	input := dto.AssetStorageUpdate{AssetStorageFields: dto.AssetStorageFields{Enabled: true, Endpoint: store.URL, Region: "local", Bucket: "assets", AccessKey: "test-access", ForcePathStyle: true}}
+	secret := "test-secret"
+	input.SecretKey = &secret
+	engine := gin.New()
+	engine.Use(middleware.RootAuth(), middleware.DisableCache())
+	engine.PUT("/api/option/asset_storage", UpdateAssetStorage)
+	engine.POST("/api/option/asset_storage/test", TestAssetStorage)
+	for _, route := range []struct{ method, path string }{{http.MethodPut, "/api/option/asset_storage"}, {http.MethodPost, "/api/option/asset_storage/test"}} {
+		body, err := common.Marshal(input)
+		require.NoError(t, err)
+		request := httptest.NewRequest(route.method, route.path, bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"success":true`)
+		assert.NotContains(t, response.Body.String(), secret)
+		mu.Lock()
+		assert.Empty(t, object)
+		mu.Unlock()
+		input.Revision = 1
+		input.SecretKey = nil
+	}
+	stored, err := model.LoadAssetStorageConfig(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, secret, stored.SecretKey)
+	assert.EqualValues(t, 1, stored.Revision)
 }
 
 func TestAssetManagementRejectsCrossUserAndReadOnlyTokens(t *testing.T) {

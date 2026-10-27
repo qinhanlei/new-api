@@ -59,6 +59,7 @@ export interface AssetReplica {
 }
 
 export interface AssetStorageConfig {
+  provider?: string
   enabled: boolean
   endpoint: string
   region: string

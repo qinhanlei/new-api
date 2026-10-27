@@ -19,6 +19,11 @@ For commercial licensing, please contact support@quantumnous.com
 import type { TFunction } from 'i18next'
 import { z } from 'zod'
 
+import {
+  assetStorageProviders,
+  normalizeAssetStorageEndpoint,
+} from './storage-providers'
+
 export function assetGroupSchema(t: TFunction) {
   return z.object({
     name: z
@@ -59,7 +64,8 @@ export function assetStorageSchema(t: TFunction, hasSecret: boolean) {
   return z
     .object({
       enabled: z.boolean(),
-      endpoint: z.string().trim(),
+      provider: z.enum(assetStorageProviders),
+      endpoint: z.string().transform(normalizeAssetStorageEndpoint),
       region: z.string().trim(),
       bucket: z.string().trim(),
       access_key: z.string().trim(),
@@ -68,7 +74,7 @@ export function assetStorageSchema(t: TFunction, hasSecret: boolean) {
       revision: z.number(),
     })
     .superRefine((values, context) => {
-      if (!values.enabled) return
+      if (!values.enabled && !values.endpoint) return
       for (const field of ['region', 'bucket', 'access_key'] as const) {
         if (!values[field]) {
           context.addIssue({
@@ -78,11 +84,21 @@ export function assetStorageSchema(t: TFunction, hasSecret: boolean) {
           })
         }
       }
-      if (!z.url({ protocol: /^https$/ }).safeParse(values.endpoint).success) {
+      let validEndpoint = false
+      try {
+        const endpoint = new URL(values.endpoint)
+        validEndpoint =
+          /^https?:$/.test(endpoint.protocol) &&
+          /^https?:\/\/[^\s/?#@\\]+\/?$/i.test(values.endpoint) &&
+          endpoint.hostname !== ''
+      } catch {
+        // Keep the validation error attached to the endpoint field.
+      }
+      if (!validEndpoint) {
         context.addIssue({
           code: 'custom',
           path: ['endpoint'],
-          message: t('Enter an HTTPS URL'),
+          message: t('Storage endpoint must be an HTTP or HTTPS origin'),
         })
       }
       if (!hasSecret && !values.secret_key) {

@@ -42,8 +42,8 @@ func validateAssetStorage(config system_setting.AssetStorageConfig) error {
 		return nil
 	}
 	endpoint, err := url.Parse(config.Endpoint)
-	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || (endpoint.Path != "" && endpoint.Path != "/") {
-		return assetError(http.StatusBadRequest, "InvalidParameter.Endpoint", "Storage endpoint must be an HTTPS origin")
+	if err != nil || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.Hostname() == "" || endpoint.User != nil || endpoint.ForceQuery || endpoint.RawQuery != "" || endpoint.Fragment != "" || (endpoint.Path != "" && endpoint.Path != "/") {
+		return assetError(http.StatusBadRequest, "InvalidParameter.Endpoint", "Storage endpoint must be an HTTP or HTTPS origin")
 	}
 	if config.Region == "" || len(config.Region) > 64 || config.Bucket == "" || len(config.Bucket) > 63 || strings.ContainsAny(config.Bucket, "/\\:") || config.AccessKey == "" || config.SecretKey == "" {
 		return assetError(http.StatusBadRequest, "InvalidParameter.Storage", "Region, bucket and storage credentials are required")
@@ -69,7 +69,11 @@ func mergeAssetStorage(ctx context.Context, input dto.AssetStorageUpdate) (syste
 		return current, model.ErrAssetConflict
 	}
 	next := system_setting.AssetStorageConfig{AssetStorageFields: input.AssetStorageFields, SecretKey: current.SecretKey}
-	next.Endpoint = strings.TrimRight(strings.TrimSpace(next.Endpoint), "/")
+	next.Endpoint = strings.TrimSpace(next.Endpoint)
+	if next.Endpoint != "" && !strings.Contains(next.Endpoint, "://") && !strings.HasPrefix(strings.ToLower(next.Endpoint), "http:") && !strings.HasPrefix(strings.ToLower(next.Endpoint), "https:") {
+		next.Endpoint = "https://" + next.Endpoint
+	}
+	next.Endpoint = strings.TrimRight(next.Endpoint, "/")
 	next.Region = strings.TrimSpace(next.Region)
 	next.Bucket = strings.TrimSpace(next.Bucket)
 	next.AccessKey = strings.TrimSpace(next.AccessKey)

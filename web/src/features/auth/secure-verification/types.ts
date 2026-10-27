@@ -26,8 +26,6 @@ export type VerificationMethod =
   | 'session'
 export type SecurityProofScope =
   | 'channel.key.read'
-  | 'asset.storage.write'
-  | 'asset.storage.test'
   | 'channel.assets.write'
   | 'passkey.register'
   | 'passkey.delete'

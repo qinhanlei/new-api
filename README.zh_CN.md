@@ -204,11 +204,13 @@ curl --fail-with-body http://localhost:3000/v1/responses \
 
 素材库默认关闭，支持 AIGC 图片、视频和音频。它管理素材及各渠道的审核副本，审核结果仍由上游决定；首版不包含真人核验流程。
 
-1. 在**系统设置 → 运营设置 → 素材存储**填写 S3 兼容 Endpoint、Region、Bucket、Access Key 和 Secret Key，测试读写及删除权限后启用。Bucket 保持私有，New API 为上游生成临时读取链接。火山 TOS 使用 S3 Endpoint，例如 `https://tos-s3-cn-beijing.volces.com`，关闭路径式寻址。
+1. 在**系统设置 → 运营设置 → 素材存储**选择 S3 服务商，填写 Endpoint、Region、Bucket、Access Key 和 Secret Key，测试读写及删除权限后启用。服务商选项自动设置寻址方式，也可按实际部署手动调整；旧配置保留原有寻址方式。Endpoint 省略协议时自动补全 `https://`，自建服务可显式填写 `http://`；地址不包含桶名或路径。Bucket 保持私有，New API 为上游生成临时读取链接，因此该地址需能被上游访问。火山 TOS 使用 S3 Endpoint，例如 `https://tos-s3-cn-beijing.volces.com`，关闭路径式寻址。测试和保存仅需现有超级管理员登录权限，无需再次输入密码。
 2. 安装或更新支持 `asset-references@1` 的 doubao 任务插件。在已保存渠道的**素材库**操作中启用素材能力，填写其官方兼容素材接口的完整 URL（含所需路径）。Bearer 模式复用该渠道的 API Key；火山官方控制面使用 AK/SK 模式。渠道必须只有一个 Key。
 3. 在**素材库**页面创建分组、上传文件或导入 URL。素材首先导入一个可用渠道，其他渠道按生成请求需要同步。用户只能访问自己的素材，管理员可选择用户管理素材。
 
 所有节点共用现有数据库和同一 S3 Bucket，无需共享本地目录或新增主节点地址。后台任务使用数据库租约协调；原文件只存储一份。请勿通过 Bucket 生命周期规则提前删除 `new-api-assets/` 下的对象。
+
+HTTP 存储可用于服务端读写，但 HTTPS 后台中的素材预览可能被浏览器的混合内容规则阻止；连接测试成功不代表浏览器预览可用。
 
 下游使用 New API 的 Bearer Key，请求 `POST /doubao/?Action=...&Version=2024-01-01`。支持素材与分组各自的 `Create`、`Get`、`List`、`Update`、`Delete` 共十个 Action，参数采用火山的字段格式：
 

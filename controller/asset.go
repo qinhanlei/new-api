@@ -223,9 +223,6 @@ func UpdateAssetStorage(c *gin.Context) {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 		return
 	}
-	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeAssetStorageWrite}) == nil {
-		return
-	}
 	view, err := service.UpdateAssetStorageConfig(c.Request.Context(), request)
 	if err != nil {
 		writeAssetManagementError(c, err)
@@ -239,9 +236,6 @@ func TestAssetStorage(c *gin.Context) {
 	var request dto.AssetStorageUpdate
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10), &request); err != nil {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
-		return
-	}
-	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeAssetStorageTest}) == nil {
 		return
 	}
 	err := service.TestAssetStorageConfig(c.Request.Context(), request)

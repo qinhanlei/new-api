@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
@@ -119,7 +119,7 @@ beforeEach(() => {
 })
 afterEach(() => client.clear())
 
-test('saving storage reuses verification and preserves a saved secret when blank', async () => {
+test('saving storage needs no verification and preserves a saved secret when blank', async () => {
   const user = userEvent.setup()
   const put = vi.spyOn(api, 'put').mockResolvedValue({
     data: {
@@ -142,6 +142,7 @@ test('saving storage reuses verification and preserves a saved secret when blank
     '/api/option/asset_storage',
     {
       enabled: true,
+      provider: 'other',
       endpoint: config.endpoint,
       region: config.region,
       bucket: 'new-assets',
@@ -149,22 +150,16 @@ test('saving storage reuses verification and preserves a saved secret when blank
       force_path_style: false,
       revision: 2,
     },
-    expect.objectContaining({
-      headers: { 'X-Security-Proof': 'single-use-proof' },
-      singleUseAuthorization: true,
-    })
+    expect.not.objectContaining({ singleUseAuthorization: true })
   )
-  expect(api.post).toHaveBeenCalledWith(
-    '/api/verify',
-    { method: 'session', scope: 'asset.storage.write' },
-    expect.anything()
-  )
+  expect(api.post).not.toHaveBeenCalled()
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   await waitFor(() =>
     expect(screen.getByRole('button', { name: 'Save Changes' })).toBeDisabled()
   )
 })
 
-test('connection testing uses its own proof and keeps unsaved configuration', async () => {
+test('connection testing needs no verification and keeps unsaved configuration', async () => {
   const user = userEvent.setup()
   render(
     <QueryClientProvider client={client}>
@@ -181,48 +176,12 @@ test('connection testing uses its own proof and keeps unsaved configuration', as
         secret_key: 'replacement-secret',
         revision: 2,
       }),
-      expect.objectContaining({ singleUseAuthorization: true })
+      expect.not.objectContaining({ singleUseAuthorization: true })
     )
   )
-  expect(api.post).toHaveBeenCalledWith(
-    '/api/verify',
-    { method: 'session', scope: 'asset.storage.test' },
-    expect.anything()
-  )
+  expect(api.post).toHaveBeenCalledOnce()
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   expect(screen.getByLabelText('Secret key')).toHaveValue('replacement-secret')
-  expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled()
-})
-
-test('a cancelled verification never saves credentials and keeps the form editable', async () => {
-  const user = userEvent.setup()
-  vi.mocked(api.get).mockImplementation(async (url) => ({
-    data: {
-      success: true,
-      data:
-        url === '/api/verify/methods'
-          ? {
-              scope: 'asset.storage.write',
-              methods: [{ method: 'password', available: true }],
-              oauth_providers: [],
-              password_encryption_enabled: false,
-            }
-          : config,
-    },
-  }))
-  const put = vi.spyOn(api, 'put')
-  render(
-    <QueryClientProvider client={client}>
-      <StorageFixture />
-    </QueryClientProvider>
-  )
-  await user.type(await screen.findByLabelText('Bucket'), '-new')
-  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
-  const dialog = await screen.findByRole('dialog', {
-    name: 'Security verification',
-  })
-  await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
-  expect(put).not.toHaveBeenCalled()
-  expect(screen.getByLabelText('Bucket')).toHaveValue('assets-new')
   expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled()
 })
 
@@ -290,7 +249,7 @@ test('multi-key channels cannot enable assets', async () => {
   )
 })
 
-test('storage errors preserve unsaved secrets and an invalid endpoint prevents verification', async () => {
+test('storage errors preserve unsaved secrets and an invalid endpoint prevents saving', async () => {
   const user = userEvent.setup()
   const put = vi.spyOn(api, 'put').mockResolvedValue({
     data: {
@@ -305,9 +264,11 @@ test('storage errors preserve unsaved secrets and an invalid endpoint prevents v
   )
   const endpoint = await screen.findByLabelText('S3 endpoint')
   await user.clear(endpoint)
-  await user.type(endpoint, 'http://insecure.example.com')
+  await user.type(endpoint, 'ftp://invalid.example.com')
   await user.click(screen.getByRole('button', { name: 'Save Changes' }))
-  expect(await screen.findByText('Enter an HTTPS URL')).toBeVisible()
+  expect(
+    await screen.findByText('Storage endpoint must be an HTTP or HTTPS origin')
+  ).toBeVisible()
   expect(api.post).not.toHaveBeenCalled()
   await user.clear(endpoint)
   await user.type(endpoint, 'https://replacement.example.com')
@@ -319,4 +280,213 @@ test('storage errors preserve unsaved secrets and an invalid endpoint prevents v
   )
   expect(screen.getByLabelText('Secret key')).toHaveValue('new-secret')
   expect(endpoint).toHaveValue('https://replacement.example.com')
+})
+
+test('legacy storage keeps its addressing mode and exposes all settings', async () => {
+  vi.mocked(api.get).mockResolvedValue({
+    data: { success: true, data: { ...config, force_path_style: true } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <StorageFixture />
+    </QueryClientProvider>
+  )
+  expect(
+    await screen.findByRole('combobox', { name: 'S3 provider' })
+  ).toHaveTextContent('Other S3-compatible storage')
+  expect(
+    screen.getByRole('switch', { name: 'Use path-style addressing' })
+  ).toBeChecked()
+  expect(screen.queryByText('Advanced settings')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Save Changes' })).toBeDisabled()
+})
+
+test('provider selection applies defaults while allowing a manual override', async () => {
+  const user = userEvent.setup()
+  render(
+    <QueryClientProvider client={client}>
+      <StorageFixture />
+    </QueryClientProvider>
+  )
+  const provider = await screen.findByRole('combobox', { name: 'S3 provider' })
+  const addressing = screen.getByRole('switch', {
+    name: 'Use path-style addressing',
+  })
+  for (const [name, checked] of [
+    ['MinIO', true],
+    ['Volcengine TOS', false],
+    ['Ceph RGW', true],
+    ['Alibaba Cloud OSS', false],
+    ['Oracle Cloud OCI', true],
+    ['Tencent Cloud COS', false],
+    ['Amazon S3', false],
+  ] as const) {
+    await user.click(provider)
+    await user.click(screen.getByRole('option', { name }))
+    expect(addressing).toHaveAttribute('aria-checked', String(checked))
+  }
+  await user.click(addressing)
+  await user.click(provider)
+  await user.click(
+    screen.getByRole('option', { name: 'Other S3-compatible storage' })
+  )
+  expect(addressing).toBeChecked()
+  expect(screen.getByLabelText('Bucket')).toHaveValue(config.bucket)
+})
+
+test('OCI endpoint changes choose the corresponding addressing style', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...config, provider: 'oci', force_path_style: true },
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <StorageFixture />
+    </QueryClientProvider>
+  )
+  const endpoint = await screen.findByLabelText('S3 endpoint')
+  const addressing = screen.getByRole('switch', {
+    name: 'Use path-style addressing',
+  })
+  await user.clear(endpoint)
+  await user.type(
+    endpoint,
+    'vhcompat.objectstorage.us-ashburn-1.oci.customer-oci.com'
+  )
+  await user.tab()
+  expect(addressing).not.toBeChecked()
+  expect(endpoint).toHaveValue(
+    'https://vhcompat.objectstorage.us-ashburn-1.oci.customer-oci.com'
+  )
+  await user.click(addressing)
+  await user.click(endpoint)
+  await user.tab()
+  expect(addressing).toBeChecked()
+  await user.clear(endpoint)
+  await user.type(
+    endpoint,
+    'namespace.compat.objectstorage.us-ashburn-1.oraclecloud.com'
+  )
+  await user.tab()
+  expect(addressing).toBeChecked()
+})
+
+test.each([
+  ['http://minio.internal:9000/', 'http://minio.internal:9000'],
+  ['tos-s3-cn-beijing.volces.com', 'https://tos-s3-cn-beijing.volces.com'],
+  ['minio.internal:9000', 'https://minio.internal:9000'],
+])(
+  'storage endpoint %s is normalized and tested without verification',
+  async (input, expected) => {
+    const user = userEvent.setup()
+    render(
+      <QueryClientProvider client={client}>
+        <StorageFixture />
+      </QueryClientProvider>
+    )
+    const endpoint = await screen.findByLabelText('S3 endpoint')
+    await user.clear(endpoint)
+    await user.type(endpoint, input)
+    await user.click(screen.getByRole('button', { name: 'Test Connection' }))
+    await waitFor(() =>
+      expect(api.post).toHaveBeenCalledWith(
+        '/api/option/asset_storage/test',
+        expect.objectContaining({ endpoint: expected }),
+        expect.not.objectContaining({ singleUseAuthorization: true })
+      )
+    )
+    expect(endpoint).toHaveValue(expected)
+    expect(api.post).toHaveBeenCalledOnce()
+  }
+)
+
+test.each([
+  'http://',
+  'https://',
+  'https://storage.example.com?',
+  'https://storage.example.com/objects',
+  'https://user:secret@storage.example.com',
+])('invalid storage origin %s prevents any request', async (input) => {
+  const user = userEvent.setup()
+  render(
+    <QueryClientProvider client={client}>
+      <StorageFixture />
+    </QueryClientProvider>
+  )
+  const endpoint = await screen.findByLabelText('S3 endpoint')
+  await user.clear(endpoint)
+  await user.type(endpoint, input)
+  await user.click(screen.getByRole('button', { name: 'Test Connection' }))
+  expect(
+    await screen.findByText('Storage endpoint must be an HTTP or HTTPS origin')
+  ).toBeVisible()
+  expect(endpoint).toHaveAttribute('aria-invalid', 'true')
+  expect(api.post).not.toHaveBeenCalled()
+})
+
+test('storage fields use a responsive address row and a shared credential row', async () => {
+  render(
+    <QueryClientProvider client={client}>
+      <StorageFixture />
+    </QueryClientProvider>
+  )
+  const endpoint = await screen.findByLabelText('S3 endpoint')
+  const endpointField = endpoint.closest('[data-slot="form-item"]')
+  const addressRow = endpointField?.parentElement
+  expect(addressRow).toHaveClass('grid', 'lg:grid-cols-4')
+  expect(endpointField).toHaveClass('lg:col-span-2')
+  expect(addressRow).toContainElement(screen.getByLabelText('Region'))
+  expect(addressRow).toContainElement(screen.getByLabelText('Bucket'))
+  const accessField = screen
+    .getByLabelText('Access key')
+    .closest('[data-slot="form-item"]')
+  const secretField = screen
+    .getByLabelText('Secret key')
+    .closest('[data-slot="form-item"]')
+  expect(accessField?.parentElement).toBe(secretField?.parentElement)
+  expect(accessField?.parentElement).toHaveClass('grid', 'lg:grid-cols-2')
+})
+
+test('a saved provider preserves its override and keyboard selection persists the new provider', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...config, provider: 'minio', force_path_style: false },
+    },
+  })
+  const put = vi.spyOn(api, 'put').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...config, provider: 'oci', force_path_style: true, revision: 3 },
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <StorageFixture />
+    </QueryClientProvider>
+  )
+  const provider = await screen.findByRole('combobox', { name: 'S3 provider' })
+  expect(provider).toHaveTextContent('MinIO')
+  expect(
+    screen.getByRole('switch', { name: 'Use path-style addressing' })
+  ).not.toBeChecked()
+  await user.click(provider)
+  await user.keyboard('{End}{Enter}')
+  expect(provider).toHaveTextContent('Oracle Cloud OCI')
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() =>
+    expect(put).toHaveBeenCalledWith(
+      '/api/option/asset_storage',
+      expect.objectContaining({ provider: 'oci', force_path_style: true }),
+      expect.anything()
+    )
+  )
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeDisabled()
+  )
+  expect(provider).toHaveTextContent('Oracle Cloud OCI')
 })
