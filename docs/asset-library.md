@@ -85,6 +85,8 @@ curl --fail-with-body "${NEW_API_URL}/doubao/?Action=GetAsset&Version=2024-01-01
 
 该对象放入请求的 `content` 数组；视频、音频使用对应的 URL 字段。必须使用本站返回的素材 ID，New API 会将其转换为选中渠道的上游 ID；同一请求不能混用本站素材和直接取得的上游素材 ID。
 
+`POST /v1/video/generations` 旧入口和 `POST /v1/videos` 也支持上述引用，放入 `metadata.content` 数组即可。旧入口保留原有请求和响应格式，也支持 JSON 字符串形式的 `metadata`。素材会在分发前校验，并优先使用全部引用素材均已就绪的合法渠道；显式指定的渠道仍受约束，不会自动切换。
+
 非默认项目需在素材管理请求中一致填写 `ProjectName`。它是用户在本站的逻辑空间，与渠道配置的上游项目不同。`ListAssetGroups`、`ListAssets` 的 `Filter.GroupType` 填写 `AIGC`；游标分页使用 `MaxResults`、`NextToken`，不与页码参数混用。
 
 ## 集群与维护

@@ -163,7 +163,7 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		}
 	}
 	body, _ := c.Get("task_request")
-	decoded := map[string]any{"kind": "json", "value": body}
+	decoded := map[string]any{"kind": "json", "value": jsonValue(body)}
 	assetIDs, assetErr := pluginruntime.ExtractAssetReferences(c.Request.Context(), a.plugin,
 		decoded, "task", "create", info.OriginModelName, true)
 	reserved, reservedErr := pluginruntime.ReservedAssetReferences(decoded)

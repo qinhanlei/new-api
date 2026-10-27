@@ -617,6 +617,12 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 		pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
 		pinned, ok := pinnedValue.(pluginruntime.PinnedEndpoint)
 		if !exists {
+			if c.Request.Method == http.MethodPost && c.Request.URL.Path == "/v1/video/generations" {
+				if err := prepareLegacyVideoAssets(c); err != nil {
+					abortTaskAssetError(c, err)
+					return
+				}
+			}
 			c.Next()
 			return
 		}

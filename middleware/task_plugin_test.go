@@ -22,6 +22,8 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	pluginadaptor "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -2417,6 +2419,240 @@ export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx
 							}
 							if tc.decoderRejects && status == http.StatusBadRequest {
 								assert.Contains(t, recorder.Body.String(), "plugin rejected this request")
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestVideoAssetSubmissionCompatibility(t *testing.T) {
+	require.NoError(t, appI18n.Init())
+	plugin, found := jsplugin.DefaultRegistry.Get("doubao")
+	require.True(t, found)
+	const videoModel = "doubao-seedance-1-5-pro-251215"
+	const assetID = "asset-na-video-reference"
+
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			dsn := ""
+			if dialect != "sqlite" {
+				dsn = os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
+				if dsn == "" {
+					t.Skip("database test DSN not configured")
+				}
+			}
+			previousDB, previousMain, previousLog := model.DB, common.MainDatabaseType(), common.LogDatabaseType()
+			previousPath, previousMaster := common.SQLitePath, common.IsMasterNode
+			previousCache, previousRedis := common.MemoryCacheEnabled, common.RedisEnabled
+			common.SQLitePath, common.IsMasterNode = t.TempDir()+"/video-assets.db", false
+			common.RedisEnabled = false
+			t.Setenv("SQL_DSN", dsn)
+			require.NoError(t, model.InitDB())
+			database := model.DB
+			database.Config.NamingStrategy = schema.NamingStrategy{TablePrefix: "video_assets_" + common.GetUUID()[:8] + "_"}
+			tables := append(model.AssetModels(), &model.Channel{}, &model.Ability{}, &model.Task{}, &model.User{}, &model.Token{}, &model.Option{})
+			require.NoError(t, database.AutoMigrate(tables...))
+			t.Cleanup(func() {
+				for _, table := range tables {
+					require.NoError(t, database.Unscoped().Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
+				}
+				common.MemoryCacheEnabled = true
+				model.InitChannelCache()
+				require.NoError(t, database.Migrator().DropTable(tables...))
+				model.DB = previousDB
+				common.SetDatabaseTypes(previousMain, previousLog)
+				common.SQLitePath, common.IsMasterNode = previousPath, previousMaster
+				common.MemoryCacheEnabled, common.RedisEnabled = previousCache, previousRedis
+				if previousDB != nil {
+					model.InitChannelCache()
+				}
+				sqlDB, err := database.DB()
+				require.NoError(t, err)
+				require.NoError(t, sqlDB.Close())
+			})
+			query := "SELECT version()"
+			if dialect == "sqlite" {
+				query = "SELECT sqlite_version()"
+			}
+			var version string
+			require.NoError(t, database.Raw(query).Scan(&version).Error)
+			t.Logf("database version: %s", version)
+
+			for _, memoryCache := range []bool{false, true} {
+				t.Run(fmt.Sprintf("memory_cache=%t", memoryCache), func(t *testing.T) {
+					common.MemoryCacheEnabled = memoryCache
+					for _, entry := range []string{"legacy", "native", "openai"} {
+						t.Run(entry, func(t *testing.T) {
+							for _, tc := range []struct {
+								name                                                 string
+								plainURL, pending, pinned, foreign, denied, tampered bool
+								metadataString, imageField, mapped, unknownField     bool
+								wantStatus                                           int
+								wantCode                                             string
+							}{
+								{name: "ready alternate"},
+								{name: "ordinary image URL", plainURL: true},
+								{name: "all replicas pending", pending: true, wantStatus: http.StatusConflict, wantCode: "AssetNotReady"},
+								{name: "explicit pending channel", pinned: true, wantStatus: http.StatusConflict, wantCode: "AssetNotReady"},
+								{name: "another owner", foreign: true, wantStatus: http.StatusNotFound, wantCode: "ResourceNotFound"},
+								{name: "token model restriction with pin", denied: true, pinned: true, wantStatus: http.StatusForbidden},
+								{name: "reference changed after selection", tampered: true, wantStatus: http.StatusBadRequest, wantCode: "InvalidAssetReference"},
+								{name: "unclaimed top level reference", unknownField: true, wantStatus: http.StatusBadRequest},
+								{name: "legacy string metadata", metadataString: true},
+								{name: "legacy single image field", imageField: true},
+								{name: "legacy model alias", mapped: true},
+							} {
+								if (tc.metadataString || tc.imageField || tc.mapped) && entry != "legacy" {
+									continue
+								}
+								t.Run(tc.name, func(t *testing.T) {
+									for _, table := range tables {
+										require.NoError(t, database.Unscoped().Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
+									}
+									require.NoError(t, database.Create(&model.User{Id: 7, Username: "video-assets", Group: "default", Status: common.UserStatusEnabled}).Error)
+									require.NoError(t, model.SaveAssetStorageConfig(t.Context(), system_setting.AssetStorageConfig{AssetStorageFields: dto.AssetStorageFields{Enabled: true}}))
+									channels := []*model.Channel{
+										{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Name: "preferred", Key: "preferred-key", Group: "default", Models: videoModel, Priority: common.GetPointer(int64(20))},
+										{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Name: "ready", Key: "ready-key", Group: "default", Models: videoModel, Priority: common.GetPointer(int64(10))},
+									}
+									modelName := videoModel
+									if tc.mapped {
+										modelName = "friendly-video"
+									}
+									for _, channel := range channels {
+										if tc.mapped {
+											channel.Models = modelName
+											channel.ModelMapping = common.GetPointer(fmt.Sprintf(`{"%s":%q}`, modelName, videoModel))
+										}
+										require.NoError(t, channel.Insert())
+										config := system_setting.AssetChannelConfig{AssetChannelFields: dto.AssetChannelFields{Enabled: true, Endpoint: "https://asset-provider.example", ProjectName: "default", AuthType: "bearer"}, ChannelScope: model.AssetChannelScope(channel)}
+										require.NoError(t, model.SaveAssetChannelConfig(t.Context(), channel.Id, config))
+									}
+									owner := 7
+									if tc.foreign {
+										owner = 8
+									}
+									group := model.AssetGroup{PublicID: "group-na-video", UserID: owner, ProjectName: "default"}
+									require.NoError(t, database.Create(&group).Error)
+									asset := model.Asset{PublicID: assetID, UserID: owner, ProjectName: "default", GroupID: group.ID, GroupPublicID: group.PublicID, AssetType: "Image", ObjectState: model.AssetReady}
+									require.NoError(t, database.Create(&asset).Error)
+									if !tc.pending {
+										require.NoError(t, database.Create(&model.AssetReplica{AssetID: asset.ID, ChannelID: channels[1].Id, UpstreamID: "asset-upstream-ready", Status: model.AssetActive, State: model.AssetReady}).Error)
+									}
+									model.InitChannelCache()
+									url := "asset://" + assetID
+									if tc.plainURL {
+										url = "https://images.example/reference.png"
+									}
+									content := []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}, "role": "reference_image"}}
+									metadata := map[string]any{"content": content, "duration": 4, "watermark": false, "priority": 0}
+									body := map[string]any{"model": modelName, "prompt": "animate this picture", "metadata": metadata}
+									path := "/v1/video/generations"
+									handlers := []gin.HandlerFunc{PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), Distribute()}
+									if entry == "native" {
+										path = "/doubao/api/v3/contents/generations/tasks"
+										body = metadata
+										body["model"] = videoModel
+										body["content"] = append(content, map[string]any{"type": "text", "text": "animate this picture"})
+										handlers = []gin.HandlerFunc{func(c *gin.Context) {
+											c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Generation: jsplugin.DefaultRegistry.Generation(), Plugin: plugin, Route: plugin.Meta.Routes[0]})
+										}, PrepareTaskPluginRoute(), Distribute()}
+									} else if entry == "openai" {
+										path = "/v1/videos"
+										handlers = []gin.HandlerFunc{RouteTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), Distribute()}
+									}
+									if tc.metadataString {
+										encoded, err := common.Marshal(metadata)
+										require.NoError(t, err)
+										body["metadata"] = string(encoded)
+									}
+									if tc.imageField {
+										delete(metadata, "content")
+										body["image"] = url
+									}
+									if tc.unknownField {
+										body["unknown_reference"] = "asset://asset-na-unclaimed"
+									}
+									encoded, err := common.Marshal(body)
+									require.NoError(t, err)
+									reached := false
+									engine := gin.New()
+									engine.Use(func(c *gin.Context) {
+										common.SetContextKey(c, constant.ContextKeyUserId, 7)
+										common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+										if tc.denied {
+											common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+											common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"other-model": true})
+										}
+										if tc.pinned {
+											service.GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: channels[0].Id, Source: dto.PinSourceToken, Rank: dto.PinRankToken})
+										}
+									})
+									handlers = append(handlers, func(c *gin.Context) {
+										reached = true
+										if entry == "legacy" {
+											_, pinned := c.Get(jsplugin.ContextKeyPinnedEndpoint)
+											assert.False(t, pinned, "keep the legacy response presenter")
+										}
+										if tc.tampered {
+											c.Set(jsplugin.ContextKeyAssetReferences, []string{"asset-na-different"})
+										}
+										info := &relaycommon.RelayInfo{OriginModelName: modelName, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_asset_video"}}
+										info.InitChannelMeta(c)
+										info.UpstreamModelName = videoModel
+										adaptor := pluginadaptor.New(plugin)
+										adaptor.Init(info)
+										if taskErr := adaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {
+											c.JSON(taskErr.StatusCode, taskErr)
+											return
+										}
+										request, err := adaptor.BuildRequestBody(c, info)
+										require.NoError(t, err)
+										var upstream map[string]any
+										require.NoError(t, common.DecodeJson(request, &upstream))
+										expectedChannel, expectedURL := channels[1].Id, "asset://asset-upstream-ready"
+										if tc.plainURL {
+											expectedChannel, expectedURL = channels[0].Id, url
+										}
+										assert.Equal(t, expectedChannel, info.ChannelId)
+										expectedReference := map[string]any{"type": "image_url", "image_url": map[string]any{"url": expectedURL}, "role": "reference_image"}
+										if tc.imageField {
+											delete(expectedReference, "role")
+										}
+										assert.Equal(t, []any{expectedReference, map[string]any{"type": "text", "text": "animate this picture"}}, upstream["content"])
+										assert.Equal(t, false, upstream["watermark"])
+										assert.EqualValues(t, 0, upstream["priority"])
+										assert.EqualValues(t, 4, upstream["duration"])
+										c.Status(http.StatusNoContent)
+									})
+									engine.POST(path, handlers...)
+									request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded))
+									request.Header.Set("Content-Type", "application/json")
+									recorder := httptest.NewRecorder()
+									engine.ServeHTTP(recorder, request)
+									status := tc.wantStatus
+									if status == 0 {
+										status = http.StatusNoContent
+									}
+									assert.Equal(t, status, recorder.Code, recorder.Body.String())
+									assert.Equal(t, status == http.StatusNoContent || tc.tampered, reached, "reject before task submission")
+									if tc.wantCode != "" {
+										assert.Contains(t, recorder.Body.String(), tc.wantCode)
+									}
+									if status == http.StatusConflict {
+										assert.Equal(t, "5", recorder.Header().Get("Retry-After"))
+									}
+									var uses int64
+									require.NoError(t, database.Model(&model.AssetUse{}).Count(&uses).Error)
+									if status == http.StatusNoContent && !tc.plainURL {
+										assert.EqualValues(t, 1, uses)
+									} else {
+										assert.Zero(t, uses)
+									}
+								})
 							}
 						})
 					}
