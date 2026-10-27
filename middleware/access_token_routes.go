@@ -41,13 +41,14 @@ func accessTokenScopeRule(scope string) accessTokenRouteRule {
 // Casbin-guarded routes declare themselves through
 // DeclareAccessTokenPermissionRoute when they are registered.
 var accessTokenRouteRules = map[string]accessTokenRouteRule{
-	"GET /api/assets/config": accessTokenScopeRule("asset:read"),
-	"POST /api/assets/actions": accessTokenAnyRule,
-	"POST /api/assets/upload": accessTokenScopeRule("asset:write"),
-	"GET /api/assets/:id/replicas": accessTokenScopeRule("asset:read"),
-	"GET /api/option/asset_storage": accessTokenScopeRule("option:read"),
-	"PUT /api/option/asset_storage": accessTokenScopeRule("option:write"),
-	"POST /api/option/asset_storage/test": accessTokenScopeRule("option:write"),
+	"GET /api/assets/config":                          accessTokenScopeRule("asset:read"),
+	"POST /api/assets/actions":                        accessTokenAnyRule,
+	"POST /api/assets/upload":                         accessTokenScopeRule("asset:write"),
+	"GET /api/assets/:id/replicas":                    accessTokenScopeRule("asset:read"),
+	"POST /api/assets/:id/replicas/:channel_id/retry": accessTokenScopeRule("asset:write"),
+	"GET /api/option/asset_storage":                   accessTokenScopeRule("option:read"),
+	"PUT /api/option/asset_storage":                   accessTokenScopeRule("option:write"),
+	"POST /api/option/asset_storage/test":             accessTokenScopeRule("option:write"),
 	// router/api-router.go: top level
 	"GET /api/models":                     accessTokenScopeRule("profile:read"),
 	"GET /api/status/test":                accessTokenScopeRule("log:read"),

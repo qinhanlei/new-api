@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,6 +82,17 @@ func UpdateAssetChannelConfig(ctx context.Context, channelID int, input dto.Asse
 	}
 	if next.AuthType == "aksk" && next.Enabled && (next.AccessKey == "" || next.SecretKey == "") {
 		return dto.AssetChannelView{}, assetError(http.StatusBadRequest, "InvalidParameter.Credentials", "Material access key and secret are required")
+	}
+	if next.Enabled {
+		var page struct {
+			Items []any `json:"Items"`
+		}
+		if err = callAssetUpstream(ctx, channel, next, "ListAssetGroups", map[string]any{"Filter": map[string]any{"GroupType": "AIGC"}, "MaxResults": 1}, &page); err != nil {
+			return dto.AssetChannelView{}, err
+		}
+		if page.Items == nil {
+			return dto.AssetChannelView{}, assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material list was invalid")
+		}
 	}
 	// A rotated signing secret must still be able to read a known resource before
 	// replacing the credential needed to poll or remove existing replicas.
@@ -185,28 +197,47 @@ func callAssetUpstream(ctx context.Context, channel *model.Channel, config syste
 			Error *dto.AssetFailure `json:"Error"`
 		} `json:"ResponseMetadata"`
 		Result any `json:"Result"`
+		Error  any `json:"error"`
 	}
 	if err = common.Unmarshal(body, &envelope); err != nil {
+		status := http.StatusBadGateway
 		code := "UpstreamInvalidResponse"
-		if strings.HasPrefix(action, "Create") {
+		if response.StatusCode >= 400 {
+			status = response.StatusCode
+			code = "UpstreamHTTP" + strconv.Itoa(status)
+		}
+		if strings.HasPrefix(action, "Create") && (status >= 500 || status == http.StatusRequestTimeout) {
 			code = "UpstreamResultUnknown"
 		}
-		return assetError(http.StatusBadGateway, code, "The upstream material response was not valid JSON")
+		return assetError(status, code, "The upstream material response was not valid JSON")
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 || envelope.ResponseMetadata.Error != nil {
+	if response.StatusCode < 200 || response.StatusCode >= 300 || envelope.ResponseMetadata.Error != nil || envelope.Error != nil {
 		status := response.StatusCode
 		if status < 400 {
 			status = http.StatusBadGateway
 		}
 		code, message := "UpstreamError", "The upstream material operation failed"
 		if envelope.ResponseMetadata.Error != nil {
-			code = safeAssetMessage(envelope.ResponseMetadata.Error.Code, channel.Key, config.SecretKey)
-			if len(code) > 128 {
-				code = "UpstreamError"
+			code, message = envelope.ResponseMetadata.Error.Code, envelope.ResponseMetadata.Error.Message
+		} else {
+			switch upstreamError := envelope.Error.(type) {
+			case string:
+				message = upstreamError
+			case map[string]any:
+				if value, ok := upstreamError["code"].(string); ok && value != "" {
+					code = value
+				}
+				if value, ok := upstreamError["message"].(string); ok && value != "" {
+					message = value
+				}
 			}
-			message = safeAssetMessage(envelope.ResponseMetadata.Error.Message, channel.Key, config.SecretKey)
 		}
-		if strings.HasPrefix(action, "Create") && status >= 500 {
+		code = safeAssetMessage(code, channel.Key, config.SecretKey)
+		if code == "" || len(code) > 128 {
+			code = "UpstreamError"
+		}
+		message = safeAssetMessage(message, channel.Key, config.SecretKey)
+		if strings.HasPrefix(action, "Create") && (status >= 500 || status == http.StatusRequestTimeout) {
 			code = "UpstreamResultUnknown"
 		}
 		return assetError(status, code, message)

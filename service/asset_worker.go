@@ -11,9 +11,85 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"gorm.io/gorm"
 )
 
 const assetCreateConsistencyWindow = 5 * time.Minute
+
+// RetryAssetReplica is an explicit administrative recovery. The normal worker
+// never repeats an uncertain create merely because a list is temporarily empty.
+func RetryAssetReplica(ctx context.Context, userID int, publicID string, channelID int) error {
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	asset, err := model.GetAsset(ctx, userID, publicID, "")
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return assetError(http.StatusNotFound, "ResourceNotFound", "The material resource was not found")
+	}
+	if err != nil {
+		return err
+	}
+	if asset.ObjectState != model.AssetReady {
+		return assetError(http.StatusConflict, "AssetNotReady", "The material source is not ready")
+	}
+	replica, err := model.GetAssetReplica(ctx, asset.ID, channelID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return assetError(http.StatusNotFound, "ResourceNotFound", "The material resource was not found")
+	}
+	if err != nil {
+		return err
+	}
+	group, err := model.GetAssetGroupReplica(ctx, asset.GroupID, channelID)
+	if err != nil {
+		return err
+	}
+	if replica.Status != model.AssetFailed || replica.State == model.AssetDeleted || group.State == model.AssetDeleted ||
+		replica.LeaseExpiresAt > time.Now().Unix() || group.LeaseExpiresAt > time.Now().Unix() {
+		return model.ErrAssetConflict
+	}
+	allowed, err := AssetChannelAuthorized(ctx, asset.UserID, replica.TokenID, channelID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return assetError(http.StatusForbidden, "AccessDenied", "The owner can no longer use this material channel")
+	}
+	channel, err := model.GetChannelById(channelID, true)
+	if err != nil {
+		return err
+	}
+	config, err := model.LoadAssetChannelConfig(ctx, channelID)
+	if err != nil {
+		return err
+	}
+	groupID := group.UpstreamID
+	if groupID == "" && (group.State == model.AssetCreating || group.State == model.AssetUnknown) {
+		if time.Now().Before(time.Unix(group.CreateStartedAt, 0).Add(assetCreateConsistencyWindow)) {
+			return assetError(http.StatusConflict, "UpstreamResultUnknown", "The upstream create result is still settling; retry later")
+		}
+		sourceGroup, loadErr := model.GetAssetGroupByID(ctx, asset.GroupID)
+		if loadErr != nil {
+			return loadErr
+		}
+		groupID, err = findUpstreamAssetGroup(ctx, channel, config, sourceGroup.PublicID)
+		if err != nil {
+			return err
+		}
+	}
+	upstreamID := replica.UpstreamID
+	if upstreamID == "" && (replica.State == model.AssetCreating || replica.State == model.AssetUnknown) {
+		if groupID == "" || time.Now().Before(time.Unix(replica.CreateStartedAt, 0).Add(assetCreateConsistencyWindow)) {
+			return assetError(http.StatusConflict, "UpstreamResultUnknown", "The upstream create result is still settling; retry later")
+		}
+		upstreamID, err = findUpstreamAsset(ctx, channel, config, asset, groupID)
+		if err != nil {
+			return err
+		}
+	}
+	if (group.State == model.AssetReady || upstreamID != "") && groupID == "" {
+		return model.ErrAssetConflict
+	}
+	return model.RequeueAssetReplica(ctx, asset, replica, group, upstreamID, groupID, config.Revision)
+}
 
 // StartAssetWorker runs on every node. Each operation owns a fenced database
 // lease; network calls never hold database transactions or require local files.
@@ -311,9 +387,9 @@ func ensureUpstreamAssetGroup(ctx context.Context, asset *model.Asset, channel *
 func findUpstreamAssetGroup(ctx context.Context, channel *model.Channel, config system_setting.AssetChannelConfig, name string) (string, error) {
 	type groupPage struct {
 		Items []struct {
-			ID        string `json:"Id"`
-			Name      string `json:"Name"`
-			GroupType string `json:"GroupType"`
+			ID        string  `json:"Id"`
+			Name      *string `json:"Name"`
+			GroupType string  `json:"GroupType"`
 		} `json:"Items"`
 		NextToken string `json:"NextToken"`
 	}
@@ -324,8 +400,14 @@ func findUpstreamAssetGroup(ctx context.Context, channel *model.Channel, config 
 		if err := callAssetUpstream(ctx, channel, config, "ListAssetGroups", payload, &result); err != nil {
 			return "", err
 		}
+		if result.Items == nil {
+			return "", assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material list was invalid")
+		}
 		for _, item := range result.Items {
-			if item.Name != name || item.GroupType != "AIGC" {
+			if strings.TrimSpace(item.ID) == "" || len(item.ID) > 191 || item.Name == nil || item.GroupType == "" {
+				return "", assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material list was invalid")
+			}
+			if *item.Name != name || item.GroupType != "AIGC" {
 				continue
 			}
 			if id != "" || len(item.ID) > 191 {
@@ -344,10 +426,10 @@ func findUpstreamAssetGroup(ctx context.Context, channel *model.Channel, config 
 func findUpstreamAsset(ctx context.Context, channel *model.Channel, config system_setting.AssetChannelConfig, asset *model.Asset, groupID string) (string, error) {
 	type assetPage struct {
 		Items []struct {
-			ID        string `json:"Id"`
-			Name      string `json:"Name"`
-			AssetType string `json:"AssetType"`
-			GroupID   string `json:"GroupId"`
+			ID        string  `json:"Id"`
+			Name      *string `json:"Name"`
+			AssetType string  `json:"AssetType"`
+			GroupID   string  `json:"GroupId"`
 		} `json:"Items"`
 		NextToken string `json:"NextToken"`
 	}
@@ -358,8 +440,14 @@ func findUpstreamAsset(ctx context.Context, channel *model.Channel, config syste
 		if err := callAssetUpstream(ctx, channel, config, "ListAssets", payload, &result); err != nil {
 			return "", err
 		}
+		if result.Items == nil {
+			return "", assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material list was invalid")
+		}
 		for _, item := range result.Items {
-			if item.Name != asset.PublicID || item.GroupID != groupID || item.AssetType != asset.AssetType {
+			if strings.TrimSpace(item.ID) == "" || len(item.ID) > 191 || item.Name == nil || item.GroupID == "" || item.AssetType == "" {
+				return "", assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material list was invalid")
+			}
+			if *item.Name != asset.PublicID || item.GroupID != groupID || item.AssetType != asset.AssetType {
 				continue
 			}
 			if id != "" || len(item.ID) > 191 {

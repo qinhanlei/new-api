@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
@@ -210,7 +212,12 @@ func SaveAssetChannelConfig(ctx context.Context, channelID int, next system_sett
 		}
 		if current.Endpoint != next.Endpoint || current.ProjectName != next.ProjectName || current.AuthType != next.AuthType || current.AccessKey != next.AccessKey || current.ChannelScope != next.ChannelScope {
 			if err = checkAssetChannelResources(tx, []int{channelID}); err != nil {
-				return err
+				if !errors.Is(err, ErrAssetInUse) {
+					return err
+				}
+				if err = checkAssetEndpointRepair(tx, channelID, current, next); err != nil {
+					return err
+				}
 			}
 		}
 		next.Revision++
@@ -221,6 +228,50 @@ func SaveAssetChannelConfig(ctx context.Context, channelID int, next system_sett
 		option := Option{Key: AssetChannelOptionKey(channelID), Value: string(encoded)}
 		return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"value"})}).Create(&option).Error
 	})
+}
+
+// Only a path correction on the same account is recoverable without removing
+// resources. Uncertain creations stay recorded for explicit reconciliation.
+func checkAssetEndpointRepair(tx *gorm.DB, channelID int, current, next system_setting.AssetChannelConfig) error {
+	before, beforeErr := url.Parse(current.Endpoint)
+	after, afterErr := url.Parse(next.Endpoint)
+	if !next.Enabled || beforeErr != nil || afterErr != nil || before.Scheme != after.Scheme || !strings.EqualFold(before.Host, after.Host) ||
+		current.ProjectName != next.ProjectName || current.AuthType != next.AuthType || current.AccessKey != next.AccessKey || current.ChannelScope != next.ChannelScope {
+		return ErrAssetInUse
+	}
+	var groups []AssetGroupReplica
+	if err := lockForUpdate(tx).Where("channel_id = ? AND state <> ?", channelID, AssetDeleted).Find(&groups).Error; err != nil {
+		return err
+	}
+	for _, group := range groups {
+		if group.UpstreamID != "" || group.LeaseToken != "" || group.LeaseExpiresAt > time.Now().Unix() || group.State == AssetCreating {
+			return ErrAssetInUse
+		}
+		var source AssetGroup
+		if err := tx.First(&source, group.GroupID).Error; err != nil {
+			return err
+		}
+		if source.DeletedAt > 0 {
+			return ErrAssetInUse
+		}
+	}
+	var replicas []AssetReplica
+	if err := lockForUpdate(tx).Where("channel_id = ? AND state <> ?", channelID, AssetDeleted).Find(&replicas).Error; err != nil {
+		return err
+	}
+	for _, replica := range replicas {
+		if replica.UpstreamID != "" || replica.Status != AssetFailed || replica.LeaseToken != "" || replica.LeaseExpiresAt > time.Now().Unix() || replica.State == AssetCreating {
+			return ErrAssetInUse
+		}
+		var asset Asset
+		if err := tx.First(&asset, replica.AssetID).Error; err != nil {
+			return err
+		}
+		if asset.DeletedAt > 0 {
+			return ErrAssetInUse
+		}
+	}
+	return nil
 }
 
 func checkAssetChannelResources(tx *gorm.DB, ids []int) error {

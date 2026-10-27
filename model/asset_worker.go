@@ -43,7 +43,7 @@ func GetAssetReplicaViews(ctx context.Context, userID int, publicID string) ([]d
 		if replica.State == AssetUnknown {
 			status = "Unknown"
 		}
-		result = append(result, dto.AssetReplicaView{ChannelID: replica.ChannelID, ChannelName: name, Status: status, ErrorCode: replica.ErrorCode, ErrorMessage: replica.ErrorMessage, LastAttemptAt: replica.UpdatedAt})
+		result = append(result, dto.AssetReplicaView{ChannelID: replica.ChannelID, ChannelName: name, Status: status, ErrorCode: replica.ErrorCode, ErrorMessage: replica.ErrorMessage, LastAttemptAt: replica.UpdatedAt, CanRetry: replica.Status == AssetFailed && replica.State != AssetDeleted && replica.LeaseExpiresAt <= time.Now().Unix()})
 	}
 	return result, nil
 }
@@ -52,6 +52,104 @@ func AssetChannelGroupReplicas(ctx context.Context, channelID int) ([]AssetGroup
 	items := []AssetGroupReplica{}
 	err := protectedAssetDB(ctx).Where("channel_id = ? AND state <> ?", channelID, AssetDeleted).Find(&items).Error
 	return items, err
+}
+
+func GetAssetReplica(ctx context.Context, assetID int64, channelID int) (AssetReplica, error) {
+	var replica AssetReplica
+	err := protectedAssetDB(ctx).Where("asset_id = ? AND channel_id = ?", assetID, channelID).First(&replica).Error
+	return replica, err
+}
+
+func GetAssetGroupReplica(ctx context.Context, groupID int64, channelID int) (AssetGroupReplica, error) {
+	var replica AssetGroupReplica
+	err := protectedAssetDB(ctx).Where("group_id = ? AND channel_id = ?", groupID, channelID).First(&replica).Error
+	return replica, err
+}
+
+// RequeueAssetReplica publishes a read-only reconciliation only if its source
+// state is still current. Row locks also fence group workers, which do not take
+// the storage lock. No network operation runs inside this transaction.
+func RequeueAssetReplica(ctx context.Context, asset *Asset, replica AssetReplica, group AssetGroupReplica, upstreamID, groupUpstreamID string, revision int64) error {
+	return protectedAssetDB(ctx).Transaction(func(tx *gorm.DB) error {
+		storage, err := lockAssetStorage(tx)
+		if err != nil {
+			return err
+		}
+		if !storage.Enabled {
+			return ErrAssetStorageDisabled
+		}
+		config, err := loadAssetChannelConfig(tx, replica.ChannelID)
+		if err != nil {
+			return err
+		}
+		var channel Channel
+		if err = lockForUpdate(tx).First(&channel, replica.ChannelID).Error; err != nil {
+			return err
+		}
+		if config.Revision != revision || !config.Enabled || channel.Status != common.ChannelStatusEnabled || config.ChannelScope != AssetChannelScope(&channel) {
+			return ErrAssetConflict
+		}
+		var current Asset
+		if err = lockForUpdate(tx).First(&current, asset.ID).Error; err != nil {
+			return err
+		}
+		if current.DeletedAt > 0 || current.ObjectState != AssetReady || current.UserID != asset.UserID || current.GroupID != asset.GroupID || current.ObjectKey != asset.ObjectKey {
+			return ErrAssetConflict
+		}
+		var owner User
+		if err = lockForUpdate(tx).First(&owner, asset.UserID).Error; err != nil {
+			return err
+		}
+		if owner.Status != common.UserStatusEnabled {
+			return ErrAssetConflict
+		}
+		var sourceGroup AssetGroup
+		if err = lockForUpdate(tx).First(&sourceGroup, asset.GroupID).Error; err != nil {
+			return err
+		}
+		if sourceGroup.DeletedAt > 0 {
+			return ErrAssetConflict
+		}
+		var currentGroup AssetGroupReplica
+		if err = lockForUpdate(tx).First(&currentGroup, group.ID).Error; err != nil {
+			return err
+		}
+		var currentReplica AssetReplica
+		if err = lockForUpdate(tx).First(&currentReplica, replica.ID).Error; err != nil {
+			return err
+		}
+		now := time.Now().Unix()
+		if currentGroup != group || currentReplica != replica || replica.Status != AssetFailed || replica.State == AssetDeleted ||
+			group.State == AssetDeleted || group.LeaseExpiresAt > now || replica.LeaseExpiresAt > now ||
+			(replica.UpstreamID != "" && replica.UpstreamID != upstreamID) || (group.UpstreamID != "" && group.UpstreamID != groupUpstreamID) {
+			return ErrAssetConflict
+		}
+		groupState := AssetPending
+		if groupUpstreamID != "" {
+			groupState = AssetReady
+		}
+		if group.State != groupState || group.UpstreamID != groupUpstreamID || group.ErrorCode != "" || group.ErrorMessage != "" || group.LeaseToken != "" || group.LeaseExpiresAt != 0 {
+			result := tx.Model(&AssetGroupReplica{}).Where("id = ?", group.ID).Updates(map[string]any{"state": groupState, "upstream_id": groupUpstreamID, "error_code": "", "error_message": "", "lease_token": "", "lease_expires_at": 0, "create_started_at": 0, "updated_at": now})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return ErrAssetConflict
+			}
+		}
+		state := AssetPending
+		if upstreamID != "" {
+			state = AssetReady
+		}
+		result := tx.Model(&AssetReplica{}).Where("id = ?", replica.ID).Updates(map[string]any{"status": AssetProcessing, "state": state, "upstream_id": upstreamID, "error_code": "", "error_message": "", "attempts": 0, "next_attempt_at": now, "lease_token": "", "lease_expires_at": 0, "create_started_at": 0, "updated_at": now})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrAssetConflict
+		}
+		return refreshAssetStatus(tx, asset.ID, "", "")
+	})
 }
 
 // Leases use conditional updates rather than process-local locks. Their token
@@ -197,29 +295,31 @@ func FinishAssetReplica(ctx context.Context, replica *AssetReplica, retryAt int6
 		if result.RowsAffected == 0 {
 			return ErrAssetConflict
 		}
-		var replicas []AssetReplica
-		if err := tx.Where("asset_id = ? AND state <> ?", replica.AssetID, AssetDeleted).Find(&replicas).Error; err != nil {
-			return err
-		}
-		status := AssetFailed
-		code, message := replica.ErrorCode, replica.ErrorMessage
-		moderation := ""
-		for _, item := range replicas {
-			if item.Status == AssetActive && item.State == AssetReady && item.UpstreamID != "" {
-				status = AssetActive
-				moderation = item.ModerationStrategy
-				break
-			}
-			if item.Status == AssetProcessing {
-				status = AssetProcessing
-			}
-		}
-		if status != AssetFailed {
-			code = ""
-			message = ""
-		}
-		return tx.Model(&Asset{}).Where("id = ?", replica.AssetID).Updates(map[string]any{"status": status, "error_code": code, "error_message": message, "moderation_strategy": moderation, "updated_at": time.Now().Unix()}).Error
+		return refreshAssetStatus(tx, replica.AssetID, replica.ErrorCode, replica.ErrorMessage)
 	})
+}
+
+func refreshAssetStatus(tx *gorm.DB, assetID int64, code, message string) error {
+	var replicas []AssetReplica
+	if err := tx.Where("asset_id = ? AND state <> ?", assetID, AssetDeleted).Find(&replicas).Error; err != nil {
+		return err
+	}
+	status := AssetFailed
+	moderation := ""
+	for _, item := range replicas {
+		if item.Status == AssetActive && item.State == AssetReady && item.UpstreamID != "" {
+			status = AssetActive
+			moderation = item.ModerationStrategy
+			break
+		}
+		if item.Status == AssetProcessing {
+			status = AssetProcessing
+		}
+	}
+	if status != AssetFailed {
+		code, message = "", ""
+	}
+	return tx.Model(&Asset{}).Where("id = ?", assetID).Updates(map[string]any{"status": status, "error_code": code, "error_message": message, "moderation_strategy": moderation, "updated_at": time.Now().Unix()}).Error
 }
 
 func ClaimAssetGroupReplica(ctx context.Context, groupID int64, channelID int, now int64) (*AssetGroupReplica, bool, error) {
@@ -232,7 +332,10 @@ func ClaimAssetGroupReplica(ctx context.Context, groupID int64, channelID int, n
 		return &replica, false, nil
 	}
 	token := common.GetUUID()
-	result := protectedAssetDB(ctx).Model(&AssetGroupReplica{}).Where("id = ? AND lease_expires_at <= ? AND state <> ?", replica.ID, now, AssetReady).Updates(map[string]any{"lease_token": token, "lease_expires_at": now + 90})
+	result := protectedAssetDB(ctx).Model(&AssetGroupReplica{}).
+		Where("id = ? AND state = ? AND upstream_id = ? AND create_started_at = ? AND lease_token = ? AND lease_expires_at = ? AND lease_expires_at <= ?",
+			replica.ID, replica.State, replica.UpstreamID, replica.CreateStartedAt, replica.LeaseToken, replica.LeaseExpiresAt, now).
+		Updates(map[string]any{"lease_token": token, "lease_expires_at": now + 90})
 	if result.Error != nil {
 		return nil, false, result.Error
 	}

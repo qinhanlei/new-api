@@ -97,6 +97,19 @@ export async function getAssetReplicas(
   return requireServerSuccess(data).data
 }
 
+export async function retryAssetReplica(
+  id: string,
+  channelId: number,
+  scope: AssetScope
+) {
+  const { data } = await api.post<AssetResponse<null>>(
+    `/api/assets/${encodeURIComponent(id)}/replicas/${channelId}/retry`,
+    undefined,
+    { ...authRequestOptions, params: { user_id: scope.userId } }
+  )
+  requireServerSuccess(data)
+}
+
 export async function getAssetStorage(signal?: AbortSignal) {
   const { data } = await api.get<AssetResponse<AssetStorageConfig>>(
     '/api/option/asset_storage',

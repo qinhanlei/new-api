@@ -23,6 +23,7 @@ func registerAssetManagementRoutes(api *gin.RouterGroup) {
 	assets.POST("/actions", assetMutationRateLimit(), controller.ManageAssetAction)
 	assets.POST("/upload", middleware.UserCriticalRateLimit("assets"), controller.UploadAsset)
 	assets.GET("/:id/replicas", controller.GetAssetReplicas)
+	assets.POST("/:id/replicas/:channel_id/retry", middleware.UserCriticalRateLimit("assets"), controller.RetryAssetReplica)
 }
 
 func assetMutationRateLimit() gin.HandlerFunc {

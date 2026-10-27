@@ -98,6 +98,7 @@ type AssetReplicaView struct {
 	ErrorCode     string `json:"error_code"`
 	ErrorMessage  string `json:"error_message"`
 	LastAttemptAt int64  `json:"last_attempt_at"`
+	CanRetry      bool   `json:"can_retry"`
 }
 
 type ResolvedAssetReference struct {

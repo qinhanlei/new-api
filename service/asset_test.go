@@ -335,6 +335,332 @@ func TestAssetFailedReplicaAndConfigurationContracts(t *testing.T) {
 	assert.Empty(t, removedConfig.SecretKey)
 }
 
+func TestAssetChannelSaveValidatesUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"HTML endpoint", http.StatusMethodNotAllowed, "<html>Method not allowed</html>"},
+		{"missing project", http.StatusBadRequest, `{"error":"Project does not exist"}`},
+		{"missing list", http.StatusOK, `{"Result":{}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assetTestDatabase(t)
+			before, err := model.LoadAssetChannelConfig(t.Context(), 1)
+			require.NoError(t, err)
+			calls := 0
+			httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+				calls++
+				assert.Equal(t, "ListAssetGroups", request.URL.Query().Get("Action"))
+				return &http.Response{StatusCode: tc.status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(tc.body)), Request: request}, nil
+			})
+			_, err = UpdateAssetChannelConfig(t.Context(), 1, dto.AssetChannelUpdate{AssetChannelFields: before.AssetChannelFields})
+			var failure *AssetError
+			require.ErrorAs(t, err, &failure)
+			if tc.status >= 400 {
+				assert.Equal(t, tc.status, failure.HTTPStatus)
+			}
+			if tc.name == "missing project" {
+				assert.Equal(t, "Project does not exist", failure.Message)
+			}
+			stored, err := model.LoadAssetChannelConfig(t.Context(), 1)
+			require.NoError(t, err)
+			assert.Equal(t, before, stored)
+			assert.Equal(t, 1, calls)
+			input := dto.AssetChannelUpdate{AssetChannelFields: before.AssetChannelFields}
+			input.Enabled = false
+			_, err = UpdateAssetChannelConfig(t.Context(), 1, input)
+			require.NoError(t, err)
+			assert.Equal(t, 1, calls, "disabling must not depend on upstream availability")
+		})
+	}
+}
+
+func TestAssetChannelRepairsFailedEndpointPath(t *testing.T) {
+	assetTestDatabase(t)
+	ctx := t.Context()
+	group := assetTestGroup(t, 1, "group")
+	asset := assetTestAsset(t, group)
+	require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Updates(map[string]any{"status": model.AssetFailed, "attempts": 5}).Error)
+	require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Add(-6 * time.Minute).Unix()}).Error)
+	before, err := model.LoadAssetChannelConfig(ctx, 1)
+	require.NoError(t, err)
+	httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+		assert.Equal(t, "/ark", request.URL.Path)
+		assert.Equal(t, "ListAssetGroups", request.URL.Query().Get("Action"))
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"Result":{"Items":[]}}`)), Request: request}, nil
+	})
+	input := dto.AssetChannelUpdate{AssetChannelFields: before.AssetChannelFields}
+	input.Endpoint += "/ark"
+	_, err = UpdateAssetChannelConfig(ctx, 1, input)
+	require.NoError(t, err)
+	groups, err := model.AssetChannelGroupReplicas(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, groups, 1)
+	assert.Equal(t, model.AssetUnknown, groups[0].State, "saving must not discard uncertain upstream creation")
+	replicas, err := model.AssetReplicas(ctx, []int64{asset.ID})
+	require.NoError(t, err)
+	require.Len(t, replicas, 1)
+	assert.Equal(t, model.AssetFailed, replicas[0].Status)
+}
+
+func TestAssetEndpointRepairPreservesResourceBoundaries(t *testing.T) {
+	for _, change := range []string{"host", "project", "known group", "known material", "group lease", "processing material", "deleted group"} {
+		t.Run(change, func(t *testing.T) {
+			assetTestDatabase(t)
+			ctx := t.Context()
+			group := assetTestGroup(t, 1, "protected")
+			asset := assetTestAsset(t, group)
+			require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Update("status", model.AssetFailed).Error)
+			before, err := model.LoadAssetChannelConfig(ctx, 1)
+			require.NoError(t, err)
+			input := dto.AssetChannelUpdate{AssetChannelFields: before.AssetChannelFields}
+			input.Endpoint += "/ark"
+			switch change {
+			case "host":
+				input.Endpoint = "https://different.example/ark"
+			case "project":
+				input.ProjectName = "different-project"
+			case "known group":
+				require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Update("upstream_id", "existing-group").Error)
+			case "known material":
+				require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Update("upstream_id", "existing-material").Error)
+			case "group lease":
+				_, claimed, err := model.ClaimAssetGroupReplica(ctx, group.ID, 1, time.Now().Unix())
+				require.NoError(t, err)
+				require.True(t, claimed)
+			case "processing material":
+				require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Update("status", model.AssetProcessing).Error)
+			case "deleted group":
+				require.NoError(t, model.DeleteAssetGroup(ctx, 1, group.PublicID, "default"))
+			}
+			httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"Result":{"Items":[]}}`)), Request: request}, nil
+			})
+			_, err = UpdateAssetChannelConfig(ctx, 1, input)
+			assert.ErrorIs(t, err, model.ErrAssetInUse)
+			stored, err := model.LoadAssetChannelConfig(ctx, 1)
+			require.NoError(t, err)
+			assert.Equal(t, before, stored)
+		})
+	}
+}
+
+func assetRetryFixture(t *testing.T) (model.AssetGroup, model.Asset) {
+	t.Helper()
+	assetTestDatabase(t)
+	previousRegistry := jsplugin.DefaultRegistry
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	t.Cleanup(func() { _ = jsplugin.DefaultRegistry.Unregister("doubao"); jsplugin.DefaultRegistry = previousRegistry })
+	source, err := os.ReadFile("../plugins/tasks/doubao/plugin.js")
+	require.NoError(t, err)
+	_, err = jsplugin.DefaultRegistry.Register(string(source), jsplugin.Options{})
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Create(&model.User{Id: 1, Username: "asset-owner", Group: "default", Status: common.UserStatusEnabled}).Error)
+	require.NoError(t, model.DB.Create(&model.Token{Id: 1, UserId: 1, Key: "asset-token", Status: common.TokenStatusEnabled, ExpiredTime: -1}).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{ChannelId: 1, Model: "doubao-seedance-2-0-260128", Group: "default", Enabled: true}).Error)
+	group := assetTestGroup(t, 1, "retry")
+	asset := assetTestAsset(t, group)
+	require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Updates(map[string]any{"status": model.AssetFailed, "token_id": 1, "attempts": 5, "error_code": "UpstreamInvalidResponse", "error_message": "The upstream material response was not valid JSON"}).Error)
+	return group, asset
+}
+
+func TestAssetReplicaRetryPreservesExistingReferences(t *testing.T) {
+	for _, found := range []bool{false, true} {
+		t.Run(fmt.Sprintf("found=%t", found), func(t *testing.T) {
+			group, asset := assetRetryFixture(t)
+			ctx := t.Context()
+			require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Add(-6 * time.Minute).Unix(), "error_code": "UpstreamInvalidResponse"}).Error)
+			if found {
+				require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Add(-6 * time.Minute).Unix()}).Error)
+			}
+			require.NoError(t, model.EnsureAssetReplicas(ctx, []model.Asset{asset}, 2, 1))
+			require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ? AND channel_id = ?", asset.ID, 2).Updates(map[string]any{"state": model.AssetReady, "status": model.AssetActive, "upstream_id": "other-channel-material"}).Error)
+			other, err := model.GetAssetReplica(ctx, asset.ID, 2)
+			require.NoError(t, err)
+			var actions []string
+			httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+				action := request.URL.Query().Get("Action")
+				actions = append(actions, action)
+				var payload map[string]any
+				require.NoError(t, common.DecodeJson(request.Body, &payload))
+				assert.Equal(t, "actual-project", payload["ProjectName"])
+				body := `{"Result":{"Items":[]}}`
+				switch action {
+				case "ListAssetGroups":
+					if found {
+						body = fmt.Sprintf(`{"Result":{"Items":[{"Id":"remote-group","Name":%q,"GroupType":"AIGC"}]}}`, group.PublicID)
+					}
+				case "ListAssets":
+					body = fmt.Sprintf(`{"Result":{"Items":[{"Id":"unnamed-material","Name":"","GroupId":"remote-group","AssetType":"Image"},{"Id":"remote-material","Name":%q,"GroupId":"remote-group","AssetType":"Image"}]}}`, asset.PublicID)
+				default:
+					t.Errorf("recovery must only query existing resources, got %s", action)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+			})
+			require.NoError(t, RetryAssetReplica(ctx, 1, asset.PublicID, 1))
+			assert.ErrorIs(t, RetryAssetReplica(ctx, 1, asset.PublicID, 1), model.ErrAssetConflict)
+			replica, err := model.GetAssetReplica(ctx, asset.ID, 1)
+			require.NoError(t, err)
+			assert.Equal(t, model.AssetProcessing, replica.Status)
+			assert.Equal(t, 1, replica.TokenID)
+			assert.Zero(t, replica.Attempts)
+			assert.Empty(t, replica.ErrorCode)
+			assert.Empty(t, replica.ErrorMessage)
+			assert.Positive(t, replica.NextAttemptAt)
+			groupReplica, err := model.GetAssetGroupReplica(ctx, group.ID, 1)
+			require.NoError(t, err)
+			if found {
+				assert.Equal(t, "remote-material", replica.UpstreamID)
+				assert.Equal(t, "remote-group", groupReplica.UpstreamID)
+				assert.Equal(t, model.AssetReady, replica.State)
+				assert.Equal(t, []string{"ListAssetGroups", "ListAssets"}, actions)
+			} else {
+				assert.Empty(t, replica.UpstreamID)
+				assert.Empty(t, groupReplica.UpstreamID)
+				assert.Equal(t, model.AssetPending, groupReplica.State)
+				assert.Equal(t, []string{"ListAssetGroups"}, actions)
+			}
+			stored, err := model.GetAsset(ctx, 1, asset.PublicID, "default")
+			require.NoError(t, err)
+			assert.Equal(t, asset.ObjectKey, stored.ObjectKey)
+			assert.Equal(t, model.AssetReady, stored.ObjectState)
+			assert.Equal(t, model.AssetActive, stored.Status)
+			preserved, err := model.GetAssetReplica(ctx, asset.ID, 2)
+			require.NoError(t, err)
+			assert.Equal(t, other, preserved)
+		})
+	}
+}
+
+func TestAssetReplicaRetryRejectsUncertainLists(t *testing.T) {
+	for _, assetList := range []bool{false, true} {
+		for _, tc := range []struct {
+			name string
+			body string
+		}{
+			{"missing items", `{"Result":{}}`},
+			{"null items", `{"Result":{"Items":null}}`},
+			{"missing name", `{"Result":{"Items":[{"Id":"one","GroupType":"AIGC","GroupId":"remote-group","AssetType":"Image"}]}}`},
+			{"empty identifier", `{"Result":{"Items":[{"Id":"","Name":%q,"GroupType":"AIGC","GroupId":"remote-group","AssetType":"Image"}]}}`},
+			{"duplicate match", `{"Result":{"Items":[{"Id":"one","Name":%[1]q,"GroupType":"AIGC","GroupId":"remote-group","AssetType":"Image"},{"Id":"two","Name":%[1]q,"GroupType":"AIGC","GroupId":"remote-group","AssetType":"Image"}]}}`},
+			{"incomplete pages", `{"Result":{"Items":[],"NextToken":"unending"}}`},
+		} {
+			t.Run(fmt.Sprintf("asset=%t/%s", assetList, tc.name), func(t *testing.T) {
+				group, asset := assetRetryFixture(t)
+				require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Add(-6 * time.Minute).Unix()}).Error)
+				action, name := "ListAssetGroups", group.PublicID
+				if assetList {
+					action, name = "ListAssets", asset.PublicID
+					require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Updates(map[string]any{"state": model.AssetReady, "upstream_id": "remote-group"}).Error)
+					require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Add(-6 * time.Minute).Unix()}).Error)
+				}
+				before, err := model.GetAssetReplica(t.Context(), asset.ID, 1)
+				require.NoError(t, err)
+				beforeGroup, err := model.GetAssetGroupReplica(t.Context(), group.ID, 1)
+				require.NoError(t, err)
+				httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+					assert.Equal(t, action, request.URL.Query().Get("Action"))
+					body := tc.body
+					if strings.Contains(body, "%") {
+						body = fmt.Sprintf(body, name)
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+				})
+				require.Error(t, RetryAssetReplica(t.Context(), 1, asset.PublicID, 1))
+				after, err := model.GetAssetReplica(t.Context(), asset.ID, 1)
+				require.NoError(t, err)
+				assert.Equal(t, before, after)
+				afterGroup, err := model.GetAssetGroupReplica(t.Context(), group.ID, 1)
+				require.NoError(t, err)
+				assert.Equal(t, beforeGroup, afterGroup)
+			})
+		}
+	}
+}
+
+func TestAssetReplicaRetryRejectsStateChanges(t *testing.T) {
+	for _, change := range []string{"group lease", "configuration", "deletion", "disabled owner"} {
+		t.Run(change, func(t *testing.T) {
+			group, asset := assetRetryFixture(t)
+			require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Add(-6 * time.Minute).Unix()}).Error)
+			httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+				switch change {
+				case "group lease":
+					_, claimed, err := model.ClaimAssetGroupReplica(t.Context(), group.ID, 1, time.Now().Unix())
+					require.NoError(t, err)
+					require.True(t, claimed)
+				case "configuration":
+					config, err := model.LoadAssetChannelConfig(t.Context(), 1)
+					require.NoError(t, err)
+					require.NoError(t, model.SaveAssetChannelConfig(t.Context(), 1, config))
+				case "deletion":
+					require.NoError(t, model.DeleteAsset(t.Context(), 1, asset.PublicID, "default"))
+				case "disabled owner":
+					require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 1).Update("status", common.UserStatusDisabled).Error)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"Result":{"Items":[]}}`)), Request: request}, nil
+			})
+			assert.ErrorIs(t, RetryAssetReplica(t.Context(), 1, asset.PublicID, 1), model.ErrAssetConflict)
+			replica, err := model.GetAssetReplica(t.Context(), asset.ID, 1)
+			require.NoError(t, err)
+			assert.Equal(t, model.AssetFailed, replica.Status)
+			assert.Equal(t, 5, replica.Attempts)
+		})
+	}
+}
+
+func TestAssetReplicaRetryFencesStaleGroupClaims(t *testing.T) {
+	group, asset := assetRetryFixture(t)
+	ctx := t.Context()
+	require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Add(-6 * time.Minute).Unix()}).Error)
+	httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"Result":{"Items":[]}}`)), Request: request}, nil
+	})
+	// Complete recovery after a worker reads the old group but before it tries
+	// to claim that group, without timing-dependent goroutines or sleeps.
+	recovered := false
+	const callback = "test:retry-before-group-claim"
+	require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+		row, ok := tx.Statement.Dest.(*model.AssetGroupReplica)
+		if recovered || !ok || row.GroupID != group.ID {
+			return
+		}
+		recovered = true
+		require.NoError(t, RetryAssetReplica(ctx, 1, asset.PublicID, 1))
+	}))
+	t.Cleanup(func() { require.NoError(t, model.DB.Callback().Query().Remove(callback)) })
+	_, claimed, err := model.ClaimAssetGroupReplica(ctx, group.ID, 1, time.Now().Unix())
+	require.NoError(t, err)
+	require.True(t, recovered)
+	assert.False(t, claimed, "a worker must not claim the recovered group using its old unknown state")
+	current, err := model.GetAssetGroupReplica(ctx, group.ID, 1)
+	require.NoError(t, err)
+	assert.Equal(t, model.AssetPending, current.State)
+	assert.Empty(t, current.LeaseToken)
+}
+
+func TestAssetReplicaRetryPreservesTokenAndConsistencyLimits(t *testing.T) {
+	group, asset := assetRetryFixture(t)
+	ctx := t.Context()
+	_, err := model.GetAssetReplica(ctx, asset.ID, 1)
+	require.NoError(t, err)
+	httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+		t.Errorf("blocked recovery must not access upstream")
+		return nil, fmt.Errorf("unexpected upstream request")
+	})
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", 1).Update("status", common.TokenStatusDisabled).Error)
+	var failure *AssetError
+	require.ErrorAs(t, RetryAssetReplica(ctx, 1, asset.PublicID, 1), &failure)
+	assert.Equal(t, http.StatusForbidden, failure.HTTPStatus)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", 1).Update("status", common.TokenStatusEnabled).Error)
+	require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Unix()}).Error)
+	require.ErrorAs(t, RetryAssetReplica(ctx, 1, asset.PublicID, 1), &failure)
+	assert.Equal(t, "UpstreamResultUnknown", failure.Code)
+	assert.Equal(t, http.StatusConflict, failure.HTTPStatus)
+}
+
 func TestAssetOptionCollationAliasesCannotOverwriteSecrets(t *testing.T) {
 	assetTestDatabase(t)
 	aliases := map[string]string{

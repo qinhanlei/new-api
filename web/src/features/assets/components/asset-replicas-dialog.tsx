@@ -16,16 +16,26 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 
 import { StaticDataTable } from '@/components/data-table'
 import { Dialog } from '@/components/dialog'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
+import { Button } from '@/components/ui/button'
+import {
+  ADMIN_PERMISSION_ACTIONS,
+  ADMIN_PERMISSION_RESOURCES,
+  hasPermission,
+} from '@/lib/admin-permissions'
+import { handleServerError } from '@/lib/handle-server-error'
+import { ROLE } from '@/lib/roles'
 import { getServerErrorMessage } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
 
-import { assetQueryKeys, getAssetReplicas } from '../api'
+import { assetQueryKeys, getAssetReplicas, retryAssetReplica } from '../api'
 import type { Asset, AssetScope } from '../types'
 import { AssetStatus } from './asset-status'
 
@@ -39,11 +49,30 @@ export function AssetReplicasDialog({
   onClose: () => void
 }) {
   const { t } = useTranslation()
+  const client = useQueryClient()
+  const currentUser = useAuthStore((state) => state.auth.user)
+  const canWriteChannel =
+    currentUser &&
+    currentUser.role >= ROLE.ADMIN &&
+    hasPermission(
+      currentUser,
+      ADMIN_PERMISSION_RESOURCES.CHANNEL,
+      ADMIN_PERMISSION_ACTIONS.WRITE
+    )
   const query = useQuery({
     queryKey: [...assetQueryKeys.all, 'replicas', asset.Id, scope.userId],
     queryFn: ({ signal }) => getAssetReplicas(asset.Id, scope, signal),
     refetchInterval: 10_000,
     meta: { errorToast: false },
+  })
+  const retry = useMutation({
+    mutationFn: (channelId: number) =>
+      retryAssetReplica(asset.Id, channelId, scope),
+    onSuccess: async () => {
+      await client.invalidateQueries({ queryKey: assetQueryKeys.all })
+      toast.success(t('Asset synchronization queued'))
+    },
+    onError: (error) => handleServerError(error),
   })
   return (
     <Dialog
@@ -63,6 +92,7 @@ export function AssetReplicasDialog({
       {query.data && (
         <StaticDataTable
           data={query.data}
+          tableClassName='table-fixed'
           getRowKey={(replica) => replica.channel_id}
           emptyContent={t(
             'Replicas are created when an asset is first used on a channel.'
@@ -71,19 +101,49 @@ export function AssetReplicasDialog({
             {
               id: 'channel',
               header: t('Channel'),
+              className: 'w-1/4',
+              cellClassName: 'align-top',
               cell: (replica) =>
                 replica.channel_name || String(replica.channel_id),
             },
             {
               id: 'status',
               header: t('Status'),
-              cell: (replica) => <AssetStatus status={replica.status} />,
+              className: 'w-28',
+              cellClassName: 'align-top',
+              cell: (replica) => {
+                const pending =
+                  retry.isPending && retry.variables === replica.channel_id
+                return (
+                  <div className='flex flex-col items-start gap-1'>
+                    <AssetStatus status={replica.status} />
+                    {canWriteChannel && replica.can_retry && (
+                      <Button
+                        variant='outline'
+                        size='sm'
+                        className='h-auto min-h-7 max-w-full whitespace-normal'
+                        disabled={retry.isPending}
+                        aria-label={t('Resync {{name}}', {
+                          name:
+                            replica.channel_name || String(replica.channel_id),
+                        })}
+                        onClick={() => retry.mutate(replica.channel_id)}
+                      >
+                        <span className='min-w-0 break-words'>
+                          {pending ? t('Syncing...') : t('Resync')}
+                        </span>
+                      </Button>
+                    )}
+                  </div>
+                )
+              },
             },
             {
               id: 'error',
               header: t('Error'),
+              cellClassName: 'align-top whitespace-normal',
               cell: (replica) => (
-                <span className='block max-w-sm break-words whitespace-normal'>
+                <span className='block break-words whitespace-normal'>
                   {[replica.error_code, t(replica.error_message)]
                     .filter(Boolean)
                     .join(': ') || '—'}

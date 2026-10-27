@@ -32,6 +32,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -122,6 +123,18 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
 
 func TestAssetChannelConfigurationAuthorizationWithoutSecurityProof(t *testing.T) {
 	user, identity := setupSecurityEnrollmentTest(t)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "ListAssetGroups", r.URL.Query().Get("Action"))
+		_, _ = io.WriteString(w, `{"Result":{"Items":[]}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	if service.GetHttpClient() == nil {
+		service.InitHttpClient()
+	}
+	client := service.GetHttpClient()
+	previousTransport := client.Transport
+	client.Transport = upstream.Client().Transport
+	t.Cleanup(func() { client.Transport = previousTransport })
 	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
 	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.CasbinRule{}, &model.AuthzRole{}))
 	wasMaster := common.IsMasterNode
@@ -153,7 +166,7 @@ func TestAssetChannelConfigurationAuthorizationWithoutSecurityProof(t *testing.T
 	engine.PUT("/api/channel/:id/assets", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelSensitiveWrite), UpdateChannelAssets)
 	secret := "asset-channel-test-secret"
 	input := dto.AssetChannelUpdate{
-		AssetChannelFields: dto.AssetChannelFields{Enabled: true, Endpoint: "https://assets.example.com", AuthType: "aksk", AccessKey: "asset-access-key"},
+		AssetChannelFields: dto.AssetChannelFields{Enabled: true, Endpoint: upstream.URL, AuthType: "aksk", AccessKey: "asset-access-key"},
 		SecretKey:          &secret,
 	}
 	for _, tc := range []struct {
@@ -381,6 +394,103 @@ func TestAssetManagementRejectsCrossUserAndReadOnlyTokens(t *testing.T) {
 			assert.True(t, response.Code == http.StatusForbidden || response.Code == http.StatusBadRequest, response.Body.String())
 			assert.Contains(t, response.Body.String(), `"success":false`)
 		})
+	}
+}
+
+func TestAssetReplicaRetryAuthorization(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Token{}, &model.CasbinRule{}, &model.AuthzRole{}))
+	require.NoError(t, authz.Init(model.DB))
+	previousRegistry := jsplugin.DefaultRegistry
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	t.Cleanup(func() { _ = jsplugin.DefaultRegistry.Unregister("doubao"); jsplugin.DefaultRegistry = previousRegistry })
+	source, err := os.ReadFile("../plugins/tasks/doubao/plugin.js")
+	require.NoError(t, err)
+	_, err = jsplugin.DefaultRegistry.Register(string(source), jsplugin.Options{})
+	require.NoError(t, err)
+	channel := model.Channel{Type: constant.ChannelTypeVolcEngine, Key: "asset-retry-channel-key", Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{ChannelId: channel.Id, Model: "doubao-seedance-2-0-260128", Group: "default", Enabled: true}).Error)
+	require.NoError(t, model.SaveAssetStorageConfig(t.Context(), system_setting.AssetStorageConfig{AssetStorageFields: dto.AssetStorageFields{Enabled: true, Endpoint: "https://storage.example", Bucket: "assets", Region: "test"}}))
+	require.NoError(t, model.SaveAssetChannelConfig(t.Context(), channel.Id, system_setting.AssetChannelConfig{
+		AssetChannelFields: dto.AssetChannelFields{Enabled: true, Endpoint: "https://upstream.example", ProjectName: "default", AuthType: "bearer"},
+		ChannelScope:       model.AssetChannelScope(&channel),
+	}))
+	group := model.AssetGroup{PublicID: model.NewAssetGroupID(), UserID: user.Id, ProjectName: "default", GroupType: "AIGC"}
+	require.NoError(t, model.DB.Create(&group).Error)
+	asset := model.Asset{PublicID: model.NewAssetID(), UserID: user.Id, ProjectName: "default", GroupID: group.ID, GroupPublicID: group.PublicID, AssetType: "Image", ObjectKey: "assets/test", ObjectState: model.AssetReady, Status: model.AssetFailed}
+	require.NoError(t, model.DB.Create(&asset).Error)
+	groupReplica := model.AssetGroupReplica{GroupID: group.ID, ChannelID: channel.Id, State: model.AssetReady, UpstreamID: "remote-group"}
+	require.NoError(t, model.DB.Create(&groupReplica).Error)
+	replica := model.AssetReplica{AssetID: asset.ID, ChannelID: channel.Id, State: model.AssetReady, UpstreamID: "remote-asset", Status: model.AssetFailed, ErrorCode: "UpstreamUnavailable", ErrorMessage: "Temporary upstream failure"}
+	require.NoError(t, model.DB.Create(&replica).Error)
+	session, _, err := service.IssueAccessToken(identity)
+	require.NoError(t, err)
+	writeToken, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "asset:write", "channel:write")
+	readToken, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "asset:read", "channel:read")
+	assetOnly, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "asset:write")
+	channelOnly, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "channel:write")
+	engine := gin.New()
+	engine.POST("/api/assets/:id/replicas/:channel_id/retry", middleware.UserAuth(), RetryAssetReplica)
+	path := fmt.Sprintf("/api/assets/%s/replicas/%d/retry", asset.PublicID, channel.Id)
+	for _, tc := range []struct {
+		name       string
+		role       int
+		token      string
+		query      string
+		permission bool
+		status     int
+	}{
+		{name: "anonymous", role: common.RoleRootUser, status: http.StatusUnauthorized},
+		{name: "ordinary user", role: common.RoleCommonUser, token: session, permission: true, status: http.StatusForbidden},
+		{name: "admin without channel permission", role: common.RoleAdminUser, token: session, status: http.StatusForbidden},
+		{name: "PAT cannot widen account permissions", role: common.RoleAdminUser, token: writeToken, status: http.StatusForbidden},
+		{name: "read-only PAT", role: common.RoleRootUser, token: readToken, status: http.StatusForbidden},
+		{name: "missing channel scope", role: common.RoleRootUser, token: assetOnly, status: http.StatusForbidden},
+		{name: "missing asset scope", role: common.RoleRootUser, token: channelOnly, status: http.StatusForbidden},
+		{name: "missing owner scope", role: common.RoleRootUser, token: writeToken, query: "?user_id=99", status: http.StatusForbidden},
+		{name: "all users cannot write", role: common.RoleRootUser, token: session, query: "?all_users=true", status: http.StatusBadRequest},
+		{name: "authorized admin session", role: common.RoleAdminUser, token: session, permission: true, status: http.StatusOK},
+		{name: "authorized admin PAT", role: common.RoleAdminUser, token: writeToken, permission: true, status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(user).Update("role", tc.role).Error)
+			require.NoError(t, model.PublishUserAuthCache(user.Id))
+			require.NoError(t, authz.SetUserPermissions(user.Id, authz.PermissionsMap{authz.ResourceChannel: {authz.ActionWrite: tc.permission}}))
+			require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("id = ?", replica.ID).Update("status", model.AssetFailed).Error)
+			var before model.AssetReplica
+			require.NoError(t, model.DB.First(&before, replica.ID).Error)
+			request := httptest.NewRequest(http.MethodPost, path+tc.query, nil)
+			if tc.token != "" {
+				request.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			require.Equal(t, tc.status, response.Code, response.Body.String())
+			var stored model.AssetReplica
+			require.NoError(t, model.DB.First(&stored, replica.ID).Error)
+			if tc.status != http.StatusOK {
+				assert.Equal(t, before, stored)
+				return
+			}
+			assert.Contains(t, response.Body.String(), `"success":true`)
+			assert.Equal(t, model.AssetProcessing, stored.Status)
+			assert.Equal(t, replica.UpstreamID, stored.UpstreamID)
+			assert.Empty(t, stored.ErrorCode)
+			assert.Empty(t, stored.ErrorMessage)
+			response = httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			assert.Equal(t, http.StatusConflict, response.Code, "an already queued replica must not be retried twice")
+		})
+	}
+	var logs []model.AuditLog
+	require.NoError(t, model.LOG_DB.Where("action = ?", "asset.replica.retry").Find(&logs).Error)
+	require.Len(t, logs, 2)
+	encoded, err := common.Marshal(logs)
+	require.NoError(t, err)
+	for _, secret := range []string{channel.Key, session, writeToken, assetOnly, channelOnly} {
+		assert.NotContains(t, string(encoded), secret)
 	}
 }
 

@@ -56,6 +56,7 @@ export interface AssetReplica {
   error_code: string
   error_message: string
   last_attempt_at: number
+  can_retry: boolean
 }
 
 export interface AssetStorageConfig {

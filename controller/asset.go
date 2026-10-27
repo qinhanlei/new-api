@@ -293,3 +293,26 @@ func GetAssetReplicas(c *gin.Context) {
 	}
 	common.ApiSuccess(c, items)
 }
+
+func RetryAssetReplica(c *gin.Context) {
+	if c.GetInt("role") < common.RoleAdminUser || !authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelWrite) ||
+		(c.GetBool("use_access_token") && c.GetInt("access_token_id") > 0 && !service.AccessTokenScopeGranted(c.GetStringSlice("access_token_scopes"), service.AccessTokenScopeOf(authz.ChannelWrite))) {
+		common.ApiErrorStatus(c, http.StatusForbidden, common.NewMessage("You do not have permission to perform this action."))
+		return
+	}
+	actor, ok := assetManagementActor(c, "RetryAsset")
+	if !ok {
+		return
+	}
+	channelID, err := strconv.Atoi(c.Param("channel_id"))
+	if err != nil || channelID <= 0 {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+		return
+	}
+	if err = service.RetryAssetReplica(c.Request.Context(), actor.UserID, c.Param("id"), channelID); err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
+	recordManageAuditFor(c, actor.UserID, "asset.replica.retry", map[string]any{"asset_id": c.Param("id"), "channel_id": channelID})
+	common.ApiSuccess(c, nil)
+}

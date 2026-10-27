@@ -26,6 +26,7 @@ import {
 } from '@tanstack/react-router'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { toast } from 'sonner'
 import { beforeEach, afterEach, expect, test, vi } from 'vitest'
 
 import { api } from '@/lib/api'
@@ -35,8 +36,9 @@ import { useAuthStore } from '@/stores/auth-store'
 import { AssetBrowser } from '../components/asset-browser'
 import { AssetCreateDialog } from '../components/asset-create-dialog'
 import { AssetGroupDialog } from '../components/asset-group-dialog'
+import { AssetReplicasDialog } from '../components/asset-replicas-dialog'
 import { Assets } from '../index'
-import type { AssetGroup } from '../types'
+import type { Asset, AssetGroup } from '../types'
 
 const group: AssetGroup = {
   Id: 'group-one',
@@ -45,6 +47,25 @@ const group: AssetGroup = {
   ProjectName: 'default',
   GroupType: 'AIGC',
   UserId: 23,
+}
+const replicaAsset: Asset = {
+  Id: 'asset-na-avatar',
+  Name: 'Avatar',
+  GroupId: group.Id,
+  ProjectName: 'default',
+  AssetType: 'Image',
+  Status: 'Active',
+  URL: 'asset://asset-na-avatar',
+  UserId: 23,
+}
+const failedReplica = {
+  channel_id: 7,
+  channel_name: 'Video channel',
+  status: 'Failed',
+  error_code: 'UpstreamInvalidResponse',
+  error_message: 'The upstream material response was not valid JSON',
+  last_attempt_at: 0,
+  can_retry: true,
 }
 let client: QueryClient
 
@@ -80,6 +101,166 @@ afterEach(() => {
   client.clear()
   useAuthStore.getState().auth.reset()
 })
+
+test('replica resync preserves the asset and owner, prevents duplicate requests, and refreshes its status', async () => {
+  const user = userEvent.setup()
+  useAuthStore.getState().auth.setUser({
+    id: 1,
+    username: 'admin',
+    role: ROLE.ADMIN,
+    permissions: {
+      admin_permissions: { channel: { read: true, write: true } },
+    },
+  })
+  let queued = false
+  const get = vi.spyOn(api, 'get').mockImplementation(async () => ({
+    data: {
+      success: true,
+      data: [
+        queued
+          ? {
+              ...failedReplica,
+              status: 'Processing',
+              error_code: '',
+              error_message: '',
+              can_retry: false,
+            }
+          : failedReplica,
+        {
+          ...failedReplica,
+          channel_id: 6,
+          channel_name: 'Ready channel',
+          status: 'Active',
+          error_code: '',
+          error_message: '',
+          can_retry: false,
+        },
+      ],
+    },
+  }))
+  let complete!: (value: { data: { success: boolean; data: null } }) => void
+  const post = vi.spyOn(api, 'post').mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        complete = resolve
+      })
+  )
+  render(
+    <QueryClientProvider client={client}>
+      <AssetReplicasDialog
+        asset={replicaAsset}
+        scope={{ userId: 23 }}
+        onClose={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  const retry = await screen.findByRole('button', {
+    name: 'Resync Video channel',
+  })
+  expect(screen.getAllByRole('columnheader')).toHaveLength(3)
+  expect(
+    within(screen.getByRole('cell', { name: /^Failed/ })).getByRole('button', {
+      name: 'Resync Video channel',
+    })
+  ).toBe(retry)
+  expect(
+    screen.queryByRole('button', { name: 'Resync Ready channel' })
+  ).not.toBeInTheDocument()
+  await user.click(retry)
+  expect(retry).toBeDisabled()
+  await user.click(retry)
+  expect(post).toHaveBeenCalledOnce()
+  expect(post).toHaveBeenCalledWith(
+    '/api/assets/asset-na-avatar/replicas/7/retry',
+    undefined,
+    expect.objectContaining({ params: { user_id: 23 } })
+  )
+  await act(async () => {
+    queued = true
+    complete({ data: { success: true, data: null } })
+  })
+  expect(await screen.findByText('Processing')).toBeVisible()
+  expect(screen.getByText('Ready')).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: 'Resync Video channel' })
+  ).not.toBeInTheDocument()
+  expect(get).toHaveBeenCalledWith(
+    '/api/assets/asset-na-avatar/replicas',
+    expect.objectContaining({ params: { user_id: 23 } })
+  )
+})
+
+test('rejected replica resync keeps the stored error visible and allows another attempt', async () => {
+  const user = userEvent.setup()
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'root', role: ROLE.SUPER_ADMIN })
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: [failedReplica] },
+  })
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: false, message: 'Upstream project is unavailable' },
+  })
+  const error = vi.spyOn(toast, 'error')
+  render(
+    <QueryClientProvider client={client}>
+      <AssetReplicasDialog
+        asset={replicaAsset}
+        scope={{ userId: 23 }}
+        onClose={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  const retry = await screen.findByRole('button', {
+    name: 'Resync Video channel',
+  })
+  await user.click(retry)
+  await waitFor(() =>
+    expect(error).toHaveBeenCalledWith('Upstream project is unavailable')
+  )
+  expect(retry).toBeEnabled()
+  expect(
+    screen.getByText(
+      'UpstreamInvalidResponse: The upstream material response was not valid JSON'
+    )
+  ).toBeVisible()
+  expect(screen.getByText('Failed')).toBeVisible()
+  await user.click(retry)
+  await waitFor(() => expect(post).toHaveBeenCalledTimes(2))
+})
+
+test.each([
+  { role: ROLE.ADMIN, write: false },
+  { role: ROLE.USER, write: true },
+])(
+  'replica resync is hidden without administrative channel write access (%j)',
+  async ({ role, write }) => {
+    useAuthStore.getState().auth.setUser({
+      id: 1,
+      username: 'viewer',
+      role,
+      permissions: { admin_permissions: { channel: { read: true, write } } },
+    })
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: { success: true, data: [failedReplica] },
+    })
+    const post = vi.spyOn(api, 'post')
+    render(
+      <QueryClientProvider client={client}>
+        <AssetReplicasDialog
+          asset={replicaAsset}
+          scope={{ userId: 23 }}
+          onClose={vi.fn()}
+        />
+      </QueryClientProvider>
+    )
+    expect(await screen.findByText('Failed')).toBeVisible()
+    expect(
+      screen.queryByRole('button', { name: /Resync/ })
+    ).not.toBeInTheDocument()
+    expect(post).not.toHaveBeenCalled()
+  }
+)
 
 test('URL import preserves form input after a rejected response and retries the official action', async () => {
   const user = userEvent.setup()
