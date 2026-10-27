@@ -404,8 +404,12 @@ func findUpstreamAssetGroup(ctx context.Context, channel *model.Channel, config 
 		if err := callAssetUpstream(ctx, channel, config, "ListAssetGroups", payload, &result); err != nil {
 			return "", err
 		}
+		// Some upstreams report PageSize=0 when the first page explicitly has no results.
+		emptyFirstPage := page == 0 && result.PageNumber != nil && *result.PageNumber == 1 &&
+			result.TotalCount != nil && *result.TotalCount == 0 && len(result.Items) == 0
 		if result.Items == nil || len(result.Items) > 100 || result.NextToken != "" ||
-			(result.PageNumber != nil && *result.PageNumber != page+1) || (result.PageSize != nil && *result.PageSize != 100) {
+			(result.PageNumber != nil && *result.PageNumber != page+1) ||
+			(result.PageSize != nil && *result.PageSize != 100 && !(emptyFirstPage && *result.PageSize == 0)) {
 			return "", assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material list was invalid")
 		}
 		if result.TotalCount != nil && (*result.TotalCount < page*100 || len(result.Items) != min(100, *result.TotalCount-page*100)) {
@@ -451,8 +455,12 @@ func findUpstreamAsset(ctx context.Context, channel *model.Channel, config syste
 		if err := callAssetUpstream(ctx, channel, config, "ListAssets", payload, &result); err != nil {
 			return "", err
 		}
+		// Some upstreams report PageSize=0 when the first page explicitly has no results.
+		emptyFirstPage := page == 0 && result.PageNumber != nil && *result.PageNumber == 1 &&
+			result.TotalCount != nil && *result.TotalCount == 0 && len(result.Items) == 0
 		if result.Items == nil || len(result.Items) > 100 || result.NextToken != "" ||
-			(result.PageNumber != nil && *result.PageNumber != page+1) || (result.PageSize != nil && *result.PageSize != 100) {
+			(result.PageNumber != nil && *result.PageNumber != page+1) ||
+			(result.PageSize != nil && *result.PageSize != 100 && !(emptyFirstPage && *result.PageSize == 0)) {
 			return "", assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material list was invalid")
 		}
 		if result.TotalCount != nil && (*result.TotalCount < page*100 || len(result.Items) != min(100, *result.TotalCount-page*100)) {

@@ -597,12 +597,22 @@ func assetRetryFixture(t *testing.T) (model.AssetGroup, model.Asset) {
 }
 
 func TestAssetReplicaRetryPreservesExistingReferences(t *testing.T) {
-	for _, found := range []bool{false, true} {
-		t.Run(fmt.Sprintf("found=%t", found), func(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		groupFound   bool
+		assetFound   bool
+		zeroPageSize bool
+	}{
+		{name: "no existing resources"},
+		{name: "existing resources", groupFound: true, assetFound: true},
+		{name: "empty group page", zeroPageSize: true},
+		{name: "empty asset page", groupFound: true, zeroPageSize: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			group, asset := assetRetryFixture(t)
 			ctx := t.Context()
 			require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Add(-6 * time.Minute).Unix(), "error_code": "UpstreamInvalidResponse"}).Error)
-			if found {
+			if tc.groupFound {
 				require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Updates(map[string]any{"state": model.AssetUnknown, "create_started_at": time.Now().Add(-6 * time.Minute).Unix()}).Error)
 			}
 			require.NoError(t, model.EnsureAssetReplicas(ctx, []model.Asset{asset}, 2, 1))
@@ -617,15 +627,20 @@ func TestAssetReplicaRetryPreservesExistingReferences(t *testing.T) {
 				require.NoError(t, common.DecodeJson(request.Body, &payload))
 				assert.Equal(t, "actual-project", payload["ProjectName"])
 				body := `{"Result":{"Items":[]}}`
+				if tc.zeroPageSize {
+					body = `{"Result":{"Items":[],"TotalCount":0,"PageNumber":1,"PageSize":0}}`
+				}
 				switch action {
 				case "ListAssetGroups":
-					if found {
+					if tc.groupFound {
 						body = fmt.Sprintf(`{"Result":{"Items":[{"Id":"remote-group","Name":%q,"GroupType":"AIGC"}]}}`, group.PublicID)
 					}
 				case "ListAssets":
-					body = fmt.Sprintf(`{"Result":{"Items":[{"Id":"unnamed-material","Name":"","GroupId":"remote-group","AssetType":"Image"},{"Id":"remote-material","Name":%q,"GroupId":"remote-group","AssetType":"Image"}]}}`, asset.PublicID)
+					if tc.assetFound {
+						body = fmt.Sprintf(`{"Result":{"Items":[{"Id":"unnamed-material","Name":"","GroupId":"remote-group","AssetType":"Image"},{"Id":"remote-material","Name":%q,"GroupId":"remote-group","AssetType":"Image"}]}}`, asset.PublicID)
+					}
 				default:
-					t.Errorf("recovery must only query existing resources, got %s", action)
+					require.FailNow(t, "recovery must only query existing resources", "got %s", action)
 				}
 				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
 			})
@@ -641,13 +656,18 @@ func TestAssetReplicaRetryPreservesExistingReferences(t *testing.T) {
 			assert.Positive(t, replica.NextAttemptAt)
 			groupReplica, err := model.GetAssetGroupReplica(ctx, group.ID, 1)
 			require.NoError(t, err)
-			if found {
+			if tc.assetFound {
 				assert.Equal(t, "remote-material", replica.UpstreamID)
-				assert.Equal(t, "remote-group", groupReplica.UpstreamID)
 				assert.Equal(t, model.AssetReady, replica.State)
-				assert.Equal(t, []string{"ListAssetGroups", "ListAssets"}, actions)
 			} else {
 				assert.Empty(t, replica.UpstreamID)
+				assert.Equal(t, model.AssetPending, replica.State)
+			}
+			if tc.groupFound {
+				assert.Equal(t, "remote-group", groupReplica.UpstreamID)
+				assert.Equal(t, model.AssetReady, groupReplica.State)
+				assert.Equal(t, []string{"ListAssetGroups", "ListAssets"}, actions)
+			} else {
 				assert.Empty(t, groupReplica.UpstreamID)
 				assert.Equal(t, model.AssetPending, groupReplica.State)
 				assert.Equal(t, []string{"ListAssetGroups"}, actions)
@@ -678,7 +698,15 @@ func TestAssetReplicaRetryRejectsUncertainLists(t *testing.T) {
 			{"incomplete pages", `{"Result":{"Items":[],"NextToken":"unending"}}`},
 			{"incomplete numbered page", `{"Result":{"Items":[],"TotalCount":101}}`},
 			{"unexpected page", `{"Result":{"Items":[],"TotalCount":0,"PageNumber":2}}`},
-			{"unexpected page size", `{"Result":{"Items":[],"TotalCount":0,"PageSize":10}}`},
+			{"unexpected page size", `{"Result":{"Items":[],"TotalCount":0,"PageNumber":1,"PageSize":10}}`},
+			{"zero size missing items", `{"Result":{"TotalCount":0,"PageNumber":1,"PageSize":0}}`},
+			{"zero size null items", `{"Result":{"Items":null,"TotalCount":0,"PageNumber":1,"PageSize":0}}`},
+			{"zero size missing total", `{"Result":{"Items":[],"PageNumber":1,"PageSize":0}}`},
+			{"zero size positive total", `{"Result":{"Items":[],"TotalCount":1,"PageNumber":1,"PageSize":0}}`},
+			{"zero size nonempty items", `{"Result":{"Items":[{"Id":"one","Name":%q,"GroupType":"AIGC","GroupId":"remote-group","AssetType":"Image"}],"TotalCount":1,"PageNumber":1,"PageSize":0}}`},
+			{"zero size missing page", `{"Result":{"Items":[],"TotalCount":0,"PageSize":0}}`},
+			{"zero size unexpected page", `{"Result":{"Items":[],"TotalCount":0,"PageNumber":2,"PageSize":0}}`},
+			{"zero size next page", `{"Result":{"Items":[],"TotalCount":0,"PageNumber":1,"PageSize":0,"NextToken":"unending"}}`},
 		} {
 			t.Run(fmt.Sprintf("asset=%t/%s", assetList, tc.name), func(t *testing.T) {
 				group, asset := assetRetryFixture(t)
@@ -1003,6 +1031,11 @@ func TestAssetUnknownCreateReconcilesBeforeFailing(t *testing.T) {
 					result = map[string]any{"Id": "remote-asset", "Status": "Active"}
 				default:
 					t.Errorf("unexpected action %s", action)
+				}
+				if items, ok := result["Items"].([]any); ok && len(items) == 0 {
+					result["TotalCount"] = 0
+					result["PageNumber"] = 1
+					result["PageSize"] = 0
 				}
 				body, err := common.Marshal(map[string]any{"Result": result})
 				require.NoError(t, err)
