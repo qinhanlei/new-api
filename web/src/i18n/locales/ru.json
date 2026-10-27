@@ -6449,6 +6449,8 @@
     "The upstream group create result is unknown; inspect this channel before retrying": "Результат создания группы у провайдера неизвестен; проверьте канал перед повтором",
     "The upstream group result is ambiguous": "Результат группы у провайдера неоднозначен",
     "The upstream key has unlimited quota. Turn on \"Allow querying user quota\" for this key on the upstream to see the real balance.": "У вышестоящего ключа неограниченная квота. Включите для него «Разрешить просмотр квоты пользователя» на вышестоящем сервере, чтобы увидеть реальный баланс.",
+    "The upstream material API returned HTTP 404 (not found). Check the complete material API address and path.": "API материалов провайдера вернул HTTP 404 (не найдено). Проверьте полный адрес и путь API материалов.",
+    "The upstream material API returned HTTP 405 (POST not allowed). Check the complete material API address and path.": "API материалов провайдера вернул HTTP 405 (POST не разрешён). Проверьте полный адрес и путь API материалов.",
     "The upstream material list was invalid": "Список материалов от вышестоящего сервиса некорректен",
     "The upstream material response could not be confirmed": "Не удалось подтвердить ответ провайдера о материале",
     "The upstream material response could not be read": "Не удалось прочитать ответ провайдера о материале",

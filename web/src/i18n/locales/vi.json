@@ -6449,6 +6449,8 @@
     "The upstream group create result is unknown; inspect this channel before retrying": "Kết quả tạo nhóm chưa rõ; kiểm tra kênh trước khi thử lại",
     "The upstream group result is ambiguous": "Kết quả nhóm của nhà cung cấp không rõ ràng",
     "The upstream key has unlimited quota. Turn on \"Allow querying user quota\" for this key on the upstream to see the real balance.": "Khóa thượng nguồn có hạn mức không giới hạn. Hãy bật “Cho phép tra cứu hạn mức người dùng” cho khóa này ở thượng nguồn để xem số dư thực tế.",
+    "The upstream material API returned HTTP 404 (not found). Check the complete material API address and path.": "API tư liệu thượng nguồn trả về HTTP 404 (không tìm thấy). Hãy kiểm tra địa chỉ và đường dẫn đầy đủ của API tư liệu.",
+    "The upstream material API returned HTTP 405 (POST not allowed). Check the complete material API address and path.": "API tư liệu thượng nguồn trả về HTTP 405 (không cho phép POST). Hãy kiểm tra địa chỉ và đường dẫn đầy đủ của API tư liệu.",
     "The upstream material list was invalid": "Danh sách nội dung từ dịch vụ thượng nguồn không hợp lệ",
     "The upstream material response could not be confirmed": "Không thể xác nhận phản hồi tư liệu của nhà cung cấp",
     "The upstream material response could not be read": "Không thể đọc phản hồi tư liệu của nhà cung cấp",

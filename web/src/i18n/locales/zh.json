@@ -6449,6 +6449,8 @@
     "The upstream group create result is unknown; inspect this channel before retrying": "上游素材组创建结果不明，请检查此渠道后重试",
     "The upstream group result is ambiguous": "上游素材组结果不明确",
     "The upstream key has unlimited quota. Turn on \"Allow querying user quota\" for this key on the upstream to see the real balance.": "上游令牌是无限额度，在上游为这个令牌开启“允许查询用户额度”后才能查到真实余额。",
+    "The upstream material API returned HTTP 404 (not found). Check the complete material API address and path.": "上游素材接口返回 HTTP 404（未找到），请检查素材 API 的完整地址及路径。",
+    "The upstream material API returned HTTP 405 (POST not allowed). Check the complete material API address and path.": "上游素材接口返回 HTTP 405（不支持 POST），请检查素材 API 的完整地址及路径。",
     "The upstream material list was invalid": "上游素材列表无效",
     "The upstream material response could not be confirmed": "无法确认上游素材响应",
     "The upstream material response could not be read": "无法读取上游素材响应",

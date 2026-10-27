@@ -6449,6 +6449,8 @@
     "The upstream group create result is unknown; inspect this channel before retrying": "上流のグループ作成結果が不明です。再試行前にチャネルを確認してください",
     "The upstream group result is ambiguous": "上流のグループ結果が曖昧です",
     "The upstream key has unlimited quota. Turn on \"Allow querying user quota\" for this key on the upstream to see the real balance.": "上流のキーはクォータが無制限です。上流でこのキーの「ユーザーのクォータ照会を許可」をオンにすると、実際の残高を確認できます。",
+    "The upstream material API returned HTTP 404 (not found). Check the complete material API address and path.": "上流の素材 API が HTTP 404（見つかりません）を返しました。素材 API の完全な URL とパスを確認してください。",
+    "The upstream material API returned HTTP 405 (POST not allowed). Check the complete material API address and path.": "上流の素材 API が HTTP 405（POST 非対応）を返しました。素材 API の完全な URL とパスを確認してください。",
     "The upstream material list was invalid": "上流の素材一覧が無効です",
     "The upstream material response could not be confirmed": "上流の素材応答を確認できませんでした",
     "The upstream material response could not be read": "上流の素材応答を読み取れませんでした",

@@ -337,13 +337,18 @@ func TestAssetFailedReplicaAndConfigurationContracts(t *testing.T) {
 
 func TestAssetChannelSaveValidatesUpstream(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		status int
-		body   string
+		name    string
+		status  int
+		body    string
+		code    string
+		message string
 	}{
-		{"HTML endpoint", http.StatusMethodNotAllowed, "<html>Method not allowed</html>"},
-		{"missing project", http.StatusBadRequest, `{"error":"Project does not exist"}`},
-		{"missing list", http.StatusOK, `{"Result":{}}`},
+		{"HTML endpoint", http.StatusMethodNotAllowed, "<html>Method not allowed</html>", "UpstreamHTTP405", "The upstream material API returned HTTP 405 (POST not allowed). Check the complete material API address and path."},
+		{"missing endpoint", http.StatusNotFound, "<html>Not found</html>", "UpstreamHTTP404", "The upstream material API returned HTTP 404 (not found). Check the complete material API address and path."},
+		{"missing project", http.StatusBadRequest, `{"error":"项目不存在"}`, "UpstreamError", "项目不存在"},
+		{"structured endpoint error", http.StatusMethodNotAllowed, `{"error":{"code":"ActionNotAllowed","message":"Action is disabled for this project"}}`, "ActionNotAllowed", "Action is disabled for this project"},
+		{"official project error", http.StatusBadRequest, `{"ResponseMetadata":{"Error":{"Code":"InvalidParameter.ProjectName","Message":"Project does not exist"}}}`, "InvalidParameter.ProjectName", "Project does not exist"},
+		{"missing list", http.StatusOK, `{"Result":{}}`, "UpstreamInvalidResponse", "The upstream material list was invalid"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assetTestDatabase(t)
@@ -361,9 +366,8 @@ func TestAssetChannelSaveValidatesUpstream(t *testing.T) {
 			if tc.status >= 400 {
 				assert.Equal(t, tc.status, failure.HTTPStatus)
 			}
-			if tc.name == "missing project" {
-				assert.Equal(t, "Project does not exist", failure.Message)
-			}
+			assert.Equal(t, tc.code, failure.Code)
+			assert.Equal(t, tc.message, failure.Message)
 			stored, err := model.LoadAssetChannelConfig(t.Context(), 1)
 			require.NoError(t, err)
 			assert.Equal(t, before, stored)

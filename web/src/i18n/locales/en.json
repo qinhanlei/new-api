@@ -6449,6 +6449,8 @@
     "The upstream group create result is unknown; inspect this channel before retrying": "The upstream group create result is unknown; inspect this channel before retrying",
     "The upstream group result is ambiguous": "The upstream group result is ambiguous",
     "The upstream key has unlimited quota. Turn on \"Allow querying user quota\" for this key on the upstream to see the real balance.": "The upstream key has unlimited quota. Turn on \"Allow querying user quota\" for this key on the upstream to see the real balance.",
+    "The upstream material API returned HTTP 404 (not found). Check the complete material API address and path.": "The upstream material API returned HTTP 404 (not found). Check the complete material API address and path.",
+    "The upstream material API returned HTTP 405 (POST not allowed). Check the complete material API address and path.": "The upstream material API returned HTTP 405 (POST not allowed). Check the complete material API address and path.",
     "The upstream material list was invalid": "The upstream material list was invalid",
     "The upstream material response could not be confirmed": "The upstream material response could not be confirmed",
     "The upstream material response could not be read": "The upstream material response could not be read",

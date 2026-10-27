@@ -202,14 +202,21 @@ func callAssetUpstream(ctx context.Context, channel *model.Channel, config syste
 	if err = common.Unmarshal(body, &envelope); err != nil {
 		status := http.StatusBadGateway
 		code := "UpstreamInvalidResponse"
+		message := "The upstream material response was not valid JSON"
 		if response.StatusCode >= 400 {
 			status = response.StatusCode
 			code = "UpstreamHTTP" + strconv.Itoa(status)
 		}
+		switch response.StatusCode {
+		case http.StatusNotFound:
+			message = "The upstream material API returned HTTP 404 (not found). Check the complete material API address and path."
+		case http.StatusMethodNotAllowed:
+			message = "The upstream material API returned HTTP 405 (POST not allowed). Check the complete material API address and path."
+		}
 		if strings.HasPrefix(action, "Create") && (status >= 500 || status == http.StatusRequestTimeout) {
 			code = "UpstreamResultUnknown"
 		}
-		return assetError(status, code, "The upstream material response was not valid JSON")
+		return assetError(status, code, message)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 || envelope.ResponseMetadata.Error != nil || envelope.Error != nil {
 		status := response.StatusCode

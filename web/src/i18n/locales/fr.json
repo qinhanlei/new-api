@@ -6449,6 +6449,8 @@
     "The upstream group create result is unknown; inspect this channel before retrying": "Le résultat de création du groupe est inconnu ; vérifiez ce canal avant de réessayer",
     "The upstream group result is ambiguous": "Le résultat du groupe en amont est ambigu",
     "The upstream key has unlimited quota. Turn on \"Allow querying user quota\" for this key on the upstream to see the real balance.": "La clé en amont a un quota illimité. Activez « Autoriser la consultation du quota utilisateur » pour cette clé en amont afin de voir le solde réel.",
+    "The upstream material API returned HTTP 404 (not found). Check the complete material API address and path.": "L’API de ressources amont a renvoyé HTTP 404 (introuvable). Vérifiez son adresse complète et son chemin.",
+    "The upstream material API returned HTTP 405 (POST not allowed). Check the complete material API address and path.": "L’API de ressources amont a renvoyé HTTP 405 (POST non autorisé). Vérifiez son adresse complète et son chemin.",
     "The upstream material list was invalid": "La liste des ressources en amont est invalide",
     "The upstream material response could not be confirmed": "La réponse de la ressource en amont n’a pas pu être confirmée",
     "The upstream material response could not be read": "Impossible de lire la réponse de la ressource en amont",
