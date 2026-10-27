@@ -42,7 +42,7 @@ const config: AssetStorageConfig = {
 }
 const channel = channelSchema.parse({
   id: 7,
-  type: 54,
+  type: 45,
   key: '',
   status: 1,
   name: 'Video channel',
@@ -113,13 +113,15 @@ beforeEach(() => {
       return { data: { success: true, data: config } }
     }
     if (url === '/api/channel' || url === '/api/channel/search') {
+      const type = (options?.params as { type?: number })?.type
       const keyword = String(
         (options?.params as { keyword?: string })?.keyword ?? ''
       )
       const items = channels.filter(
         (item) =>
-          item.name.toLowerCase().includes(keyword.toLowerCase()) ||
-          String(item.id) === keyword
+          (type === undefined || item.type === type) &&
+          (item.name.toLowerCase().includes(keyword.toLowerCase()) ||
+            String(item.id) === keyword)
       )
       return { data: { success: true, data: { items, total: items.length } } }
     }
@@ -392,9 +394,52 @@ test('switching search results preserves the search draft and applied keyword wh
   expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
 })
 
-test('a failed channel list can be retried and an empty result cannot submit a configuration', async () => {
+test('channel listing and search only show Volcengine Ark channels', async () => {
   const user = userEvent.setup()
-  channels = []
+  channels = [
+    channel,
+    { ...otherChannel, type: 1, name: 'OpenAI channel' },
+    { ...otherChannel, id: 9, type: 54, name: 'Doubao video channel' },
+  ]
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  expect(
+    screen.queryByRole('option', { name: /OpenAI/ })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('option', { name: /Doubao/ })
+  ).not.toBeInTheDocument()
+  await user.type(
+    screen.getByRole('searchbox', { name: 'Search channels' }),
+    'channel'
+  )
+  await user.click(screen.getByRole('button', { name: 'Search' }))
+  await waitFor(() =>
+    expect(api.get).toHaveBeenCalledWith(
+      '/api/channel/search',
+      expect.objectContaining({
+        params: expect.objectContaining({ keyword: 'channel', type: 45 }),
+      })
+    )
+  )
+  expect(
+    screen.getByRole('option', { name: 'Video channel (#7)' })
+  ).toBeVisible()
+  expect(
+    screen.queryByRole('option', { name: /OpenAI/ })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('option', { name: /Doubao/ })
+  ).not.toBeInTheDocument()
+})
+
+test('a failed channel list can be retried and no Ark channels cannot submit a configuration', async () => {
+  const user = userEvent.setup()
+  channels = [{ ...channel, type: 54 }]
   vi.mocked(api.get).mockRejectedValueOnce(new Error('Channels unavailable'))
   render(
     <QueryClientProvider client={client}>
@@ -477,7 +522,7 @@ test('channel selection pages on the server and keeps the current channel select
   expect(api.get).toHaveBeenCalledWith(
     '/api/channel',
     expect.objectContaining({
-      params: expect.objectContaining({ p: 2, page_size: 20 }),
+      params: expect.objectContaining({ p: 2, page_size: 20, type: 45 }),
     })
   )
   await user.selectOptions(screen.getByLabelText('Channel'), '8')

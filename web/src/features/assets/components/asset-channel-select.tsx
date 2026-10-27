@@ -49,10 +49,10 @@ export function AssetChannelSelect(props: {
   const { t } = useTranslation()
   const id = useId()
   const { keyword, page } = props.search
+  const params = { p: page, page_size: 20, tag_mode: false, type: 45 }
   const query = useQuery({
-    queryKey: ['asset-channel-options', { keyword, page }],
+    queryKey: ['asset-channel-options', { ...params, keyword }],
     queryFn: async () => {
-      const params = { p: page, page_size: 20, tag_mode: false }
       const result = keyword
         ? await searchChannels({ ...params, keyword })
         : await getChannels(params)
