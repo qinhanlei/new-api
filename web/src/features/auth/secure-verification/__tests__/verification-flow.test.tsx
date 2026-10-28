@@ -167,8 +167,12 @@ it('lets a pending login switch from Passkey to 2FA without using authenticated 
     'aria-selected',
     'true'
   )
+  expect(screen.getByRole('tabpanel', { name: 'Passkey' })).toBeVisible()
   expect(result).not.toHaveBeenCalled()
   await user.click(screen.getByRole('tab', { name: 'Authenticator code' }))
+  expect(
+    screen.getByRole('tabpanel', { name: 'Authenticator code' })
+  ).toBeVisible()
   await user.type(
     screen.getByLabelText('Authenticator code or backup code'),
     '123456'
@@ -363,6 +367,61 @@ it('returns a proof only after successful verification and clears a rejected pas
     expect.objectContaining({ signal: expect.any(AbortSignal) })
   )
   expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+})
+
+it('shows a password-only verification form without a redundant method selector', async () => {
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: passwordRequirements },
+  })
+  const user = userEvent.setup()
+  const result = vi.fn()
+  render(<Harness onResult={result} />)
+  const trigger = screen.getByRole('button', { name: 'Protected action' })
+  await user.click(trigger)
+  const password = await screen.findByLabelText('Password', {
+    selector: 'input',
+  })
+  expect(screen.getAllByText('Password')).toHaveLength(1)
+  expect(screen.queryByRole('tablist')).not.toBeInTheDocument()
+  expect(screen.queryByRole('tabpanel')).not.toBeInTheDocument()
+  expect(password).toHaveAttribute('type', 'password')
+  expect(password).toHaveAttribute('autocomplete', 'current-password')
+  await waitFor(() => expect(password).toHaveFocus())
+  await user.keyboard('{Escape}')
+  await waitFor(() => expect(result).toHaveBeenCalledExactlyOnceWith(null))
+  await waitFor(() => expect(trigger).toHaveFocus())
+})
+
+it('keeps multiple method choices visible when only one is available', async () => {
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        ...passwordRequirements,
+        methods: [
+          { method: '2fa', available: true },
+          { method: 'passkey', available: false },
+        ],
+      },
+    },
+  })
+  const user = userEvent.setup()
+  render(<Harness onResult={vi.fn()} />)
+  await user.click(screen.getByRole('button', { name: 'Protected action' }))
+  const available = await screen.findByRole('tab', {
+    name: 'Authenticator code',
+  })
+  expect(available).toHaveAttribute('aria-selected', 'true')
+  expect(screen.getByRole('tab', { name: 'Passkey' })).toHaveAttribute(
+    'aria-disabled',
+    'true'
+  )
+  expect(
+    screen.getByRole('tabpanel', { name: 'Authenticator code' })
+  ).toBeVisible()
+  expect(
+    screen.getByLabelText('Authenticator code or backup code')
+  ).toBeVisible()
 })
 
 it('discards a late proof after cancellation and prevents a duplicate submission', async () => {
