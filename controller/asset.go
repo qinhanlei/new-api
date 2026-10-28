@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 const assetAPIVersion = "2024-01-01"
@@ -72,6 +73,9 @@ func assetHTTPError(err error) *service.AssetError {
 	var failure *service.AssetError
 	if errors.As(err, &failure) {
 		return failure
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return &service.AssetError{HTTPStatus: http.StatusNotFound, Code: "ResourceNotFound", Message: "The material resource was not found"}
 	}
 	if errors.Is(err, model.ErrAssetConflict) {
 		return &service.AssetError{HTTPStatus: http.StatusConflict, Code: "Conflict", Message: "Asset settings changed. Reload and try again."}

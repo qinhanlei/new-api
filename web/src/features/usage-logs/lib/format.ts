@@ -496,6 +496,7 @@ const AUDIT_TEMPLATES: Record<string, string> = {
   'channel.assets.update': 'Updated asset settings for channel {{id}}',
   'channel.assets.secret_view': 'Viewed channel asset secret key (ID: {{id}})',
   'asset.manage': 'Performed asset action {{action}}',
+  'asset.replica.retry': 'Retried asset {{asset_id}} on channel {{channel_id}}',
   'option.update': 'Updated system setting {{key}}',
   'option.passkey_domains':
     'Updated Passkey domains: removed {{domains}}; affected {{known}}; unknown {{unknown}}',

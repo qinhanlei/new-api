@@ -25,6 +25,7 @@ var auditContentTemplates = map[string]string{
 	"asset.storage.test":        "Tested asset storage access",
 	"channel.assets.update":     "Updated asset settings for channel ${id}",
 	"asset.manage":              "Performed asset action ${action}",
+	"asset.replica.retry":       "Retried asset ${asset_id} on channel ${channel_id}",
 	"user.create":               "Created user ${username} (role ${role})",
 	"user.update":               "Updated user ${username} (ID: ${id})",
 	"user.delete":               "Deleted user ${username} (ID: ${id})",

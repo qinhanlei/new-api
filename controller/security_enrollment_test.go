@@ -683,6 +683,9 @@ func TestAssetReplicaRetryAuthorization(t *testing.T) {
 	var logs []model.AuditLog
 	require.NoError(t, model.LOG_DB.Where("action = ?", "asset.replica.retry").Find(&logs).Error)
 	require.Len(t, logs, 2)
+	for _, entry := range logs {
+		assert.Equal(t, fmt.Sprintf("Retried asset %s on channel %d", asset.PublicID, channel.Id), entry.Content)
+	}
 	encoded, err := common.Marshal(logs)
 	require.NoError(t, err)
 	for _, secret := range []string{channel.Key, session, writeToken, assetOnly, channelOnly} {
@@ -711,6 +714,40 @@ func TestAssetReplicaDetailsRequireChannelReadPermission(t *testing.T) {
 		GetAssetReplicas(c)
 	})
 	assert.Equal(t, http.StatusForbidden, response.Code)
+
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	for _, tc := range []struct {
+		name    string
+		ownerID int
+		deleted bool
+		status  int
+	}{
+		{name: "missing", status: http.StatusNotFound},
+		{name: "deleted", ownerID: user.Id, deleted: true, status: http.StatusNotFound},
+		{name: "other owner", ownerID: user.Id + 1, status: http.StatusNotFound},
+		{name: "owned", ownerID: user.Id, status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			asset := model.Asset{PublicID: model.NewAssetID(), UserID: tc.ownerID, ProjectName: "default", ObjectKey: tc.name}
+			if tc.deleted {
+				asset.DeletedAt = time.Now().Unix()
+			}
+			if tc.ownerID != 0 {
+				require.NoError(t, model.DB.Create(&asset).Error)
+			}
+			response := securityEnrollmentRequest(http.MethodGet, "/api/assets/"+asset.PublicID+"/replicas", "", "", identity, func(c *gin.Context) {
+				c.Set("role", common.RoleRootUser)
+				c.Params = gin.Params{{Key: "id", Value: asset.PublicID}}
+				GetAssetReplicas(c)
+			})
+			assert.Equal(t, tc.status, response.Code, response.Body.String())
+			if tc.status == http.StatusNotFound {
+				assert.Contains(t, response.Body.String(), `"code":"ResourceNotFound"`)
+			} else {
+				assert.Contains(t, response.Body.String(), `"success":true`)
+			}
+		})
+	}
 }
 
 func TestAssetAdministratorCanCleanUpUnavailableOwners(t *testing.T) {
