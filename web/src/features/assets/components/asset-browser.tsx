@@ -52,6 +52,8 @@ import { AssetCreateDialog } from './asset-create-dialog'
 import { AssetGroupDialog } from './asset-group-dialog'
 import { AssetListTable } from './asset-list-table'
 
+type AssetGroupTarget = { group: AssetGroup; scope: AssetScope }
+
 export function AssetBrowser({
   project,
   scope,
@@ -72,11 +74,13 @@ export function AssetBrowser({
   const client = useQueryClient()
   const { copyToClipboard } = useCopyToClipboard()
   const [groupId, setGroupId] = useState('')
-  const [groupDialog, setGroupDialog] = useState<'create' | 'rename' | null>(
-    null
-  )
-  const [adding, setAdding] = useState(false)
-  const [deleting, setDeleting] = useState(false)
+  const [groupDialog, setGroupDialog] = useState<{
+    group?: AssetGroup
+    project: string
+    scope: AssetScope
+  } | null>(null)
+  const [adding, setAdding] = useState<AssetGroupTarget | null>(null)
+  const [deleting, setDeleting] = useState<AssetGroupTarget | null>(null)
   const groups = useInfiniteQuery({
     queryKey: [...assetQueryKeys.all, 'groups', project, scope],
     initialPageParam: '',
@@ -98,14 +102,14 @@ export function AssetBrowser({
   const items = groups.data?.pages.flatMap((page) => page.Items) ?? []
   const group = items.find((item) => item.Id === groupId) ?? items[0]
   const remove = useMutation({
-    mutationFn: (target: AssetGroup) =>
+    mutationFn: (target: AssetGroupTarget) =>
       executeAssetAction(
         'DeleteAssetGroup',
-        { ProjectName: project, Id: target.Id },
-        scope
+        { ProjectName: target.group.ProjectName, Id: target.group.Id },
+        target.scope
       ),
     onSuccess: () => {
-      setDeleting(false)
+      setDeleting(null)
       void client.invalidateQueries({ queryKey: assetQueryKeys.all })
       toast.success(t('Deleted successfully'))
     },
@@ -116,7 +120,9 @@ export function AssetBrowser({
       title={t('No asset groups')}
       action={
         !scope.allUsers && (
-          <Button onClick={() => setGroupDialog('create')}>
+          <Button
+            onClick={() => setGroupDialog({ project, scope: { ...scope } })}
+          >
             {t('Create asset group')}
           </Button>
         )
@@ -141,7 +147,7 @@ export function AssetBrowser({
           {settingsActions}
           <Button
             disabled={!group || scope.allUsers}
-            onClick={() => setAdding(true)}
+            onClick={() => group && setAdding({ group, scope: { ...scope } })}
           >
             <Plus className='size-4' />
             {t('Add asset')}
@@ -167,10 +173,10 @@ export function AssetBrowser({
                 scope={scope}
                 admin={admin}
                 toolbarProps={{
-                  customSearch: filterControls ?? null,
                   hideViewOptions: true,
                   additionalSearch: (
                     <>
+                      {filterControls}
                       <div className='flex min-w-0 items-center gap-2'>
                         <Label className='sr-only' htmlFor={id}>
                           {t('Asset group')}
@@ -223,13 +229,25 @@ export function AssetBrowser({
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 disabled={scope.allUsers}
-                                onClick={() => setGroupDialog('create')}
+                                onClick={() =>
+                                  setGroupDialog({
+                                    project,
+                                    scope: { ...scope },
+                                  })
+                                }
                               >
                                 {t('Create asset group')}
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 disabled={!group || scope.allUsers}
-                                onClick={() => setGroupDialog('rename')}
+                                onClick={() =>
+                                  group &&
+                                  setGroupDialog({
+                                    group,
+                                    project,
+                                    scope: { ...scope },
+                                  })
+                                }
                               >
                                 {t('Rename')}
                               </DropdownMenuItem>
@@ -241,7 +259,9 @@ export function AssetBrowser({
                                 disabled={!group || scope.allUsers}
                                 onClick={() => {
                                   remove.reset()
-                                  setDeleting(true)
+                                  if (group) {
+                                    setDeleting({ group, scope: { ...scope } })
+                                  }
                                 }}
                               >
                                 {t('Delete group')}
@@ -293,31 +313,31 @@ export function AssetBrowser({
       </SectionPageLayout>
       {groupDialog && (
         <AssetGroupDialog
-          group={groupDialog === 'rename' ? group : undefined}
-          project={project}
-          scope={scope}
+          group={groupDialog.group}
+          project={groupDialog.project}
+          scope={groupDialog.scope}
           onClose={() => setGroupDialog(null)}
         />
       )}
-      {adding && group && (
+      {adding && (
         <AssetCreateDialog
-          group={group}
-          scope={scope}
-          onClose={() => setAdding(false)}
+          group={adding.group}
+          scope={adding.scope}
+          onClose={() => setAdding(null)}
         />
       )}
       <ConfirmDialog
-        open={deleting}
-        onOpenChange={(open) => !remove.isPending && setDeleting(open)}
+        open={Boolean(deleting)}
+        onOpenChange={(open) => !open && !remove.isPending && setDeleting(null)}
         title={t('Delete asset group')}
         desc={t(
           'Delete {{name}} and all assets in this group? Their asset URIs will no longer work.',
-          { name: group?.Name }
+          { name: deleting?.group.Name }
         )}
         destructive
         confirmText={t('Delete')}
         isLoading={remove.isPending}
-        handleConfirm={() => group && remove.mutate(group)}
+        handleConfirm={() => deleting && remove.mutate(deleting)}
       >
         {remove.isError && (
           <p role='alert' className='text-destructive text-sm'>

@@ -594,6 +594,92 @@ test('group selection survives refresh and failed deletion leaves confirmation o
   )
 })
 
+test.each(['Rename', 'Delete group', 'Add asset'])(
+  '%s keeps its original group when a refresh removes that group',
+  async (action) => {
+    const user = userEvent.setup()
+    let items = [group, { ...group, Id: 'group-two', Name: 'Products' }]
+    const post = vi
+      .spyOn(api, 'post')
+      .mockImplementation(async (_url, _body, options) => {
+        const requestAction = (
+          options?.params as { Action?: string } | undefined
+        )?.Action
+        if (requestAction === 'ListAssetGroups') {
+          return { data: { success: true, data: { Items: items } } }
+        }
+        if (requestAction === 'ListAssets') {
+          return { data: { success: true, data: { Items: [], TotalCount: 0 } } }
+        }
+        return {
+          data: { success: false, message: 'Original group unavailable' },
+        }
+      })
+    render(
+      <QueryClientProvider client={client}>
+        <AssetBrowser project='default' scope={{ userId: 23 }} admin />
+      </QueryClientProvider>
+    )
+    await screen.findByRole('option', { name: 'Avatars' })
+    if (action === 'Add asset') {
+      await user.click(screen.getByRole('button', { name: action }))
+    } else {
+      await user.click(screen.getByRole('button', { name: 'Group actions' }))
+      await user.click(screen.getByRole('menuitem', { name: action }))
+    }
+    const dialog = screen.getByRole(
+      action === 'Delete group' ? 'alertdialog' : 'dialog'
+    )
+    if (action !== 'Delete group') {
+      await user.clear(within(dialog).getByLabelText('Name'))
+      await user.type(within(dialog).getByLabelText('Name'), 'Draft avatar')
+    }
+    if (action === 'Add asset') {
+      await user.type(
+        within(dialog).getByLabelText('Asset URL'),
+        'https://example.com/avatar.png'
+      )
+    }
+    items = [items[1]]
+    await act(() => client.invalidateQueries({ queryKey: ['assets'] }))
+    await waitFor(() => expect(client.isFetching()).toBe(0))
+    const submit = {
+      Rename: 'Save',
+      'Delete group': 'Delete',
+      'Add asset': 'Add asset',
+    }[action]
+    await user.click(within(dialog).getByRole('button', { name: submit }))
+    const requestAction = {
+      Rename: 'UpdateAssetGroup',
+      'Delete group': 'DeleteAssetGroup',
+      'Add asset': 'CreateAsset',
+    }[action]
+    await waitFor(() =>
+      expect(post).toHaveBeenCalledWith(
+        '/api/assets/actions',
+        expect.objectContaining({
+          ProjectName: 'default',
+          [action === 'Add asset' ? 'GroupId' : 'Id']: group.Id,
+        }),
+        expect.objectContaining({
+          params: expect.objectContaining({
+            Action: requestAction,
+            user_id: 23,
+          }),
+        })
+      )
+    )
+    expect(dialog).toBeVisible()
+    if (action === 'Delete group') {
+      expect(dialog).toHaveTextContent(
+        'Delete Avatars and all assets in this group?'
+      )
+    } else {
+      expect(within(dialog).getByLabelText('Name')).toHaveValue('Draft avatar')
+    }
+  }
+)
+
 test('group deletion warns that all assets and their URIs are removed before confirmation', async () => {
   const user = userEvent.setup()
   let deleted = false
