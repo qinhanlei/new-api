@@ -15,10 +15,13 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -864,6 +867,78 @@ func assetRetryFixture(t *testing.T) (model.AssetGroup, model.Asset) {
 	asset := assetTestAsset(t, group)
 	require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Updates(map[string]any{"status": model.AssetFailed, "token_id": 1, "attempts": 5, "error_code": "UpstreamInvalidResponse", "error_message": "The upstream material response was not valid JSON"}).Error)
 	return group, asset
+}
+
+func TestAssetRoutingRetriesAfterUnreadyAffinity(t *testing.T) {
+	previousCache, previousRedis := common.MemoryCacheEnabled, common.RedisEnabled
+	previousLogDB, previousLogType, previousMaster := model.LOG_DB, common.LogDatabaseType(), common.IsMasterNode
+	affinity := operation_setting.GetChannelAffinitySetting()
+	previousAffinity := *affinity
+	common.RedisEnabled, common.IsMasterNode = false, false
+	t.Setenv("LOG_SQL_DSN", "")
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled, common.RedisEnabled = previousCache, previousRedis
+		model.LOG_DB, common.IsMasterNode = previousLogDB, previousMaster
+		common.SetLogDatabaseType(previousLogType)
+		*affinity = previousAffinity
+		if model.DB != nil && model.DB.Migrator().HasTable(&model.Channel{}) && model.DB.Migrator().HasTable(&model.Ability{}) {
+			model.InitChannelCache()
+		}
+	})
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprintf("memory_cache=%t", cached), func(t *testing.T) {
+			_, asset := assetRetryFixture(t)
+			// Initialize dialect-specific column quoting for uncached selection.
+			require.NoError(t, model.InitLogDB())
+			const modelName = "doubao-seedance-2-0-260128"
+			channel := model.Channel{Id: 3, Name: "channel-3", Key: "channel-key", Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled}
+			require.NoError(t, model.DB.Create(&channel).Error)
+			config := system_setting.AssetChannelConfig{AssetChannelFields: dto.AssetChannelFields{Enabled: true, Endpoint: "https://upstream.example", ProjectName: "actual-project", AuthType: "bearer"}, ChannelScope: model.AssetChannelScope(&channel)}
+			require.NoError(t, model.SaveAssetChannelConfig(t.Context(), 3, config))
+			for i, priority := range []int64{0, 20, 10} {
+				channel, err := model.GetChannelById(i+1, true)
+				require.NoError(t, err)
+				channel.Group, channel.Models, channel.Priority = "default", modelName, &priority
+				require.NoError(t, model.DB.Save(channel).Error)
+				require.NoError(t, channel.UpdateAbilities(model.DB))
+				if channel.Id > 1 {
+					require.NoError(t, model.EnsureAssetReplicas(t.Context(), []model.Asset{asset}, channel.Id, 1))
+					require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ? AND channel_id = ?", asset.ID, channel.Id).
+						Updates(map[string]any{"state": model.AssetReady, "status": model.AssetActive, "upstream_id": fmt.Sprintf("remote-%d", channel.Id)}).Error)
+				}
+			}
+			common.MemoryCacheEnabled = cached
+			model.InitChannelCache()
+			*affinity = operation_setting.ChannelAffinitySetting{
+				Enabled: true, DefaultTTLSeconds: 60, MaxEntries: 100,
+				Rules: []operation_setting.ChannelAffinityRule{{
+					Name: t.Name(), ModelRegex: []string{"^" + modelName + "$"}, SessionMode: "prefer",
+					KeySources: []operation_setting.ChannelAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
+				}},
+			}
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+			ctx.Request.Header.Set("X-Session", t.Name())
+			ctx.Set("id", 1)
+			ctx.Set("token_id", 1)
+			common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+			ctx.Set(jsplugin.ContextKeyAssetReferences, []string{asset.PublicID})
+			_, found := GetPreferredChannelByAffinity(ctx, modelName, "default")
+			require.False(t, found)
+			RecordChannelAffinity(ctx, 1)
+			t.Cleanup(func() { ClearCurrentChannelAffinityCache(ctx) })
+
+			// Affinity channel 1 has no ready replica. The first actual attempt
+			// uses channel 2; its retry must advance to channel 3's lower priority.
+			for retry, want := range []int{2, 3} {
+				selected, group, err := SelectChannelForRequest(ctx, modelName, &RetryParam{Ctx: ctx, TokenGroup: "default", ModelName: modelName, Retry: &retry})
+				require.Nil(t, err)
+				require.NotNil(t, selected)
+				assert.Equal(t, "default", group)
+				assert.Equal(t, want, selected.Id)
+			}
+		})
+	}
 }
 
 func TestAssetReplicaRetryPreservesExistingReferences(t *testing.T) {

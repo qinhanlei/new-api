@@ -82,12 +82,12 @@ func selectAssetChannel(c *gin.Context, modelName string, retry *RetryParam) (*m
 	actor.ChannelIDs = eligible
 	constraints.Filters = append(slices.Clone(originalFilters), dto.ChannelFilter{Kind: dto.FilterAssetChannels, AssetChannelIDs: actor.ChannelIDs})
 	defer func() { constraints.Filters = originalFilters }()
-	// Finding the usual preference must not advance auto-group retry state
+	// Finding the usual preference must not advance auto-group or affinity retry state
 	// twice when another channel is the first one with ready replicas.
 	retryBefore := *retry
 	retryBefore.Retry = common.GetPointer(retry.GetRetry())
 	selectionState := make(map[string]any)
-	for _, key := range []string{string(constant.ContextKeyAutoGroup), string(constant.ContextKeyAutoGroupIndex), string(constant.ContextKeyAutoGroupRetryIndex), ginKeyChannelAffinityLogInfo, ginKeyChannelAffinitySkipRetry} {
+	for _, key := range []string{string(constant.ContextKeyAutoGroup), string(constant.ContextKeyAutoGroupIndex), string(constant.ContextKeyAutoGroupRetryIndex), ginKeyChannelAffinityLogInfo, ginKeyChannelAffinitySkipRetry, ginKeyChannelAffinityRetryOffset} {
 		selectionState[key], _ = c.Get(key)
 	}
 	preferred, group, selectErr := selectChannelForRequest(c, modelName, retry)
