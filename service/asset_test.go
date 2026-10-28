@@ -404,6 +404,149 @@ func TestAssetWorkReclaimsExpiredUpload(t *testing.T) {
 	assert.ErrorIs(t, model.FinishAssetSource(ctx, &asset, "", "", 0), model.ErrAssetConflict)
 }
 
+func TestAssetReplicaWorkRejectsStaleCandidates(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		state      string
+		status     string
+		upstreamID string
+		retryDelay int64
+		keepLease  bool
+	}{
+		{name: "created pending moderation", state: model.AssetReady, status: model.AssetProcessing, upstreamID: "remote-asset", retryDelay: 60},
+		{name: "moderation completed", state: model.AssetReady, status: model.AssetActive, upstreamID: "remote-asset"},
+		{name: "creation failed", state: model.AssetPending, status: model.AssetFailed},
+		{name: "retry postponed", state: model.AssetPending, status: model.AssetProcessing, retryDelay: 60},
+		{name: "retry still due", state: model.AssetPending, status: model.AssetProcessing},
+		{name: "expired lease replaced", keepLease: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assetTestDatabase(t)
+			ctx := t.Context()
+			asset := assetTestAsset(t, assetTestGroup(t, 1, "group"))
+			require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Update("next_attempt_at", 0).Error)
+			now := time.Now().Unix()
+			var expected, previousLease model.AssetReplica
+			interleaved := false
+			const callback = "test:finish-before-replica-claim"
+			require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+				rows, ok := tx.Statement.Dest.(*[]model.AssetReplica)
+				if interleaved || !ok || len(*rows) != 1 || (*rows)[0].AssetID != asset.ID {
+					return
+				}
+				interleaved = true
+				claimAt := now
+				if tc.keepLease {
+					claimAt -= 120
+				}
+				claimed, err := model.ClaimAssetReplicas(ctx, claimAt, 1)
+				require.NoError(t, err)
+				require.Len(t, claimed, 1)
+				previousLease = claimed[0]
+				if !tc.keepLease {
+					claimed[0].State = tc.state
+					claimed[0].Status = tc.status
+					claimed[0].UpstreamID = tc.upstreamID
+					retryAt := int64(0)
+					if tc.retryDelay > 0 {
+						retryAt = now + tc.retryDelay
+					}
+					require.NoError(t, model.FinishAssetReplica(ctx, &claimed[0], retryAt))
+				}
+				expected, err = model.GetAssetReplica(ctx, asset.ID, 1)
+				require.NoError(t, err)
+			}))
+			t.Cleanup(func() { require.NoError(t, model.DB.Callback().Query().Remove(callback)) })
+
+			claimed, err := model.ClaimAssetReplicas(ctx, now, 1)
+			require.NoError(t, err)
+			require.True(t, interleaved)
+			assert.Empty(t, claimed)
+			current, err := model.GetAssetReplica(ctx, asset.ID, 1)
+			require.NoError(t, err)
+			assert.Equal(t, expected, current, "the stale candidate must preserve the current upstream identity and retry state")
+			if current.Status == model.AssetProcessing {
+				claimed, err = model.ClaimAssetReplicas(ctx, max(now, current.NextAttemptAt, current.LeaseExpiresAt), 1)
+				require.NoError(t, err)
+				require.Len(t, claimed, 1, "fresh due work must remain claimable, including an expired lease")
+				assert.Equal(t, expected.UpstreamID, claimed[0].UpstreamID)
+				assert.NotEqual(t, previousLease.LeaseToken, claimed[0].LeaseToken)
+				before, err := model.GetAssetReplica(ctx, asset.ID, 1)
+				require.NoError(t, err)
+				assert.ErrorIs(t, model.FinishAssetReplica(ctx, &previousLease, 0), model.ErrAssetConflict)
+				after, err := model.GetAssetReplica(ctx, asset.ID, 1)
+				require.NoError(t, err)
+				assert.Equal(t, before, after, "an expired worker cannot replace the new lease's result")
+			}
+		})
+	}
+}
+
+func TestAssetGroupCleanupRejectsStaleCandidates(t *testing.T) {
+	for _, name := range []string{"cleanup completed", "cleanup postponed", "expired lease replaced"} {
+		t.Run(name, func(t *testing.T) {
+			assetTestDatabase(t)
+			ctx := t.Context()
+			group := assetTestGroup(t, 1, "group")
+			asset := assetTestAsset(t, group)
+			require.NoError(t, model.DeleteAssetGroup(ctx, 1, group.PublicID, "default"))
+			require.NoError(t, model.DB.Model(&model.Asset{}).Where("id = ?", asset.ID).Update("object_state", model.AssetDeleted).Error)
+			now := time.Now().Unix()
+			require.NoError(t, model.DB.Model(&model.AssetGroupReplica{}).Where("group_id = ?", group.ID).
+				Updates(map[string]any{"state": model.AssetReady, "upstream_id": "remote-group", "updated_at": now - 150}).Error)
+			var expected, previousLease model.AssetGroupReplica
+			interleaved := false
+			const callback = "test:finish-before-group-cleanup-claim"
+			require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+				rows, ok := tx.Statement.Dest.(*[]model.AssetGroupReplica)
+				if interleaved || !ok || len(*rows) != 1 || (*rows)[0].GroupID != group.ID {
+					return
+				}
+				interleaved = true
+				claimAt := now
+				if name == "expired lease replaced" {
+					claimAt -= 90
+				}
+				claimed, err := model.ClaimDeletedAssetGroups(ctx, claimAt, 1)
+				require.NoError(t, err)
+				require.Len(t, claimed, 1)
+				previousLease = claimed[0]
+				if name != "expired lease replaced" {
+					if name == "cleanup completed" {
+						claimed[0].State = model.AssetDeleted
+					}
+					require.NoError(t, model.FinishAssetGroupReplica(ctx, &claimed[0]))
+				}
+				expected, err = model.GetAssetGroupReplica(ctx, group.ID, 1)
+				require.NoError(t, err)
+			}))
+			t.Cleanup(func() { require.NoError(t, model.DB.Callback().Query().Remove(callback)) })
+
+			claimed, err := model.ClaimDeletedAssetGroups(ctx, now, 1)
+			require.NoError(t, err)
+			require.True(t, interleaved)
+			assert.Empty(t, claimed)
+			current, err := model.GetAssetGroupReplica(ctx, group.ID, 1)
+			require.NoError(t, err)
+			assert.Equal(t, expected, current, "the stale candidate must not repeat deletion or skip the retry delay")
+			if current.State != model.AssetDeleted {
+				claimed, err = model.ClaimDeletedAssetGroups(ctx, max(now, current.UpdatedAt+30, current.LeaseExpiresAt), 1)
+				require.NoError(t, err)
+				require.Len(t, claimed, 1)
+				assert.NotEqual(t, previousLease.LeaseToken, claimed[0].LeaseToken)
+				claimed[0].State = model.AssetDeleted
+				require.NoError(t, model.FinishAssetGroupReplica(ctx, &claimed[0]))
+				before, err := model.GetAssetGroupReplica(ctx, group.ID, 1)
+				require.NoError(t, err)
+				assert.ErrorIs(t, model.FinishAssetGroupReplica(ctx, &previousLease), model.ErrAssetConflict)
+				after, err := model.GetAssetGroupReplica(ctx, group.ID, 1)
+				require.NoError(t, err)
+				assert.Equal(t, before, after, "an expired worker cannot resurrect a deleted group")
+			}
+		})
+	}
+}
+
 func TestAssetFailedReplicaAndConfigurationContracts(t *testing.T) {
 	assetTestDatabase(t)
 	ctx := t.Context()

@@ -268,7 +268,12 @@ func ClaimAssetReplicas(ctx context.Context, now int64, limit int) ([]AssetRepli
 				return nil
 			}
 			token := common.GetUUID()
-			result := tx.Model(&AssetReplica{}).Where("id = ? AND status = ? AND lease_expires_at <= ?", replica.ID, AssetProcessing, now).Updates(map[string]any{"lease_token": token, "lease_expires_at": now + 120, "updated_at": now})
+			result := tx.Model(&AssetReplica{}).
+				Where("id = ? AND status = ? AND state = ?", replica.ID, replica.Status, replica.State).
+				Where("upstream_id = ? AND create_started_at = ?", replica.UpstreamID, replica.CreateStartedAt).
+				Where("attempts = ? AND next_attempt_at = ?", replica.Attempts, replica.NextAttemptAt).
+				Where("lease_token = ? AND lease_expires_at = ? AND lease_expires_at <= ?", replica.LeaseToken, replica.LeaseExpiresAt, now).
+				Updates(map[string]any{"lease_token": token, "lease_expires_at": now + 120, "updated_at": now})
 			if result.Error != nil {
 				return result.Error
 			}
@@ -399,12 +404,17 @@ func ClaimDeletedAssetGroups(ctx context.Context, now int64, limit int) ([]Asset
 	claimed := []AssetGroupReplica{}
 	for _, replica := range candidates {
 		token := common.GetUUID()
-		result := protectedAssetDB(ctx).Model(&AssetGroupReplica{}).Where("id = ? AND lease_expires_at <= ?", replica.ID, now).Updates(map[string]any{"lease_token": token, "lease_expires_at": now + 90})
+		result := protectedAssetDB(ctx).Model(&AssetGroupReplica{}).
+			Where("id = ? AND state = ? AND upstream_id = ?", replica.ID, replica.State, replica.UpstreamID).
+			Where("create_started_at = ? AND updated_at = ?", replica.CreateStartedAt, replica.UpdatedAt).
+			Where("lease_token = ? AND lease_expires_at = ? AND lease_expires_at <= ?", replica.LeaseToken, replica.LeaseExpiresAt, now).
+			Updates(map[string]any{"lease_token": token, "lease_expires_at": now + 90})
 		if result.Error != nil {
 			return nil, result.Error
 		}
 		if result.RowsAffected > 0 {
 			replica.LeaseToken = token
+			replica.LeaseExpiresAt = now + 90
 			claimed = append(claimed, replica)
 		}
 	}
