@@ -205,8 +205,10 @@ async function renderSecretSettings(target: 'storage' | 'channel') {
     </QueryClientProvider>
   )
   if (target === 'channel') {
-    await screen.findByRole('option', { name: 'Second channel (#8)' })
-    await user.selectOptions(screen.getByLabelText('Channel'), '8')
+    await screen.findByRole('button', { name: 'Edit Second channel (#8)' })
+    await user.click(
+      await screen.findByRole('button', { name: 'Edit Second channel (#8)' })
+    )
   }
   await screen.findByLabelText('Secret key')
   return { user, ...result }
@@ -441,7 +443,10 @@ test('changing channels after disclosure requires verification for the newly sel
   await user.click(screen.getByRole('button', { name: 'Verify' }))
   const dialog = await screen.findByRole('dialog', { name: 'Saved secret key' })
   await user.click(within(dialog).getByRole('button', { name: 'Close' }))
-  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.click(screen.getByRole('button', { name: 'Back to list' }))
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  )
   await screen.findByLabelText('Secret key')
   expect(
     screen.queryByRole('textbox', { name: 'Saved secret key' })
@@ -558,7 +563,7 @@ test('connection testing needs no verification and keeps unsaved configuration',
   expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled()
 })
 
-test('selecting a channel fetches only its settings and saves without extra verification', async () => {
+test('editing a listed channel loads only its settings and saving returns to the list', async () => {
   const user = userEvent.setup()
   const close = vi.fn()
   const put = vi.spyOn(api, 'put').mockResolvedValue({
@@ -572,12 +577,16 @@ test('selecting a channel fetches only its settings and saves without extra veri
       <AssetChannelSettingsDialog onClose={close} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  const edit = await screen.findByRole('button', {
+    name: 'Edit Video channel (#7)',
+  })
+  expect(screen.getByRole('table')).toBeVisible()
+  expect(screen.queryByLabelText('Channel')).not.toBeInTheDocument()
   expect(api.get).not.toHaveBeenCalledWith(
     '/api/channel/7/assets',
     expect.anything()
   )
-  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.click(edit)
   await user.click(
     await screen.findByRole('switch', { name: 'Enable asset library' })
   )
@@ -607,13 +616,15 @@ test('selecting a channel fetches only its settings and saves without extra veri
     },
     { skipBusinessError: true, skipErrorHandler: true }
   )
-  await waitFor(() =>
-    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
-  )
+  expect(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  ).toBeVisible()
+  expect(screen.queryByLabelText('Asset API endpoint')).not.toBeInTheDocument()
 })
 
-test('switching a dirty channel requires confirmation and clears the previous credentials', async () => {
+test('returning from a dirty channel confirms discard and clears credentials before editing another', async () => {
   const user = userEvent.setup()
+  client.setDefaultOptions({ queries: { retry: false, staleTime: 10_000 } })
   channelConfigs[7] = {
     ...channelConfigs[7],
     auth_type: 'aksk',
@@ -625,19 +636,30 @@ test('switching a dirty channel requires confirmation and clears the previous cr
       <AssetChannelSettingsDialog onClose={vi.fn()} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Video channel (#7)' })
-  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  )
   await user.type(await screen.findByLabelText('Secret key'), 'first-secret')
-  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  await user.click(screen.getByRole('button', { name: 'Back to list' }))
   expect(await screen.findByRole('alertdialog')).toHaveTextContent(
     'Unsaved changes'
   )
   await user.click(screen.getByRole('button', { name: 'Cancel' }))
-  expect(screen.getByLabelText('Channel')).toHaveValue('7')
+  expect(
+    screen.getByRole('dialog', { name: 'Channel settings' })
+  ).toHaveAccessibleDescription('Video channel (#7)')
   expect(screen.getByLabelText('Secret key')).toHaveValue('first-secret')
-  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  await user.click(screen.getByRole('button', { name: 'Back to list' }))
   await user.click(
     await screen.findByRole('button', { name: 'Discard changes' })
+  )
+  await waitFor(() =>
+    expect(
+      screen.getByRole('button', { name: 'Edit Video channel (#7)' })
+    ).toHaveFocus()
+  )
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Second channel (#8)' })
   )
   expect(
     await screen.findByDisplayValue('https://second.example.com/assets')
@@ -649,16 +671,14 @@ test('switching a dirty channel requires confirmation and clears the previous cr
 
 test('channel size overrides save together and clearing restores official defaults', async () => {
   const user = userEvent.setup()
-  const put = vi.spyOn(api, 'put').mockImplementation(async (_url, body) => ({
-    data: {
-      success: true,
-      data: {
-        ...channelConfigs[7],
-        ...(body as AssetChannelUpdate),
-        revision: 1,
-      },
-    },
-  }))
+  const put = vi.spyOn(api, 'put').mockImplementation(async (_url, body) => {
+    channelConfigs[7] = {
+      ...channelConfigs[7],
+      ...(body as AssetChannelUpdate),
+      revision: channelConfigs[7].revision + 1,
+    }
+    return { data: { success: true, data: channelConfigs[7] } }
+  })
   client.setQueryData(['assets', 'config'], {
     enabled: true,
     size_limits_mb: { image: 30, video: 200, audio: 15 },
@@ -668,8 +688,9 @@ test('channel size overrides save together and clearing restores official defaul
       <AssetChannelSettingsDialog onClose={vi.fn()} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Video channel (#7)' })
-  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  )
   const image = await screen.findByLabelText('Image limit (MB)')
   const video = screen.getByLabelText('Video limit (MB)')
   const audio = screen.getByLabelText('Audio limit (MB)')
@@ -688,7 +709,10 @@ test('channel size overrides save together and clearing restores official defaul
     })
   )
   expect(client.getQueryState(['assets', 'config'])?.isInvalidated).toBe(true)
-  await user.clear(video)
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  )
+  await user.clear(await screen.findByLabelText('Video limit (MB)'))
   await user.click(screen.getByRole('button', { name: 'Save' }))
   await waitFor(() => expect(put).toHaveBeenCalledTimes(2))
   expect(put.mock.calls[1][1]).toEqual(
@@ -706,8 +730,9 @@ test('invalid channel size limit associates its validation error with the input'
       <AssetChannelSettingsDialog onClose={vi.fn()} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Video channel (#7)' })
-  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  )
   const image = await screen.findByLabelText('Image limit (MB)')
   await user.type(image, '-1')
   const form = image.closest('form')
@@ -728,7 +753,7 @@ test('channel settings can search by name or ID without fetching each result con
       <AssetChannelSettingsDialog onClose={vi.fn()} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
   await user.type(
     screen.getByRole('searchbox', { name: 'Search channels' }),
     '8'
@@ -736,11 +761,11 @@ test('channel settings can search by name or ID without fetching each result con
   await user.click(screen.getByRole('button', { name: 'Search' }))
   await waitFor(() =>
     expect(
-      screen.queryByRole('option', { name: 'Video channel (#7)' })
+      screen.queryByRole('button', { name: 'Edit Video channel (#7)' })
     ).not.toBeInTheDocument()
   )
   expect(
-    screen.getByRole('option', { name: 'Second channel (#8)' })
+    screen.getByRole('button', { name: 'Edit Second channel (#8)' })
   ).toBeInTheDocument()
   expect(api.get).toHaveBeenCalledWith(
     '/api/channel/search',
@@ -754,7 +779,7 @@ test('channel settings can search by name or ID without fetching each result con
   )
 })
 
-test('switching search results preserves the search draft and applied keyword while clearing credentials', async () => {
+test('returning to search results preserves the draft and applied keyword', async () => {
   const user = userEvent.setup()
   channels = [channel, otherChannel, { ...channel, id: 9, name: 'Unrelated' }]
   channelConfigs[7] = {
@@ -768,7 +793,7 @@ test('switching search results preserves the search draft and applied keyword wh
       <AssetChannelSettingsDialog onClose={vi.fn()} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Unrelated (#9)' })
+  await screen.findByRole('button', { name: 'Edit Unrelated (#9)' })
   await user.type(
     screen.getByRole('searchbox', { name: 'Search channels' }),
     'channel'
@@ -776,35 +801,34 @@ test('switching search results preserves the search draft and applied keyword wh
   await user.click(screen.getByRole('button', { name: 'Search' }))
   await waitFor(() =>
     expect(
-      screen.queryByRole('option', { name: 'Unrelated (#9)' })
+      screen.queryByRole('button', { name: 'Edit Unrelated (#9)' })
     ).not.toBeInTheDocument()
   )
   await user.type(
     screen.getByRole('searchbox', { name: 'Search channels' }),
     '-draft'
   )
-  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  )
   await user.type(await screen.findByLabelText('Secret key'), 'first-secret')
-  expect(
-    screen.getByRole('searchbox', { name: 'Search channels' })
-  ).toHaveValue('channel-draft')
-  expect(
-    screen.queryByRole('option', { name: 'Unrelated (#9)' })
-  ).not.toBeInTheDocument()
-  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  await user.click(screen.getByRole('button', { name: 'Back to list' }))
   await user.click(
     await screen.findByRole('button', { name: 'Discard changes' })
   )
-  await screen.findByDisplayValue('https://second.example.com/assets')
   expect(
-    screen.getByRole('searchbox', { name: 'Search channels' })
+    await screen.findByRole('searchbox', { name: 'Search channels' })
   ).toHaveValue('channel-draft')
   expect(
-    screen.queryByRole('option', { name: 'Unrelated (#9)' })
+    screen.queryByRole('button', { name: 'Edit Unrelated (#9)' })
   ).not.toBeInTheDocument()
   expect(
-    screen.getByRole('option', { name: 'Video channel (#7)' })
+    screen.getByRole('button', { name: 'Edit Video channel (#7)' })
   ).toBeInTheDocument()
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Second channel (#8)' })
+  )
+  await screen.findByDisplayValue('https://second.example.com/assets')
   expect(screen.getByLabelText('Secret key')).toHaveValue('')
   expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
 })
@@ -821,12 +845,12 @@ test('channel listing and search only show Volcengine Ark channels', async () =>
       <AssetChannelSettingsDialog onClose={vi.fn()} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Video channel (#7)' })
+  await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
   expect(
-    screen.queryByRole('option', { name: /OpenAI/ })
+    screen.queryByRole('button', { name: /Edit OpenAI/ })
   ).not.toBeInTheDocument()
   expect(
-    screen.queryByRole('option', { name: /Doubao/ })
+    screen.queryByRole('button', { name: /Edit Doubao/ })
   ).not.toBeInTheDocument()
   await user.type(
     screen.getByRole('searchbox', { name: 'Search channels' }),
@@ -842,13 +866,13 @@ test('channel listing and search only show Volcengine Ark channels', async () =>
     )
   )
   expect(
-    screen.getByRole('option', { name: 'Video channel (#7)' })
+    screen.getByRole('button', { name: 'Edit Video channel (#7)' })
   ).toBeVisible()
   expect(
-    screen.queryByRole('option', { name: /OpenAI/ })
+    screen.queryByRole('button', { name: /Edit OpenAI/ })
   ).not.toBeInTheDocument()
   expect(
-    screen.queryByRole('option', { name: /Doubao/ })
+    screen.queryByRole('button', { name: /Edit Doubao/ })
   ).not.toBeInTheDocument()
 })
 
@@ -864,8 +888,77 @@ test('a failed channel list can be retried and no Ark channels cannot submit a c
   expect(await screen.findByText('Channels unavailable')).toBeVisible()
   await user.click(screen.getByRole('button', { name: 'Retry' }))
   expect(await screen.findByText('No Channels Found')).toBeVisible()
-  expect(screen.getByLabelText('Channel')).toHaveValue('')
+  expect(
+    screen.queryByRole('button', { name: /^Edit / })
+  ).not.toBeInTheDocument()
   expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument()
+})
+
+test('failed channel details can be retried or left without losing the list', async () => {
+  const user = userEvent.setup()
+  const get = vi.mocked(api.get).getMockImplementation()
+  if (!get) throw new Error('Channel request fixture is missing')
+  vi.mocked(api.get).mockImplementation(async (url, options) => {
+    if (url === '/api/channel/7/assets') throw new Error('Settings unavailable')
+    return get(url, options)
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  )
+  expect(await screen.findByText('Settings unavailable')).toBeVisible()
+  expect(screen.getByRole('dialog')).toHaveAccessibleDescription(
+    'Video channel (#7)'
+  )
+  vi.mocked(api.get).mockImplementation(get)
+  await user.click(screen.getByRole('button', { name: 'Retry' }))
+  await screen.findByLabelText('Asset API endpoint')
+  await user.click(screen.getByRole('button', { name: 'Back to list' }))
+  expect(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  ).toBeVisible()
+})
+
+test('leaving pending channel details prevents a late response from replacing another editor', async () => {
+  const user = userEvent.setup()
+  const get = vi.mocked(api.get).getMockImplementation()
+  if (!get) throw new Error('Channel request fixture is missing')
+  let resolveDetails!: (value: Awaited<ReturnType<typeof api.get>>) => void
+  vi.mocked(api.get).mockImplementation(async (url, options) => {
+    if (url === '/api/channel/7/assets') {
+      return new Promise((resolve) => {
+        resolveDetails = resolve
+      })
+    }
+    return get(url, options)
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  )
+  expect(await screen.findByText('Loading...')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Back to list' }))
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Second channel (#8)' })
+  )
+  await screen.findByDisplayValue('https://second.example.com/assets')
+  await act(async () =>
+    resolveDetails({ data: { success: true, data: channelConfigs[7] } })
+  )
+  expect(screen.getByRole('dialog')).toHaveAccessibleDescription(
+    'Second channel (#8)'
+  )
+  expect(screen.getByLabelText('Asset API endpoint')).toHaveValue(
+    'https://second.example.com/assets'
+  )
 })
 
 test('multi-key channels cannot enable assets', async () => {
@@ -885,8 +978,9 @@ test('multi-key channels cannot enable assets', async () => {
       <AssetChannelSettingsDialog onClose={vi.fn()} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Video channel (#7)' })
-  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  )
   expect(
     await screen.findByRole('switch', { name: 'Enable asset library' })
   ).toHaveAttribute('aria-disabled', 'true')
@@ -895,8 +989,9 @@ test('multi-key channels cannot enable assets', async () => {
   )
 })
 
-test('channel selection pages on the server and keeps the current channel selectable', async () => {
+test('returning from keyboard editing restores the server page, scroll position and edit focus', async () => {
   const user = userEvent.setup()
+  client.setDefaultOptions({ queries: { retry: false, staleTime: 10_000 } })
   const thirdChannel = { ...channel, id: 9, name: 'Third channel' }
   channelConfigs[9] = {
     ...channelConfigs[8],
@@ -925,44 +1020,54 @@ test('channel selection pages on the server and keeps the current channel select
       <AssetChannelSettingsDialog onClose={vi.fn()} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Video channel (#7)' })
-  await user.selectOptions(screen.getByLabelText('Channel'), '7')
-  await screen.findByLabelText('Asset API endpoint')
+  await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
   await user.click(screen.getByRole('button', { name: 'Next page' }))
-  await screen.findByRole('option', { name: 'Second channel (#8)' })
-  expect(screen.getByLabelText('Channel')).toHaveValue('7')
-  expect(
-    screen.getByRole('option', { name: 'Video channel (#7)' })
-  ).toBeInTheDocument()
+  const edit = await screen.findByRole('button', {
+    name: 'Edit Second channel (#8)',
+  })
   expect(api.get).toHaveBeenCalledWith(
     '/api/channel',
     expect.objectContaining({
       params: expect.objectContaining({ p: 2, page_size: 20, type: 45 }),
     })
   )
-  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  fireEvent.scroll(screen.getByRole('region', { name: 'Channels' }), {
+    target: { scrollTop: 120 },
+  })
+  edit.focus()
+  await user.keyboard('{Enter}')
   expect(
     await screen.findByDisplayValue('https://second.example.com/assets')
   ).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Back to list' }))
   await waitFor(() =>
     expect(screen.getByRole('button', { name: 'Previous page' })).toBeEnabled()
   )
   expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled()
   expect(
-    screen.queryByRole('option', { name: 'Video channel (#7)' })
+    screen.queryByRole('button', { name: 'Edit Video channel (#7)' })
   ).not.toBeInTheDocument()
-  await user.selectOptions(screen.getByLabelText('Channel'), '9')
+  expect(screen.getByRole('region', { name: 'Channels' }).scrollTop).toBe(120)
+  await waitFor(() =>
+    expect(
+      screen.getByRole('button', { name: 'Edit Second channel (#8)' })
+    ).toHaveFocus()
+  )
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Third channel (#9)' })
+  )
   await screen.findByDisplayValue('https://third.example.com/assets')
+  await user.click(screen.getByRole('button', { name: 'Back to list' }))
   await waitFor(() =>
     expect(screen.getByRole('button', { name: 'Previous page' })).toBeEnabled()
   )
   expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled()
   expect(
-    screen.queryByRole('option', { name: 'Video channel (#7)' })
+    screen.queryByRole('button', { name: 'Edit Video channel (#7)' })
   ).not.toBeInTheDocument()
 })
 
-test('saving locks channel selection and clears a replacement secret on success', async () => {
+test('saving prevents leaving the editor and returns to the list with credentials cleared', async () => {
   const user = userEvent.setup()
   let resolveSave: (
     value: Awaited<ReturnType<typeof api.put>>
@@ -980,17 +1085,22 @@ test('saving locks channel selection and clears a replacement secret on success'
       <AssetChannelSettingsDialog onClose={vi.fn()} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Second channel (#8)' })
-  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Second channel (#8)' })
+  )
   await user.type(
     await screen.findByLabelText('Secret key'),
     'replacement-secret'
   )
   await user.click(screen.getByRole('button', { name: 'Save' }))
   await waitFor(() => expect(put).toHaveBeenCalledOnce())
-  expect(screen.getByLabelText('Channel')).toBeDisabled()
+  expect(screen.getByRole('button', { name: 'Back to list' })).toBeDisabled()
   expect(screen.getByRole('button', { name: 'Saving...' })).toBeDisabled()
   expect(screen.getByLabelText('Upstream project name')).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Back to list' }))
+  await user.keyboard('{Escape}')
+  expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  expect(screen.getByLabelText('Secret key')).toHaveValue('replacement-secret')
   expect(api.post).not.toHaveBeenCalled()
   expect(put).toHaveBeenCalledWith(
     '/api/channel/8/assets',
@@ -1000,7 +1110,10 @@ test('saving locks channel selection and clears a replacement secret on success'
   resolveSave({
     data: { success: true, data: { ...channelConfigs[8], revision: 4 } },
   })
-  await waitFor(() => expect(screen.getByLabelText('Channel')).toBeEnabled())
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Second channel (#8)' })
+  )
+  await screen.findByLabelText('Secret key')
   expect(screen.getByLabelText('Secret key')).toHaveValue('')
   expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
 })
@@ -1018,8 +1131,9 @@ test('a failed channel save retains the draft and a blank saved secret is never 
       <AssetChannelSettingsDialog onClose={vi.fn()} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Second channel (#8)' })
-  await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Second channel (#8)' })
+  )
   await user.type(
     await screen.findByLabelText('Upstream project name'),
     '-draft'
@@ -1055,8 +1169,9 @@ test('closing a dirty channel requires confirmation and preserves input when can
       <AssetChannelSettingsDialog onClose={close} />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Video channel (#7)' })
-  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  )
   await user.type(
     await screen.findByLabelText('Upstream project name'),
     '-draft'

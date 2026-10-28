@@ -29,14 +29,18 @@ import { getServerErrorMessage } from '@/lib/server-error-message'
 
 import { assetQueryKeys, getAssetChannel } from '../api'
 import {
-  AssetChannelSelect,
+  AssetChannelList,
+  type AssetChannelListPosition,
   type AssetChannelSearch,
-} from './asset-channel-select'
+} from './asset-channel-list'
 import { ChannelAssetsForm } from './channel-assets-form'
 
 export function AssetChannelSettingsDialog(props: { onClose: () => void }) {
   const { t } = useTranslation()
   const [channel, setChannel] = useState<Channel | null>(null)
+  const [position, setPosition] = useState<AssetChannelListPosition | null>(
+    null
+  )
   const [search, setSearch] = useState<AssetChannelSearch>({
     draft: '',
     keyword: '',
@@ -55,9 +59,7 @@ export function AssetChannelSettingsDialog(props: { onClose: () => void }) {
         key={channel.id}
         channel={channel}
         config={query.data}
-        onChannelChange={setChannel}
-        search={search}
-        onSearchChange={setSearch}
+        onBack={() => setChannel(null)}
         onClose={props.onClose}
       />
     )
@@ -67,18 +69,33 @@ export function AssetChannelSettingsDialog(props: { onClose: () => void }) {
       open
       onOpenChange={(open) => !open && props.onClose()}
       title={t('Channel settings')}
+      description={channel ? `${channel.name} (#${channel.id})` : undefined}
+      descriptionClassName='break-words'
+      initialFocus={channel !== null || position === null}
       footer={
         <Button variant='outline' onClick={props.onClose}>
           {t('Close')}
         </Button>
       }
     >
-      <AssetChannelSelect
-        channel={channel}
-        onChange={setChannel}
-        search={search}
-        onSearchChange={setSearch}
-      />
+      {channel ? (
+        <Button variant='ghost' onClick={() => setChannel(null)}>
+          {t('Back to list')}
+        </Button>
+      ) : (
+        <AssetChannelList
+          onEdit={(selected, scrollTop) => {
+            setPosition({ channelId: selected.id, scrollTop })
+            setChannel(selected)
+          }}
+          search={search}
+          onSearchChange={(next) => {
+            setPosition(null)
+            setSearch(next)
+          }}
+          position={position}
+        />
+      )}
       {channel && query.isPending && <LoadingState />}
       {query.isError && (
         <ErrorState

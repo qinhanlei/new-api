@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useId, useState } from 'react'
+import { useId, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -55,26 +55,26 @@ import {
 } from '@/features/system-settings/components/settings-form-layout'
 import { handleServerError } from '@/lib/handle-server-error'
 
-import {
-  AssetChannelSelect,
-  type AssetChannelSearch,
-} from './asset-channel-select'
 import { AssetSecretDisclosure } from './asset-secret-disclosure'
 
 export function ChannelAssetsForm(props: {
   config: AssetChannelConfig
   channel: Channel
-  onChannelChange: (channel: Channel) => void
-  search: AssetChannelSearch
-  onSearchChange: (search: AssetChannelSearch) => void
+  onBack: () => void
   onClose: () => void
 }) {
   const { config, channel } = props
-  const [pendingChange, setPendingChange] = useState<Channel | 'close' | null>(
+  const [pendingChange, setPendingChange] = useState<'list' | 'close' | null>(
     null
   )
   const { t } = useTranslation()
   const id = useId()
+  const restoreFocus = useRef(true)
+  const returnToList = () => {
+    // The list restores its row focus after both editor dialogs unmount.
+    restoreFocus.current = false
+    props.onBack()
+  }
   const client = useQueryClient()
   const multiKey = isMultiKeyChannel(channel)
   const schema = assetChannelSchema(t, config.has_secret, multiKey)
@@ -114,6 +114,7 @@ export function ChannelAssetsForm(props: {
         },
         secret_key: '',
       })
+      returnToList()
     },
     onError: (error) => handleServerError(error),
     onSettled: (): void => mutation.reset(),
@@ -126,14 +127,14 @@ export function ChannelAssetsForm(props: {
       ...(authType === 'aksk' && secret_key ? { secret_key } : {}),
     })
   })
-  const requestChange = (target: Channel | 'close') => {
-    if (busy || (target !== 'close' && target.id === channel.id)) return
+  const requestChange = (target: 'list' | 'close') => {
+    if (busy) return
     if (form.formState.isDirty) {
       setPendingChange(target)
       return
     }
     if (target === 'close') props.onClose()
-    else props.onChannelChange(target)
+    else returnToList()
   }
   return (
     <>
@@ -141,7 +142,10 @@ export function ChannelAssetsForm(props: {
         open
         onOpenChange={(open) => !open && requestChange('close')}
         title={t('Channel settings')}
+        description={`${channel.name} (#${channel.id})`}
+        descriptionClassName='break-words'
         contentHeight='auto'
+        finalFocus={() => restoreFocus.current}
         footer={
           <>
             <Button
@@ -162,13 +166,13 @@ export function ChannelAssetsForm(props: {
         }
       >
         <div className='space-y-4'>
-          <AssetChannelSelect
-            channel={channel}
-            onChange={requestChange}
-            search={props.search}
-            onSearchChange={props.onSearchChange}
+          <Button
+            variant='ghost'
+            onClick={() => requestChange('list')}
             disabled={busy}
-          />
+          >
+            {t('Back to list')}
+          </Button>
           <Form {...form}>
             <form id={id} className='space-y-4' onSubmit={onSubmit}>
               {multiKey && (
@@ -378,6 +382,7 @@ export function ChannelAssetsForm(props: {
       </Dialog>
       <ConfirmDialog
         open={pendingChange !== null}
+        finalFocus={() => restoreFocus.current}
         onOpenChange={(open) => !open && setPendingChange(null)}
         title={t('Unsaved changes')}
         desc={t('You have unsaved changes. Are you sure you want to leave?')}
@@ -386,7 +391,7 @@ export function ChannelAssetsForm(props: {
           const target = pendingChange
           setPendingChange(null)
           if (target === 'close') props.onClose()
-          else if (target) props.onChannelChange(target)
+          else if (target === 'list') returnToList()
         }}
       />
     </>
