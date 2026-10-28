@@ -3,7 +3,9 @@ package middleware
 import (
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
+	"net/url"
 	"slices"
 
 	"github.com/QuantumNous/new-api/common"
@@ -109,11 +111,11 @@ func prepareTaskPluginAssets(c *gin.Context, plugin *jsplugin.LoadedPlugin, body
 // shared endpoint selects ordinary relay versus task-plugin handling. A model
 // declaration alone still does not change how requests without assets route.
 func probeTaskPluginAssets(c *gin.Context, endpoint jsplugin.PinnedEndpoint) (jsplugin.PinnedEndpoint, error) {
-	request, err := buildTaskPluginRouteRequest(c)
+	body, err := buildTaskPluginAssetProbeBody(c)
 	if err != nil {
 		return endpoint, err
 	}
-	expected, err := jsplugin.ReservedAssetReferences(request.Body)
+	expected, err := jsplugin.ReservedAssetReferences(body)
 	if err != nil {
 		return endpoint, err
 	}
@@ -122,20 +124,29 @@ func probeTaskPluginAssets(c *gin.Context, endpoint jsplugin.PinnedEndpoint) (js
 		return endpoint, nil
 	}
 	var accepted []jsplugin.ProtocolBinding
+	var rejected error
 	for _, candidate := range endpoint.Candidates {
-		ids, err := jsplugin.ExtractAssetReferences(c.Request.Context(), candidate.Plugin, request.Body, candidate.Protocol, candidate.Operation.Name, endpoint.Model, false)
-		if err != nil {
+		if err := c.Request.Context().Err(); err != nil {
 			return endpoint, err
 		}
-		if len(ids) == 0 {
+		ids, err := jsplugin.ExtractAssetReferences(c.Request.Context(), candidate.Plugin, body, candidate.Protocol, candidate.Operation.Name, endpoint.Model, false)
+		if canceled := c.Request.Context().Err(); canceled != nil {
+			return endpoint, canceled
+		}
+		if err != nil {
+			rejected = err
 			continue
 		}
 		if !slices.Equal(expected, ids) {
-			return endpoint, fmt.Errorf("Plugin asset references differ from the reserved gateway references")
+			rejected = fmt.Errorf("Plugin asset references differ from the reserved gateway references")
+			continue
 		}
 		accepted = append(accepted, candidate)
 	}
 	if len(accepted) == 0 {
+		if rejected != nil {
+			return endpoint, rejected
+		}
 		return endpoint, fmt.Errorf("No plugin supports the request's gateway asset references")
 	}
 	endpoint.Candidates = accepted
@@ -143,6 +154,51 @@ func probeTaskPluginAssets(c *gin.Context, endpoint jsplugin.PinnedEndpoint) (js
 	endpoint.Protocol = accepted[0].Protocol
 	endpoint.Operation = accepted[0].Operation
 	return endpoint, nil
+}
+
+// Asset probing precedes channel selection. Only a selected plugin may impose
+// its upload limits; ordinary relays retain their existing request limits.
+func buildTaskPluginAssetProbeBody(c *gin.Context) (any, error) {
+	mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err != nil {
+		request, requestErr := buildTaskPluginRouteRequest(c)
+		return request.Body, requestErr
+	}
+	switch mediaType {
+	case "application/x-www-form-urlencoded":
+		storage, err := common.GetBodyStorage(c)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := storage.Bytes()
+		if err != nil {
+			return nil, err
+		}
+		fields, err := url.ParseQuery(string(raw))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"kind": string(jsplugin.BodyForm), "fields": map[string][]string(fields)}, nil
+	case "multipart/form-data":
+		form, err := common.ParseMultipartFormReusable(c)
+		if err != nil {
+			return nil, err
+		}
+		defer form.RemoveAll()
+		files := make([]map[string]any, 0)
+		for field, headers := range form.File {
+			for index, header := range headers {
+				files = append(files, map[string]any{
+					"ref": jsplugin.FileReference(field, index), "field": field,
+					"filename": header.Filename, "mimeType": header.Header.Get("Content-Type"), "size": header.Size,
+				})
+			}
+		}
+		return map[string]any{"kind": string(jsplugin.BodyMultipart), "fields": form.Value, "files": files}, nil
+	default:
+		request, err := buildTaskPluginRouteRequest(c)
+		return request.Body, err
+	}
 }
 
 func abortTaskAssetError(c *gin.Context, err error) {

@@ -386,6 +386,7 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 			}
 			// Gateway references require plugin handling. Normalize all
 			// candidates before distribution can enqueue replica preparation.
+			c.Set(pluginruntime.ContextKeyPinnedEndpoint, endpoint)
 			pinEndpoint(c)
 			return
 		}
@@ -452,11 +453,18 @@ func lookupTaskPluginEndpoint(generation *pluginruntime.RoutingGeneration, metho
 // through so the existing endpoint remains responsible for its validation.
 func PinTaskPluginEndpoint() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		pinnedValue, _ := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
+		pinnedEndpoint, found := pinnedValue.(pluginruntime.PinnedEndpoint)
 		generation := pluginruntime.DefaultRegistry.Generation()
 		if value, exists := c.Get(contextKeyTaskPluginEndpointSelection); exists {
 			if selected, ok := value.(taskPluginEndpointSelection); ok {
 				generation = selected.Generation
 			}
+		}
+		if found {
+			// The asset probe already narrowed this request's candidates.
+			// Keep that generation and subset through preparation and retries.
+			generation = pinnedEndpoint.Generation
 		}
 		if generation == nil {
 			c.Next()
@@ -478,7 +486,9 @@ func PinTaskPluginEndpoint() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		pinnedEndpoint, found := lookupTaskPluginEndpoint(generation, c.Request.Method, c.Request.URL.Path, claimedModel)
+		if !found {
+			pinnedEndpoint, found = lookupTaskPluginEndpoint(generation, c.Request.Method, c.Request.URL.Path, claimedModel)
+		}
 		if !found {
 			c.Set(contextKeyTaskPluginEndpointModel, *modelRequest)
 			c.Next()

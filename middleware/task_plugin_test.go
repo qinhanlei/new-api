@@ -2049,6 +2049,7 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 	require.NoError(t, appI18n.Init())
 	for _, tc := range []struct {
 		name, alpha, beta string
+		probe             string
 		wantKeys          []string
 		wantError         string
 		assets            bool
@@ -2062,13 +2063,20 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 		{name: "rewritten model is excluded", alpha: `return {model:"another-model"}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
 		{name: "asset candidate cannot drop references", assets: true, alpha: `return {model:ctx.model,requestBody:{}}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
 		{name: "asset candidate cannot invent references", assets: true, alpha: `return {model:ctx.model,requestBody:{asset:"asset://asset-na-other"}}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
+		{name: "asset probe failure excludes only that candidate", assets: true, probe: `throw new Error("unsupported reference field")`, alpha: `return {model:ctx.model,requestBody:ctx.body.value}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
+		{name: "asset probe cannot invent references", assets: true, probe: `return ["asset-na-other"]`, alpha: `return {model:ctx.model,requestBody:ctx.body.value}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
+		{name: "asset probe cannot drop references", assets: true, probe: `return []`, alpha: `return {model:ctx.model,requestBody:ctx.body.value}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, spec := range []struct{ key, decode string }{{"decode-alpha", tc.alpha}, {"decode-beta", tc.beta}} {
 				source := taskResponsesPluginSource(spec.key, 0, `["decode-shared-model"]`, `["sync"]`, `renderFinal:function(){return {};}`, spec.decode)
 				if tc.assets {
-					source = strings.Replace(source, `fetchMode: "per_task",`, `fetchMode: "per_task", requiredCapabilities:["asset-references@1"],`, 1) + `
-export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx.body.value.asset.slice(8)] : []; }`
+					probe := ""
+					if spec.key == "decode-alpha" {
+						probe = tc.probe
+					}
+					source = strings.Replace(source, `fetchMode: "per_task",`, `fetchMode: "per_task", requiredCapabilities:["asset-references@1"],`, 1) + fmt.Sprintf(`
+export function extractAssetReferences(ctx) { if (!ctx.normalized) { %s }; return ctx.body.value.asset ? [ctx.body.value.asset.slice(8)] : []; }`, probe)
 				}
 				_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
 				require.NoError(t, err)
@@ -2076,11 +2084,11 @@ export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx
 			}
 			var gotKeys []string
 			router := gin.New()
-			router.POST("/v1/responses", func(c *gin.Context) {
-				if tc.assets {
-					c.Set(jsplugin.ContextKeyAssetReferences, []string{"asset-na-original"})
-				}
-			}, PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			entry := PinTaskPluginEndpoint()
+			if tc.assets {
+				entry = RouteTaskPluginEndpoint()
+			}
+			router.POST("/v1/responses", entry, PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 				pinned := c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint)
 				for _, candidate := range pinned.Candidates {
 					gotKeys = append(gotKeys, candidate.Plugin.Meta.Key)
@@ -2102,6 +2110,155 @@ export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx
 			} else {
 				assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
 				assert.Equal(t, tc.wantKeys, gotKeys)
+			}
+		})
+	}
+}
+
+func TestRouteTaskPluginAssetProbePreservesOrdinaryBody(t *testing.T) {
+	require.NoError(t, appI18n.Init())
+	previousFileLimit, previousBodyLimit := constant.MaxFileDownloadMB, constant.MaxRequestBodyMB
+	constant.MaxFileDownloadMB, constant.MaxRequestBodyMB = 1, 4
+	t.Cleanup(func() { constant.MaxFileDownloadMB, constant.MaxRequestBodyMB = previousFileLimit, previousBodyLimit })
+	for _, tc := range []struct {
+		name       string
+		assets     []string
+		fileSize   int
+		fileCount  int
+		fieldCount int
+		wantStatus int
+	}{
+		{name: "ordinary large file", fileSize: 2 << 20, fileCount: 1},
+		{name: "ordinary repeated files and fields", fileSize: 4, fileCount: maxTaskPluginFiles + 1, fieldCount: maxTaskPluginFormFields + 1},
+		{name: "reserved URI in file contents is opaque", fileSize: 32, fileCount: 1},
+		{name: "unclaimed reference is rejected", assets: []string{"asset://asset-na-unclaimed"}, wantStatus: http.StatusBadRequest},
+		{name: "invalid reference is rejected", assets: []string{"asset://asset-na-invalid/path"}, wantStatus: http.StatusBadRequest},
+		{name: "total body limit remains enforced", fileSize: 5 << 20, fileCount: 1, wantStatus: http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			require.NoError(t, writer.WriteField("model", "ordinary-asset-probe-model"))
+			for i := range tc.fieldCount {
+				require.NoError(t, writer.WriteField("tag", fmt.Sprint(i)))
+			}
+			for _, asset := range tc.assets {
+				require.NoError(t, writer.WriteField("reference", asset))
+			}
+			for i := range tc.fileCount {
+				file, err := writer.CreateFormFile("image", fmt.Sprintf("%d.png", i))
+				require.NoError(t, err)
+				content := bytes.Repeat([]byte{'x'}, tc.fileSize)
+				if tc.name == "reserved URI in file contents is opaque" {
+					content = []byte("asset://asset-na-file-payload")
+				}
+				_, err = file.Write(content)
+				require.NoError(t, err)
+			}
+			require.NoError(t, writer.Close())
+			reached := false
+			router := gin.New()
+			router.POST("/v1/images/edits", RouteTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+				reached = true
+				raw, err := io.ReadAll(c.Request.Body)
+				require.NoError(t, err)
+				assert.Equal(t, body.Bytes(), raw)
+				form, err := common.ParseMultipartFormReusable(c)
+				require.NoError(t, err)
+				defer form.RemoveAll()
+				assert.Len(t, form.Value["tag"], tc.fieldCount)
+				assert.Len(t, form.File["image"], tc.fileCount)
+				_, pinned := c.Get(jsplugin.ContextKeyPinnedEndpoint)
+				assert.False(t, pinned)
+				c.Status(http.StatusNoContent)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(body.Bytes()))
+			request.Header.Set("Content-Type", writer.FormDataContentType())
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			status := tc.wantStatus
+			if status == 0 {
+				status = http.StatusNoContent
+			}
+			assert.Equal(t, status, recorder.Code, recorder.Body.String())
+			assert.Equal(t, status == http.StatusNoContent, reached)
+			if status == http.StatusBadRequest {
+				assert.Contains(t, recorder.Body.String(), "InvalidAssetReference")
+			}
+		})
+	}
+}
+
+func TestRouteTaskPluginAssetProbeMultipartContract(t *testing.T) {
+	require.NoError(t, appI18n.Init())
+	previousLimit := constant.MaxFileDownloadMB
+	constant.MaxFileDownloadMB = 1
+	t.Cleanup(func() { constant.MaxFileDownloadMB = previousLimit })
+	source := taskProtocolPluginSource("asset-multipart-probe", "1.0.0", `["asset-multipart-model"]`, "/v1/videos", `return {model:ctx.model, requestBody:{refs:JSON.parse(ctx.body.fields.references[0])}};`)
+	source = strings.Replace(source, `fetchMode: "per_task",`, `fetchMode: "per_task", requiredCapabilities:["asset-references@1"],`, 1) + `
+export function extractAssetReferences(ctx) {
+  if (ctx.normalized) return ctx.body.value.refs.map(value => value.slice(8));
+  if (ctx.body.kind !== "multipart" || ctx.body.fields.tag.join(",") !== "one,two" || ctx.body.files.length !== 2) throw new Error("incomplete multipart body");
+  for (let i = 0; i < 2; i++) {
+    const file = ctx.body.files[i];
+    if (file.field !== "image" || file.ref !== "request_file:image" + (i ? "#1" : "") || file.filename !== i + ".png" || file.mimeType !== "application/octet-stream" || file.size < 3) throw new Error("incomplete file metadata");
+  }
+  return JSON.parse(ctx.body.fields.references[0]).map(value => value.slice(8));
+}`
+	_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister("asset-multipart-probe")) })
+	for _, tc := range []struct {
+		name       string
+		fileSize   int
+		references int
+		cancel     bool
+		wantError  string
+	}{
+		{name: "metadata and repeated fields reach the hook", fileSize: 3, references: 1},
+		{name: "plugin upload limit remains enforced", fileSize: 2 << 20, references: 1, wantError: "multipart file exceeds 1 MB"},
+		{name: "reserved references remain bounded", fileSize: 3, references: 33, wantError: "InvalidAssetReference"},
+		{name: "canceled probe stops preparation", fileSize: 3, references: 1, cancel: true, wantError: "InvalidAssetReference"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			require.NoError(t, writer.WriteField("model", "asset-multipart-model"))
+			require.NoError(t, writer.WriteField("tag", "one"))
+			require.NoError(t, writer.WriteField("tag", "two"))
+			references := make([]string, tc.references)
+			for i := range references {
+				references[i] = fmt.Sprintf("asset://asset-na-%d", i)
+			}
+			encoded, err := common.Marshal(references)
+			require.NoError(t, err)
+			require.NoError(t, writer.WriteField("references", string(encoded)))
+			for i := range 2 {
+				file, err := writer.CreateFormFile("image", fmt.Sprintf("%d.png", i))
+				require.NoError(t, err)
+				_, err = file.Write(bytes.Repeat([]byte{'x'}, tc.fileSize))
+				require.NoError(t, err)
+			}
+			require.NoError(t, writer.Close())
+			router := gin.New()
+			router.POST("/v1/videos", RouteTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+				assert.Equal(t, []string{"asset-na-0"}, service.TaskAssetReferences(c))
+				c.Status(http.StatusNoContent)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/videos", bytes.NewReader(body.Bytes()))
+			request.Header.Set("Content-Type", writer.FormDataContentType())
+			if tc.cancel {
+				ctx, cancel := context.WithCancel(request.Context())
+				cancel()
+				request = request.WithContext(ctx)
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if tc.wantError != "" {
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+				assert.Contains(t, recorder.Body.String(), tc.wantError)
+			} else {
+				assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
 			}
 		})
 	}
@@ -2171,6 +2328,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 						pluginPriority                                                      int64
 						pluginOnly, wantPlugin                                              bool
 						multipart, stream                                                   bool
+						largeUpload, probeRejects                                           bool
 						pinOrdinary, pinPlugin                                              bool
 						wrongGroup, wrongModel                                              bool
 						disabled, unrelated                                                 bool
@@ -2200,6 +2358,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 						{name: "mapped plugin alias remains usable", model: "friendly-image", mapped: true, pluginOnly: true, wantPlugin: true},
 						{name: "ordinary alias is not rewritten by plugin", model: "friendly-image", mapped: true, decoderRejects: true},
 						{name: "ordinary multipart edits are preserved", path: "/v1/images/edits", multipart: true, decoderRejects: true},
+						{name: "ordinary multipart keeps its upload limit", path: "/v1/images/edits", multipart: true, largeUpload: true, decoderRejects: true},
 						{name: "plugin multipart edits remain usable", path: "/v1/images/edits", multipart: true, pluginOnly: true, wantPlugin: true},
 						{name: "ordinary Responses bypass unsupported plugin mode", path: "/v1/responses", stream: true, syncOnly: true},
 						{name: "plugin Responses remain usable", path: "/v1/responses", pluginOnly: true, wantPlugin: true},
@@ -2219,6 +2378,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 						{name: "disabled storage fails before ordinary relay", path: "/v1/videos", assets: true, storageDisabled: true, wantStatus: http.StatusServiceUnavailable},
 						{name: "library assets preserve model restriction with pin", path: "/v1/videos", assets: true, modelDenied: true, pinPlugin: true, wantStatus: http.StatusForbidden},
 						{name: "old plugin cannot forward gateway asset namespace", path: "/v1/videos", assets: true, oldAssetPlugin: true, ordinaryPriority: 50, wantStatus: http.StatusBadRequest},
+						{name: "rejected asset probe stays excluded on retry", path: "/v1/videos", assets: true, shared: true, probeRejects: true, pluginPriority: 20, retry: true, wantPlugin: true},
 					} {
 						t.Run(tc.name, func(t *testing.T) {
 							for _, table := range tables {
@@ -2242,6 +2402,9 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							if tc.assets && !tc.oldAssetPlugin {
 								source = strings.Replace(source, `fetchMode: "per_task",`, `fetchMode: "per_task", requiredCapabilities:["asset-references@1"],`, 1) + `
 export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx.body.value.asset.slice(8)] : []; }`
+								if tc.probeRejects {
+									source = strings.Replace(source, `return ctx.body.value.asset ?`, `if (!ctx.normalized) throw new Error("unsupported reference"); return ctx.body.value.asset ?`, 1)
+								}
 							}
 							if tc.syncOnly {
 								source = taskResponsesPluginSource(key, 0, `["channel-route-model"]`, `["sync"]`, `renderFinal: function() { return {}; },`, decode)
@@ -2291,6 +2454,11 @@ export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx
 								if tc.shared {
 									const alternateKey = "channel-route-ztest"
 									alternateSource := taskProtocolPluginSource(alternateKey, "1.0.0", `["channel-route-model"]`, path, `return {model: ctx.model, requestBody: {normalized: true}};`)
+									if tc.assets {
+										alternateSource = strings.Replace(alternateSource, `requestBody: {normalized: true}`, `requestBody: ctx.body.value`, 1)
+										alternateSource = strings.Replace(alternateSource, `fetchMode: "per_task",`, `fetchMode: "per_task", requiredCapabilities:["asset-references@1"],`, 1) + `
+export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx.body.value.asset.slice(8)] : []; }`
+									}
 									_, err := jsplugin.DefaultRegistry.Register(alternateSource, jsplugin.Options{})
 									require.NoError(t, err)
 									t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(alternateKey)) })
@@ -2340,6 +2508,13 @@ export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx
 								require.NoError(t, err)
 								_, err = file.Write([]byte("image bytes"))
 								require.NoError(t, err)
+								if tc.largeUpload {
+									previousLimit := constant.MaxFileDownloadMB
+									constant.MaxFileDownloadMB = 1
+									t.Cleanup(func() { constant.MaxFileDownloadMB = previousLimit })
+									_, err = file.Write(bytes.Repeat([]byte{'x'}, 2<<20))
+									require.NoError(t, err)
+								}
 								require.NoError(t, writer.Close())
 								body, contentType = form.Bytes(), writer.FormDataContentType()
 							}
