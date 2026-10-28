@@ -4420,6 +4420,7 @@
     "Only successful requests count toward this limit.": "Only successful requests count toward this limit.",
     "Only the changes listed here will be committed. If any write fails, none of these changes are applied.": "Only the changes listed here will be committed. If any write fails, none of these changes are applied.",
     "Only the default moderation strategy is supported": "Only the default moderation strategy is supported",
+    "Only the first {{limit}} assets can be browsed. Filter by name to narrow the results.": "Only the first {{limit}} assets can be browsed. Filter by name to narrow the results.",
     "Only the first {{shown}} IDs were recorded": "Only the first {{shown}} IDs were recorded",
     "Only the first {{shown}} IDs were recorded ({{total}} requested)": "Only the first {{shown}} IDs were recorded ({{total}} requested)",
     "Only the last {{value}} log files will be retained; the rest will be deleted.": "Only the last {{value}} log files will be retained; the rest will be deleted.",

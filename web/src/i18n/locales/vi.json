@@ -4420,6 +4420,7 @@
     "Only successful requests count toward this limit.": "Chỉ những yêu cầu thành công mới được tính vào giới hạn này.",
     "Only the changes listed here will be committed. If any write fails, none of these changes are applied.": "Chỉ lưu các thay đổi được liệt kê. Nếu bất kỳ thao tác ghi nào thất bại, không thay đổi nào được áp dụng.",
     "Only the default moderation strategy is supported": "Chỉ hỗ trợ chính sách kiểm duyệt mặc định",
+    "Only the first {{limit}} assets can be browsed. Filter by name to narrow the results.": "Chỉ có thể duyệt {{limit}} tài nguyên đầu tiên. Lọc theo tên để thu hẹp kết quả.",
     "Only the first {{shown}} IDs were recorded": "Chỉ ghi nhận {{shown}} ID đầu tiên",
     "Only the first {{shown}} IDs were recorded ({{total}} requested)": "Chỉ ghi nhận {{shown}} ID đầu tiên (đã yêu cầu {{total}})",
     "Only the last {{value}} log files will be retained; the rest will be deleted.": "Chỉ giữ lại {{value}} tệp nhật ký gần nhất; phần còn lại sẽ bị xóa.",

@@ -680,6 +680,174 @@ test.each(['Rename', 'Delete group', 'Add asset'])(
   }
 )
 
+test('asset pagination keeps the true total while limiting page navigation and resetting page size', async () => {
+  const user = userEvent.setup()
+  const post = vi
+    .spyOn(api, 'post')
+    .mockImplementation(async (_url, body, options) => {
+      if (
+        (options?.params as { Action?: string } | undefined)?.Action ===
+        'ListAssetGroups'
+      ) {
+        return { data: { success: true, data: { Items: [group] } } }
+      }
+      const { PageNumber, PageSize } = body as {
+        PageNumber: number
+        PageSize: number
+      }
+      if (PageNumber * PageSize > 20_000) {
+        return {
+          data: { success: false, message: 'Pagination limit exceeded' },
+        }
+      }
+      return {
+        data: {
+          success: true,
+          data: { Items: [replicaAsset], TotalCount: 25_001 },
+        },
+      }
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetBrowser project='default' scope={{}} admin={false} />
+    </QueryClientProvider>
+  )
+  await screen.findByText('Avatar')
+  expect(screen.getByText('25,001')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Go to last page' }))
+  await waitFor(() =>
+    expect(post).toHaveBeenLastCalledWith(
+      '/api/assets/actions',
+      expect.objectContaining({ PageNumber: 1000, PageSize: 20 }),
+      expect.anything()
+    )
+  )
+  await screen.findByText('Avatar')
+  expect(screen.getByRole('button', { name: 'Go to next page' })).toBeDisabled()
+  await user.click(screen.getByRole('combobox', { name: '' }))
+  await user.click(screen.getByRole('option', { name: '30' }))
+  await waitFor(() =>
+    expect(post).toHaveBeenLastCalledWith(
+      '/api/assets/actions',
+      expect.objectContaining({ PageNumber: 1, PageSize: 30 }),
+      expect.anything()
+    )
+  )
+  await screen.findByText('Avatar')
+  expect(
+    screen.getByText(
+      'Only the first 19,980 assets can be browsed. Filter by name to narrow the results.'
+    )
+  ).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Go to last page' }))
+  await waitFor(() =>
+    expect(post).toHaveBeenLastCalledWith(
+      '/api/assets/actions',
+      expect.objectContaining({ PageNumber: 666, PageSize: 30 }),
+      expect.anything()
+    )
+  )
+  await screen.findByText('Avatar')
+  expect(screen.getByRole('button', { name: 'Go to next page' })).toBeDisabled()
+  expect(screen.getByText('25,001')).toBeVisible()
+  expect(
+    screen.queryByText('Pagination limit exceeded')
+  ).not.toBeInTheDocument()
+})
+
+test('name filtering resets asset pagination and a shrinking result returns to a valid page', async () => {
+  const user = userEvent.setup()
+  let total = 61
+  const post = vi
+    .spyOn(api, 'post')
+    .mockImplementation(async (_url, body, options) => {
+      if (
+        (options?.params as { Action?: string } | undefined)?.Action ===
+        'ListAssetGroups'
+      ) {
+        return { data: { success: true, data: { Items: [group] } } }
+      }
+      const request = body as { PageNumber: number; Filter: { Name?: string } }
+      const count = request.Filter.Name === 'missing' ? 0 : total
+      return {
+        data: {
+          success: true,
+          data: {
+            Items:
+              count > 0 && request.PageNumber <= Math.ceil(count / 20)
+                ? [replicaAsset]
+                : [],
+            TotalCount: count,
+          },
+        },
+      }
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetBrowser project='default' scope={{}} admin={false} />
+    </QueryClientProvider>
+  )
+  await screen.findByText('Avatar')
+  await user.click(screen.getByRole('button', { name: 'Go to last page' }))
+  await waitFor(() =>
+    expect(post).toHaveBeenLastCalledWith(
+      '/api/assets/actions',
+      expect.objectContaining({ PageNumber: 4 }),
+      expect.anything()
+    )
+  )
+  await screen.findByText('Avatar')
+  await user.type(screen.getByPlaceholderText('Filter by name...'), 'Avatar')
+  await waitFor(() =>
+    expect(post).toHaveBeenLastCalledWith(
+      '/api/assets/actions',
+      expect.objectContaining({
+        PageNumber: 1,
+        Filter: expect.objectContaining({ Name: 'Avatar' }),
+      }),
+      expect.anything()
+    )
+  )
+  await screen.findByText('Avatar')
+  await user.click(screen.getByRole('button', { name: 'Go to last page' }))
+  await waitFor(() =>
+    expect(post).toHaveBeenLastCalledWith(
+      '/api/assets/actions',
+      expect.objectContaining({ PageNumber: 4 }),
+      expect.anything()
+    )
+  )
+  total = 21
+  await act(() => client.invalidateQueries({ queryKey: ['assets'] }))
+  await waitFor(() =>
+    expect(post).toHaveBeenLastCalledWith(
+      '/api/assets/actions',
+      expect.objectContaining({ PageNumber: 2 }),
+      expect.anything()
+    )
+  )
+  await screen.findByText('Avatar')
+  expect(screen.getByRole('button', { name: 'Go to next page' })).toBeDisabled()
+  await user.clear(screen.getByPlaceholderText('Filter by name...'))
+  await user.type(screen.getByPlaceholderText('Filter by name...'), 'missing')
+  expect(await screen.findByText('No assets')).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Go to previous page' })
+  ).toBeDisabled()
+  expect(screen.getByRole('button', { name: 'Go to next page' })).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Reset' }))
+  expect(await screen.findByText('Avatar')).toBeVisible()
+  expect(screen.getByPlaceholderText('Filter by name...')).toHaveValue('')
+  expect(post).toHaveBeenLastCalledWith(
+    '/api/assets/actions',
+    expect.objectContaining({
+      PageNumber: 1,
+      Filter: expect.objectContaining({ Name: '' }),
+    }),
+    expect.anything()
+  )
+})
+
 test('group deletion warns that all assets and their URIs are removed before confirmation', async () => {
   const user = userEvent.setup()
   let deleted = false

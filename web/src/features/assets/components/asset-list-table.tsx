@@ -34,11 +34,13 @@ import {
 import { Dialog } from '@/components/dialog'
 import { ErrorState } from '@/components/error-state'
 import { Button } from '@/components/ui/button'
+import { toIntlLocale } from '@/i18n/languages'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
   hasPermission,
 } from '@/lib/admin-permissions'
+import { formatNumber } from '@/lib/format'
 import { getServerErrorMessage } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -60,7 +62,7 @@ export function AssetListTable({
   toolbarProps?: DataTablePageProps<Asset>['toolbarProps']
   emptyState?: ReactNode
 }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const client = useQueryClient()
   const currentUser = useAuthStore((state) => state.auth.user)
   const canReadChannel =
@@ -71,11 +73,19 @@ export function AssetListTable({
       ADMIN_PERMISSION_ACTIONS.READ
     )
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: 20 })
+  const [name, setName] = useState('')
   const [deleting, setDeleting] = useState<Asset | null>(null)
   const [replicas, setReplicas] = useState<Asset | null>(null)
   const [preview, setPreview] = useState<Asset | null>(null)
   const query = useQuery({
-    queryKey: [...assetQueryKeys.all, 'list', group?.Id, scope, pagination],
+    queryKey: [
+      ...assetQueryKeys.all,
+      'list',
+      group?.Id,
+      scope,
+      name,
+      pagination,
+    ],
     enabled: Boolean(group),
     queryFn: ({ signal }) => {
       if (!group) return { Items: [], TotalCount: 0 }
@@ -83,7 +93,7 @@ export function AssetListTable({
         'ListAssets',
         {
           ProjectName: group.ProjectName,
-          Filter: { GroupType: 'AIGC', GroupIds: [group.Id] },
+          Filter: { GroupType: 'AIGC', GroupIds: [group.Id], Name: name },
           PageNumber: pagination.pageIndex + 1,
           PageSize: pagination.pageSize,
         },
@@ -198,23 +208,62 @@ export function AssetListTable({
       ),
     },
   ]
+  const totalCount = query.data?.TotalCount ?? 0
+  const maxPages = Math.floor(20_000 / pagination.pageSize)
+  const pageCount = Math.min(
+    Math.ceil(totalCount / pagination.pageSize),
+    maxPages
+  )
   const { table } = useDataTable({
     data: query.data?.Items ?? [],
     columns,
     columnFilters: [],
-    totalCount: query.data?.TotalCount ?? 0,
+    totalCount,
+    pageCount,
+    globalFilter: name,
+    onGlobalFilterChange: (updater) => {
+      setName((previous) =>
+        String(
+          (typeof updater === 'function' ? updater(previous) : updater) ?? ''
+        )
+      )
+      setPagination((previous) => ({ ...previous, pageIndex: 0 }))
+    },
     pagination,
-    onPaginationChange: setPagination,
+    onPaginationChange: (updater) => {
+      setPagination((previous) => {
+        const next = typeof updater === 'function' ? updater(previous) : updater
+        return {
+          ...next,
+          pageIndex: next.pageSize === previous.pageSize ? next.pageIndex : 0,
+        }
+      })
+    },
+    ensurePageInRange: (pages) => {
+      if (!query.data) return
+      setPagination((previous) => {
+        const pageIndex = Math.max(0, pages - 1)
+        return previous.pageIndex > pageIndex
+          ? { ...previous, pageIndex }
+          : previous
+      })
+    },
+    manualFiltering: true,
     manualPagination: true,
     manualSorting: true,
     enableSorting: false,
     enableRowSelection: false,
     getRowId: (asset) => asset.Id,
   })
+  const searchToolbarProps = {
+    ...toolbarProps,
+    searchPlaceholder: t('Filter by name...'),
+    searchDebounceMs: 300,
+  }
   if (!group || (query.isError && !query.data)) {
     return (
       <div className='flex h-full min-h-0 flex-col gap-3'>
-        <DataTableToolbar table={table} {...toolbarProps} />
+        <DataTableToolbar table={table} {...searchToolbarProps} />
         <div className='min-h-0 flex-1 overflow-auto'>
           {!group ? (
             emptyState
@@ -235,14 +284,29 @@ export function AssetListTable({
         columns={columns}
         isLoading={query.isPending}
         isFetching={query.isFetching}
-        toolbarProps={toolbarProps}
+        toolbarProps={searchToolbarProps}
         emptyTitle={t('No assets')}
         afterTable={
-          query.isError && (
-            <p role='alert' className='text-destructive text-sm'>
-              {getServerErrorMessage(query.error)}
-            </p>
-          )
+          <>
+            {totalCount > maxPages * pagination.pageSize && (
+              <p className='text-muted-foreground text-sm'>
+                {t(
+                  'Only the first {{limit}} assets can be browsed. Filter by name to narrow the results.',
+                  {
+                    limit: formatNumber(
+                      maxPages * pagination.pageSize,
+                      toIntlLocale(i18n.resolvedLanguage || i18n.language)
+                    ),
+                  }
+                )}
+              </p>
+            )}
+            {query.isError && (
+              <p role='alert' className='text-destructive text-sm'>
+                {getServerErrorMessage(query.error)}
+              </p>
+            )}
+          </>
         }
       />
       <ConfirmDialog

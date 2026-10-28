@@ -4420,6 +4420,7 @@
     "Only successful requests count toward this limit.": "成功したリクエストのみがこの制限にカウントされます。",
     "Only the changes listed here will be committed. If any write fails, none of these changes are applied.": "ここに記載した変更のみを保存します。書き込みが一つでも失敗すると、すべての変更を取り消します。",
     "Only the default moderation strategy is supported": "デフォルトの審査方式のみ対応しています",
+    "Only the first {{limit}} assets can be browsed. Filter by name to narrow the results.": "閲覧できるのは先頭の {{limit}} 件です。名前で絞り込んでください。",
     "Only the first {{shown}} IDs were recorded": "先頭の {{shown}} 件の ID のみ記録されています",
     "Only the first {{shown}} IDs were recorded ({{total}} requested)": "先頭の {{shown}} 件のみ記録されています（リクエスト：{{total}} 件）",
     "Only the last {{value}} log files will be retained; the rest will be deleted.": "最新の{{value}}個のログファイルのみ保持され、残りは削除されます。",

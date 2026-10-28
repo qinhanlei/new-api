@@ -4420,6 +4420,7 @@
     "Only successful requests count toward this limit.": "仅成功的请求计入此限制。",
     "Only the changes listed here will be committed. If any write fails, none of these changes are applied.": "仅提交此处列出的变更。任何写入失败，本次变更均不应用。",
     "Only the default moderation strategy is supported": "仅支持默认审核策略",
+    "Only the first {{limit}} assets can be browsed. Filter by name to narrow the results.": "仅可浏览前 {{limit}} 个素材，请按名称筛选以缩小范围。",
     "Only the first {{shown}} IDs were recorded": "仅记录前 {{shown}} 项 ID",
     "Only the first {{shown}} IDs were recorded ({{total}} requested)": "仅记录前 {{shown}} 项，共请求 {{total}} 项",
     "Only the last {{value}} log files will be retained; the rest will be deleted.": "将只保留最近 {{value}} 个日志文件，其余将被删除。",
