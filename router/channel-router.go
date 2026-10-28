@@ -48,6 +48,14 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 		middleware.SecureVerificationRequired(),
 		controller.GetChannelKey,
 	)
+	middleware.DeclareAccessTokenPermissionRoute(http.MethodPost, "/api/channel/:id/assets/secret", authz.ChannelSecretView)
+	channelRoute.POST("/:id/assets/secret",
+		middleware.RootAuth(),
+		middleware.RequirePermission(authz.ChannelSecretView),
+		middleware.CriticalRateLimit(),
+		middleware.DisableCache(),
+		controller.GetChannelAssetsSecret,
+	)
 
 	for _, route := range channelPermissionRoutes {
 		handlePermissionRoute(channelRoute, route.method, route.path, route.permission, route.handler)

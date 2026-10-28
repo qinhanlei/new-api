@@ -51,6 +51,7 @@ import {
   saveAssetStorage,
   testAssetStorage,
 } from '@/features/assets/api'
+import { AssetSecretDisclosure } from '@/features/assets/components/asset-secret-disclosure'
 import { assetStorageSchema } from '@/features/assets/lib/schemas'
 import {
   assetStoragePathStyle,
@@ -347,6 +348,7 @@ function AssetStorageForm(props: { config: AssetStorageConfig }) {
                     ? t('A secret is saved. Leave blank to keep it.')
                     : t('No secret is saved.')}
                 </FormDescription>
+                <AssetSecretDisclosure config={props.config} disabled={busy} />
                 <FormMessage />
               </FormItem>
             )}

@@ -17,16 +17,26 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
+import { toast } from 'sonner'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { channelSchema } from '@/features/channels/types'
 import { SettingsPageProvider } from '@/features/system-settings/components/settings-page-context'
 import { AssetStorageSection } from '@/features/system-settings/operations/asset-storage-section'
 import { api } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth-store'
 
+import { assetQueryKeys } from '../api'
 import { AssetChannelSettingsDialog } from '../components/asset-channel-settings-dialog'
 import type {
   AssetChannelConfig,
@@ -73,6 +83,22 @@ function StorageFixture() {
 }
 
 beforeEach(() => {
+  useAuthStore.getState().auth.setBundle({
+    access_token: 'asset-secret-test-session',
+    token_type: 'Bearer',
+    access_expires_at: Math.floor(Date.now() / 1000) + 3600,
+    user: { id: 1, username: 'root', role: 100 },
+    session: {
+      sid: 'asset-secret-session',
+      current: true,
+      login_method: 'password',
+      ip: '127.0.0.1',
+      user_agent: 'test',
+      created_at: 0,
+      last_active_at: 0,
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+    },
+  })
   channels = [channel, otherChannel]
   channelConfigs = {
     7: {
@@ -100,6 +126,19 @@ beforeEach(() => {
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
   vi.spyOn(api, 'get').mockImplementation(async (url, options) => {
+    if (url === '/api/verify/methods') {
+      return {
+        data: {
+          success: true,
+          data: {
+            scope: (options?.params as { scope: string } | undefined)?.scope,
+            methods: [{ method: 'password', available: true }],
+            oauth_providers: [],
+            password_encryption_enabled: false,
+          },
+        },
+      }
+    }
     if (url === '/api/option/asset_storage') {
       return { data: { success: true, data: config } }
     }
@@ -119,11 +158,339 @@ beforeEach(() => {
     const id = Number(String(url).split('/')[3])
     return { data: { success: true, data: channelConfigs[id] } }
   })
-  vi.spyOn(api, 'post').mockResolvedValue({
-    data: { success: true, data: {} },
+  vi.spyOn(api, 'post').mockImplementation(async (url, body) => {
+    if (url === '/api/verify') {
+      return {
+        data: {
+          success: true,
+          data: {
+            proof_token: 'asset-secret-proof',
+            method: 'password',
+            scope: (body as { scope: string }).scope,
+            expires_at: Math.floor(Date.now() / 1000) + 60,
+          },
+        },
+      }
+    }
+    if (String(url).endsWith('/secret')) {
+      return {
+        data: {
+          success: true,
+          data: {
+            secret_key:
+              url === '/api/option/asset_storage/secret'
+                ? 'saved-storage-secret'
+                : 'saved-channel-secret',
+          },
+        },
+      }
+    }
+    return { data: { success: true, data: {} } }
   })
 })
-afterEach(() => client.clear())
+afterEach(() => {
+  client.clear()
+  useAuthStore.getState().auth.reset()
+})
+
+async function renderSecretSettings(target: 'storage' | 'channel') {
+  const user = userEvent.setup()
+  const result = render(
+    <QueryClientProvider client={client}>
+      {target === 'storage' ? (
+        <StorageFixture />
+      ) : (
+        <AssetChannelSettingsDialog onClose={vi.fn()} />
+      )}
+    </QueryClientProvider>
+  )
+  if (target === 'channel') {
+    await screen.findByRole('option', { name: 'Second channel (#8)' })
+    await user.selectOptions(screen.getByLabelText('Channel'), '8')
+  }
+  await screen.findByLabelText('Secret key')
+  return { user, ...result }
+}
+
+test.each(['storage', 'channel'] as const)(
+  'root can verify and view a saved %s secret without saving or caching it',
+  async (target) => {
+    const put = vi.spyOn(api, 'put')
+    const { user } = await renderSecretSettings(target)
+    const secret = `saved-${target}-secret`
+    await user.type(screen.getByLabelText('Secret key'), 'replacement-draft')
+    await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+    await user.type(
+      await screen.findByLabelText('Password', { selector: 'input' }),
+      'reveal-password'
+    )
+    await user.click(screen.getByRole('button', { name: 'Verify' }))
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Saved secret key',
+    })
+    expect(
+      within(dialog).getByRole('textbox', { name: 'Saved secret key' })
+    ).toHaveValue(secret)
+    expect(
+      within(dialog).getByRole('textbox', { name: 'Saved secret key' })
+    ).toHaveAttribute('readonly')
+    expect(screen.getByLabelText('Secret key')).toHaveValue('replacement-draft')
+    expect(put).not.toHaveBeenCalled()
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/verify',
+      {
+        method: 'password',
+        password: 'reveal-password',
+        scope:
+          target === 'storage'
+            ? 'asset.storage.secret.read'
+            : 'channel.assets.secret.read',
+        ...(target === 'channel' ? { context: { channel_id: 8 } } : {}),
+      },
+      expect.anything()
+    )
+    expect(api.post).toHaveBeenCalledWith(
+      target === 'storage'
+        ? '/api/option/asset_storage/secret'
+        : '/api/channel/8/assets/secret',
+      undefined,
+      expect.objectContaining({
+        singleUseAuthorization: true,
+        headers: { 'X-Security-Proof': 'asset-secret-proof' },
+        signal: expect.any(AbortSignal),
+      })
+    )
+    expect(
+      JSON.stringify(
+        client
+          .getQueryCache()
+          .getAll()
+          .map((query) => query.state.data)
+      )
+    ).not.toContain(secret)
+    expect(client.getMutationCache().getAll()).toHaveLength(0)
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Copy to clipboard' })
+    )
+    expect(await navigator.clipboard.readText()).toBe(secret)
+    await user.click(within(dialog).getByRole('button', { name: 'Close' }))
+    expect(put).not.toHaveBeenCalled()
+    expect(
+      screen.queryByRole('textbox', { name: 'Saved secret key' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Copied' })
+    ).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+    expect(
+      await screen.findByLabelText('Password', { selector: 'input' })
+    ).toHaveValue('')
+    expect(
+      screen.queryByRole('textbox', { name: 'Saved secret key' })
+    ).not.toBeInTheDocument()
+  }
+)
+
+test('cancelling verification leaves the saved storage secret unread and the draft untouched', async () => {
+  const { user } = await renderSecretSettings('storage')
+  await user.type(screen.getByLabelText('Secret key'), 'keep-draft')
+  const trigger = screen.getByRole('button', { name: 'Verify to view' })
+  trigger.focus()
+  await user.keyboard('{Enter}')
+  await screen.findByLabelText('Password', { selector: 'input' })
+  await user.keyboard('{Escape}')
+  expect(api.post).not.toHaveBeenCalled()
+  expect(screen.getByLabelText('Secret key')).toHaveValue('keep-draft')
+  expect(trigger).toBeEnabled()
+  await waitFor(() => expect(trigger).toHaveFocus())
+})
+
+test('failed password verification does not request the saved secret or submit settings', async () => {
+  vi.mocked(api.post).mockResolvedValueOnce({
+    data: {
+      success: false,
+      code: 'SECURITY_VERIFICATION_FAILED',
+      message: 'Verification failed. Please try again.',
+    },
+  })
+  const put = vi.spyOn(api, 'put')
+  const { user } = await renderSecretSettings('storage')
+  await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+  await user.type(
+    await screen.findByLabelText('Password', { selector: 'input' }),
+    'wrong-password'
+  )
+  await user.click(screen.getByRole('button', { name: 'Verify' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Verification failed. Please try again.'
+  )
+  expect(api.post).toHaveBeenCalledTimes(1)
+  expect(put).not.toHaveBeenCalled()
+  expect(
+    screen.queryByRole('textbox', { name: 'Saved secret key' })
+  ).not.toBeInTheDocument()
+})
+
+test('a failed secret read reports the error and requires fresh verification', async () => {
+  const errorToast = vi.spyOn(toast, 'error').mockImplementation(() => 1)
+  const post = vi.mocked(api.post).getMockImplementation()
+  if (!post) throw new Error('Secret request fixture is missing')
+  vi.mocked(api.post).mockImplementation(async (url, ...args) => {
+    if (String(url).endsWith('/secret')) {
+      return { data: { success: false, message: 'No secret is saved.' } }
+    }
+    return post(url, ...args)
+  })
+  const { user } = await renderSecretSettings('storage')
+  await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+  await user.type(
+    await screen.findByLabelText('Password', { selector: 'input' }),
+    'reveal-password'
+  )
+  await user.click(screen.getByRole('button', { name: 'Verify' }))
+  await waitFor(() =>
+    expect(errorToast).toHaveBeenCalledWith('No secret is saved.')
+  )
+  expect(
+    screen.queryByRole('textbox', { name: 'Saved secret key' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+  expect(
+    await screen.findByLabelText('Password', { selector: 'input' })
+  ).toHaveValue('')
+})
+
+test.each(['close', 'unmount', 'revision', 'session', 'logout'] as const)(
+  '%s cancels a pending saved-secret read and ignores its late response',
+  async (change) => {
+    let resolveRead!: (response: {
+      data: { success: boolean; data: { secret_key: string } }
+    }) => void
+    const pending = new Promise<{
+      data: { success: boolean; data: { secret_key: string } }
+    }>((resolve) => {
+      resolveRead = resolve
+    })
+    const post = vi.mocked(api.post).getMockImplementation()
+    if (!post) throw new Error('Secret request fixture is missing')
+    let signal: AbortSignal | undefined
+    vi.mocked(api.post).mockImplementation(async (url, body, options) => {
+      if (String(url).endsWith('/secret')) {
+        signal = options?.signal as AbortSignal
+        return pending
+      }
+      return post(url, body, options)
+    })
+    const { user, unmount } = await renderSecretSettings('storage')
+    await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+    await user.type(
+      await screen.findByLabelText('Password', { selector: 'input' }),
+      'reveal-password'
+    )
+    await user.click(screen.getByRole('button', { name: 'Verify' }))
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Saved secret key',
+    })
+    expect(within(dialog).getByText('Loading...')).toBeVisible()
+    if (change === 'close') {
+      await user.click(within(dialog).getByRole('button', { name: 'Close' }))
+    } else if (change === 'unmount') {
+      unmount()
+    } else {
+      act(() => {
+        if (change === 'revision') {
+          client.setQueryData(assetQueryKeys.storage, {
+            ...config,
+            revision: 3,
+          })
+        } else if (change === 'logout') useAuthStore.getState().auth.reset()
+        else {
+          const auth = useAuthStore.getState().auth
+          if (!auth.session) throw new Error('Login session fixture is missing')
+          useAuthStore.setState({
+            auth: { ...auth, session: { ...auth.session, sid: 'new-session' } },
+          })
+        }
+      })
+    }
+    await waitFor(() => expect(signal?.aborted).toBe(true))
+    await act(async () => {
+      resolveRead({
+        data: { success: true, data: { secret_key: 'late-secret' } },
+      })
+    })
+    expect(
+      screen.queryByRole('textbox', { name: 'Saved secret key' })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText('late-secret')).not.toBeInTheDocument()
+  }
+)
+
+test('changing channels after disclosure requires verification for the newly selected channel', async () => {
+  channelConfigs[7] = {
+    ...channelConfigs[7],
+    auth_type: 'aksk',
+    has_secret: true,
+  }
+  const { user } = await renderSecretSettings('channel')
+  await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+  await user.type(
+    await screen.findByLabelText('Password', { selector: 'input' }),
+    'reveal-password'
+  )
+  await user.click(screen.getByRole('button', { name: 'Verify' }))
+  const dialog = await screen.findByRole('dialog', { name: 'Saved secret key' })
+  await user.click(within(dialog).getByRole('button', { name: 'Close' }))
+  await user.selectOptions(screen.getByLabelText('Channel'), '7')
+  await screen.findByLabelText('Secret key')
+  expect(
+    screen.queryByRole('textbox', { name: 'Saved secret key' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+  await user.type(
+    await screen.findByLabelText('Password', { selector: 'input' }),
+    'reveal-password'
+  )
+  await user.click(screen.getByRole('button', { name: 'Verify' }))
+  await screen.findByRole('textbox', { name: 'Saved secret key' })
+  expect(api.post).toHaveBeenLastCalledWith(
+    '/api/channel/7/assets/secret',
+    undefined,
+    expect.anything()
+  )
+  expect(api.post).toHaveBeenCalledWith(
+    '/api/verify',
+    expect.objectContaining({ context: { channel_id: 7 } }),
+    expect.anything()
+  )
+})
+
+test.each(['no saved secret', 'non-root'] as const)(
+  '%s has no saved-secret disclosure action',
+  async (condition) => {
+    if (condition === 'non-root') {
+      useAuthStore
+        .getState()
+        .auth.setUser({ id: 1, username: 'admin', role: 10 })
+    } else {
+      const get = vi.mocked(api.get).getMockImplementation()
+      if (!get) throw new Error('Storage request fixture is missing')
+      vi.mocked(api.get).mockImplementation(async (url, ...args) => {
+        if (url === '/api/option/asset_storage') {
+          return {
+            data: { success: true, data: { ...config, has_secret: false } },
+          }
+        }
+        return get(url, ...args)
+      })
+    }
+    await renderSecretSettings('storage')
+    expect(
+      screen.queryByRole('button', { name: 'Verify to view' })
+    ).not.toBeInTheDocument()
+    expect(api.post).not.toHaveBeenCalled()
+  }
+)
 
 test('saving storage needs no verification and preserves a saved secret when blank', async () => {
   const user = userEvent.setup()

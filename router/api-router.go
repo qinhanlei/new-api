@@ -213,6 +213,7 @@ func SetApiRouter(router *gin.Engine) {
 		optionRoute.Use(middleware.RootAuth())
 		{
 			optionRoute.GET("/asset_storage", middleware.DisableCache(), controller.GetAssetStorage)
+			optionRoute.POST("/asset_storage/secret", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.GetAssetStorageSecret)
 			optionRoute.PUT("/asset_storage", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.UpdateAssetStorage)
 			optionRoute.POST("/asset_storage/test", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.TestAssetStorage)
 			optionRoute.GET("/", controller.GetOptions)

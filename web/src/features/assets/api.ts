@@ -119,6 +119,23 @@ export async function getAssetStorage(signal?: AbortSignal) {
   return requireServerSuccess(data).data
 }
 
+export async function getAssetStorageSecret(
+  proofToken: string,
+  signal?: AbortSignal
+) {
+  const { data } = await api.post<AssetResponse<{ secret_key: string }>>(
+    '/api/option/asset_storage/secret',
+    undefined,
+    {
+      ...authRequestOptions,
+      headers: { 'X-Security-Proof': proofToken },
+      singleUseAuthorization: true,
+      signal,
+    }
+  )
+  return requireServerSuccess(data).data.secret_key
+}
+
 export async function saveAssetStorage(values: AssetStorageUpdate) {
   const { data } = await api.put<AssetResponse<AssetStorageConfig>>(
     '/api/option/asset_storage',
@@ -143,6 +160,24 @@ export async function getAssetChannel(id: number, signal?: AbortSignal) {
     { ...authRequestOptions, signal }
   )
   return requireServerSuccess(data).data
+}
+
+export async function getAssetChannelSecret(
+  id: number,
+  proofToken: string,
+  signal?: AbortSignal
+) {
+  const { data } = await api.post<AssetResponse<{ secret_key: string }>>(
+    `/api/channel/${id}/assets/secret`,
+    undefined,
+    {
+      ...authRequestOptions,
+      headers: { 'X-Security-Proof': proofToken },
+      singleUseAuthorization: true,
+      signal,
+    }
+  )
+  return requireServerSuccess(data).data.secret_key
 }
 
 export async function saveAssetChannel(id: number, values: AssetChannelUpdate) {

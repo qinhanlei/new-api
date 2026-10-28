@@ -121,6 +121,202 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
 	return user, identity
 }
 
+func TestAssetSecretDisclosureRequiresBoundSingleUseProof(t *testing.T) {
+	previousPasswordLogin := common.PasswordLoginEnabled
+	common.PasswordLoginEnabled = true
+	t.Cleanup(func() { common.PasswordLoginEnabled = previousPasswordLogin })
+	for _, endpoint := range []struct {
+		name, route, path, option, scope, context, grant, audit string
+		read, reveal                                            gin.HandlerFunc
+	}{
+		{"storage", "/api/option/asset_storage", "/api/option/asset_storage", system_setting.AssetStorageOption,
+			service.VerificationScopeAssetStorageSecretRead, `{}`, "option:write", "asset.storage.secret_view", GetAssetStorage, GetAssetStorageSecret},
+		{"channel", "/api/channel/:id/assets", "/api/channel/7/assets", model.AssetChannelOptionKey(7),
+			service.VerificationScopeChannelAssetsSecretRead, `{"channel_id":7}`, "channel:secret_view", "channel.assets.secret_view", GetChannelAssets, GetChannelAssetsSecret},
+	} {
+		t.Run(endpoint.name, func(t *testing.T) {
+			user, identity := setupSecurityEnrollmentTest(t)
+			require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
+			require.NoError(t, model.PublishUserAuthCache(user.Id))
+			stored := model.Option{Key: endpoint.option, Value: `{"revision":3,"secret_key":"saved-asset-secret","cursor_secret":"private-cursor-secret"}`}
+			require.NoError(t, model.DB.Create(&stored).Error)
+			token, _, err := service.IssueAccessToken(identity)
+			require.NoError(t, err)
+			operation := service.VerificationOperation{Scope: endpoint.scope, Context: []byte(endpoint.context)}
+			engine := gin.New()
+			engine.Use(middleware.RootAuth(), middleware.DisableCache())
+			if endpoint.name == "channel" {
+				middleware.DeclareAccessTokenPermissionRoute(http.MethodGet, endpoint.route, authz.ChannelRead)
+				middleware.DeclareAccessTokenPermissionRoute(http.MethodPost, endpoint.route+"/secret", authz.ChannelSecretView)
+				engine.POST(endpoint.route+"/secret", middleware.RequirePermission(authz.ChannelSecretView), endpoint.reveal)
+			} else {
+				engine.POST(endpoint.route+"/secret", endpoint.reveal)
+			}
+			engine.GET(endpoint.route, endpoint.read)
+			request := func(method, path, credential, proof string) *httptest.ResponseRecorder {
+				r := httptest.NewRequest(method, path, nil)
+				if credential != "" {
+					r.Header.Set("Authorization", "Bearer "+credential)
+				}
+				r.Header.Set("X-Security-Proof", proof)
+				response := httptest.NewRecorder()
+				engine.ServeHTTP(response, r)
+				return response
+			}
+
+			response := request(http.MethodGet, endpoint.path, token, "")
+			require.Equal(t, http.StatusOK, response.Code)
+			assert.Contains(t, response.Body.String(), `"has_secret":true`)
+			assert.NotContains(t, response.Body.String(), "secret_key")
+			assert.NotContains(t, response.Body.String(), "private-cursor-secret")
+
+			expired := issueSecurityEnrollmentProof(t, identity, operation, "password")
+			require.NoError(t, model.DB.Model(&model.AuthFlow{}).Where("purpose = ?", model.AuthFlowPurposeSecurityProof).Update("expires_at", time.Now().Add(-time.Minute)).Error)
+			proof, err := service.VerifySecurityInput(identity, service.VerificationInput{Scope: endpoint.scope, Context: operation.Context, Method: "password", Password: "enrollment-password"})
+			require.NoError(t, err)
+			otherAction := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: service.VerificationScopePasskeyRegister}, "password")
+			otherSession, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "other-asset-secret-session")
+			require.NoError(t, err)
+			readOnly, readToken := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "option:read", "channel:read")
+			readIdentity := service.AuthIdentity{UserID: user.Id, SessionID: model.AccessTokenSessionID(readToken.Id), UserAuthVersion: user.AuthVersion, SessionVersion: model.AccessTokenSessionVersion}
+			_, err = service.GetVerificationRequirements(readIdentity, endpoint.scope)
+			assert.ErrorIs(t, err, service.ErrVerificationForbidden)
+
+			for _, test := range []struct {
+				name, credential, proof, code string
+				role, status                  int
+			}{
+				{"anonymous", "", "", "AUTH_UNAUTHORIZED", common.RoleRootUser, http.StatusUnauthorized},
+				{"ordinary user", token, proof.ProofToken, "AUTH_INSUFFICIENT_PRIVILEGE", common.RoleCommonUser, http.StatusForbidden},
+				{"administrator", token, proof.ProofToken, "AUTH_INSUFFICIENT_PRIVILEGE", common.RoleAdminUser, http.StatusForbidden},
+				{"read-only PAT", readOnly, proof.ProofToken, "ACCESS_TOKEN_SCOPE_DENIED", common.RoleRootUser, http.StatusForbidden},
+				{"missing proof", token, "", "SECURITY_PROOF_REQUIRED", common.RoleRootUser, http.StatusForbidden},
+				{"expired proof", token, expired, "SECURITY_PROOF_EXPIRED", common.RoleRootUser, http.StatusForbidden},
+				{"wrong scope", token, otherAction, "SECURITY_PROOF_SCOPE_MISMATCH", common.RoleRootUser, http.StatusForbidden},
+				{"wrong session", otherSession.AccessToken, proof.ProofToken, "SECURITY_PROOF_INVALID", common.RoleRootUser, http.StatusForbidden},
+				{"verified session", token, proof.ProofToken, "", common.RoleRootUser, http.StatusOK},
+				{"replayed proof", token, proof.ProofToken, "SECURITY_PROOF_CONSUMED", common.RoleRootUser, http.StatusForbidden},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					require.NoError(t, model.DB.Model(user).Update("role", test.role).Error)
+					require.NoError(t, model.PublishUserAuthCache(user.Id))
+					if test.role != common.RoleRootUser {
+						_, err := service.GetVerificationRequirements(identity, endpoint.scope)
+						assert.ErrorIs(t, err, service.ErrVerificationForbidden)
+					}
+					response := request(http.MethodPost, endpoint.path+"/secret", test.credential, test.proof)
+					require.Equal(t, test.status, response.Code, response.Body.String())
+					var body securityEnrollmentResponse
+					require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+					if test.status == http.StatusOK {
+						assert.JSONEq(t, `{"secret_key":"saved-asset-secret"}`, string(body.Data))
+						assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+					} else {
+						assert.Equal(t, test.code, body.Code)
+						assert.NotContains(t, response.Body.String(), "saved-asset-secret")
+					}
+				})
+			}
+			if endpoint.name == "channel" {
+				otherChannel := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: endpoint.scope, Context: []byte(`{"channel_id":8}`)}, "password")
+				response := request(http.MethodPost, endpoint.path+"/secret", token, otherChannel)
+				assert.Equal(t, http.StatusForbidden, response.Code)
+				assert.Contains(t, response.Body.String(), "SECURITY_PROOF_CONTEXT_MISMATCH")
+				assert.NotContains(t, response.Body.String(), "saved-asset-secret")
+			}
+
+			pat, patRecord := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), endpoint.grant)
+			patIdentity := service.AuthIdentity{UserID: user.Id, SessionID: model.AccessTokenSessionID(patRecord.Id), UserAuthVersion: user.AuthVersion, SessionVersion: model.AccessTokenSessionVersion}
+			patProof, err := service.VerifySecurityInput(patIdentity, service.VerificationInput{Scope: endpoint.scope, Context: operation.Context, Method: "password", Password: "enrollment-password"})
+			require.NoError(t, err)
+			response = request(http.MethodPost, endpoint.path+"/secret", pat, patProof.ProofToken)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "saved-asset-secret")
+			assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+			var logs []model.AuditLog
+			require.NoError(t, model.LOG_DB.Where("action = ?", endpoint.audit).Find(&logs).Error)
+			require.Len(t, logs, 2)
+			require.NoError(t, model.LOG_DB.Find(&logs).Error)
+			encoded, err := common.Marshal(logs)
+			require.NoError(t, err)
+			for _, secret := range []string{"saved-asset-secret", "private-cursor-secret", "enrollment-password", proof.ProofToken, patProof.ProofToken} {
+				assert.NotContains(t, string(encoded), secret)
+			}
+			var unchanged model.Option
+			require.NoError(t, model.DB.Where(&model.Option{Key: endpoint.option}).First(&unchanged).Error)
+			assert.Equal(t, stored.Value, unchanged.Value, "disclosure must not change configuration")
+
+			require.NoError(t, model.DB.Where(&model.Option{Key: endpoint.option}).Delete(&model.Option{}).Error)
+			missing := issueSecurityEnrollmentProof(t, identity, operation, "password")
+			response = request(http.MethodPost, endpoint.path+"/secret", token, missing)
+			assert.Equal(t, http.StatusNotFound, response.Code)
+			assert.NotContains(t, response.Body.String(), "saved-asset-secret")
+			response = request(http.MethodPost, endpoint.path+"/secret", token, missing)
+			assert.Contains(t, response.Body.String(), "SECURITY_PROOF_CONSUMED")
+		})
+	}
+}
+
+func TestAssetSecretDisclosureVerificationPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name, method                               string
+		twoFA, passkey, disabled, passwordDisabled bool
+	}{
+		{name: "password", method: "password"},
+		{name: "disabled password", method: "password", passwordDisabled: true},
+		{name: "twofa", method: "2fa", twoFA: true},
+		{name: "locked twofa", method: "2fa", twoFA: true, disabled: true},
+		{name: "passkey", method: "passkey", passkey: true},
+		{name: "disabled passkey", method: "passkey", passkey: true, disabled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			user, identity := setupSecurityEnrollmentTest(t)
+			require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
+			previous := common.PasswordLoginEnabled
+			common.PasswordLoginEnabled = !test.passwordDisabled
+			t.Cleanup(func() { common.PasswordLoginEnabled = previous })
+			if test.twoFA {
+				twoFA := &model.TwoFA{UserId: user.Id, Secret: "JBSWY3DPEHPK3PXP", IsEnabled: true}
+				if test.disabled {
+					until := time.Now().Add(time.Minute)
+					twoFA.LockedUntil = &until
+				}
+				require.NoError(t, model.DB.Create(twoFA).Error)
+			}
+			if test.passkey {
+				require.NoError(t, model.DB.Create(&model.PasskeyCredential{UserID: user.Id, CredentialID: "asset-secret-passkey", PublicKey: "public-key"}).Error)
+				system_setting.GetPasskeySettings().Enabled = !test.disabled
+			}
+			for _, operation := range []service.VerificationOperation{
+				{Scope: service.VerificationScopeAssetStorageSecretRead},
+				{Scope: service.VerificationScopeChannelAssetsSecretRead, Context: []byte(`{"channel_id":7}`)},
+			} {
+				requirements, err := service.GetVerificationRequirements(identity, operation.Scope)
+				require.NoError(t, err)
+				require.Len(t, requirements.Methods, 1)
+				assert.Equal(t, test.method, requirements.Methods[0].Method)
+				assert.Equal(t, !test.disabled && !test.passwordDisabled, requirements.Methods[0].Available)
+				input := service.VerificationInput{Scope: operation.Scope, Context: operation.Context, Method: "password", Password: "enrollment-password"}
+				if test.method == "password" && !test.passwordDisabled {
+					input.Password = "wrong-password"
+					_, err := service.VerifySecurityInput(identity, input)
+					assert.ErrorIs(t, err, service.ErrVerificationFailed)
+				} else {
+					expected := service.ErrProofMethod
+					if test.passwordDisabled {
+						expected = service.ErrVerificationUnavailable
+					}
+					_, err := service.VerifySecurityInput(identity, input)
+					assert.ErrorIs(t, err, expected, "password must not bypass the enrolled factor or disabled password policy")
+					proof := issueSecurityEnrollmentProof(t, identity, operation, "password")
+					_, err = service.ConsumeOperationProof(proof, identity, operation)
+					assert.ErrorIs(t, err, expected, "an existing password proof must also respect current policy")
+				}
+			}
+		})
+	}
+}
+
 func TestAssetChannelConfigurationAuthorizationWithoutSecurityProof(t *testing.T) {
 	user, identity := setupSecurityEnrollmentTest(t)
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1172,6 +1368,11 @@ func TestSecurityEnrollmentOperationContext(t *testing.T) {
 		err                  error
 	}{
 		{"channel", "channel.key.read", `{"channel_id":123}`, nil},
+		{"asset channel", "channel.assets.secret.read", `{"channel_id":7}`, nil},
+		{"asset channel missing", "channel.assets.secret.read", `{}`, service.ErrVerificationContextInvalid},
+		{"asset channel extra field", "channel.assets.secret.read", `{"channel_id":7,"extra":true}`, service.ErrVerificationContextInvalid},
+		{"asset storage", "asset.storage.secret.read", `{}`, nil},
+		{"asset storage extra field", "asset.storage.secret.read", `{"channel_id":7}`, service.ErrVerificationContextInvalid},
 		{"missing channel", "channel.key.read", ``, service.ErrVerificationContextInvalid},
 		{"null channel", "channel.key.read", `{"channel_id":null}`, service.ErrVerificationContextInvalid},
 		{"string channel", "channel.key.read", `{"channel_id":"123"}`, service.ErrVerificationContextInvalid},

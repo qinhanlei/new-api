@@ -49,6 +49,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/option/asset_storage":                   accessTokenScopeRule("option:read"),
 	"PUT /api/option/asset_storage":                   accessTokenScopeRule("option:write"),
 	"POST /api/option/asset_storage/test":             accessTokenScopeRule("option:write"),
+	"POST /api/option/asset_storage/secret":           accessTokenScopeRule("option:write"),
 	// router/api-router.go: top level
 	"GET /api/models":                     accessTokenScopeRule("profile:read"),
 	"GET /api/status/test":                accessTokenScopeRule("log:read"),

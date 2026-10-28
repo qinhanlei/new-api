@@ -19,6 +19,8 @@ For commercial licensing, please contact support@quantumnous.com
 // Static translation keys that don't get picked up by the t('...') regex.
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
+  'Viewed asset storage secret key',
+  'Viewed channel asset secret key (ID: {{id}})',
   'The upstream material list was invalid',
   'The material source is not ready',
   'The upstream create result is still settling; retry later',

@@ -44,6 +44,14 @@ Bucket 保持私有。New API 为上游生成临时读取链接，因此存储�
 
 若保存时提示 HTTP 404 或 405，请核对素材 API 的完整地址及路径，不能直接用站点首页或视频生成地址代替。上游返回“项目不存在”等 JSON 错误时，会保留具体原因；请在上游创建项目，或填写已有的项目名。
 
+### 查看已保存密钥
+
+超级管理员可在存储或渠道 AK/SK 配置的密钥字段旁点击**验证后查看**。已启用 2FA 或 Passkey 时使用已注册的验证方式；未启用时使用当前密码，无密码账号使用已绑定的 OAuth 身份。被锁定或停用的验证方式不会降级到密码。查看结果独立展示，不覆盖正在编辑的密钥；关闭弹窗、切换渠道或退出登录后清除，需要再次验证才能重新查看。
+
+读取接口为 `POST /api/option/asset_storage/secret` 和 `POST /api/channel/{id}/assets/secret`，分别要求 `asset.storage.secret.read`（空上下文）和 `channel.assets.secret.read`（上下文 `{"channel_id":id}`）的一次性 `X-Security-Proof`。个人访问令牌分别还需 `option:write`、`channel:secret_view`，账号仍须为超级管理员。成功响应仅包含 `data.secret_key`，禁止 HTTP 缓存；普通配置查询仍仅返回 `has_secret`。查看操作会记录不包含密钥的审计日志，保存和测试配置的流程不变。
+
+该流程复用统一验证的会话、权限、短期凭证和重放保护，对照 [OWASP ASVS 5.0.0](https://asvs.owasp.org/) 的 7.5.3、8.2.1–8.2.3、8.3.1，以及 [Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)、[Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)、[MFA](https://cheatsheetseries.owasp.org/cheatsheets/Multifactor_Authentication_Cheat_Sheet.html) 和 [CSRF](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html) 指南实现。
+
 ## 在后台管理素材
 
 在素材库选择项目、分组，首次使用先**新建分组**，再通过**添加素材**上传文件或导入 URL。项目默认是 `default`；管理员可选择具体用户管理其素材，“所有用户”视图仅用于查看。

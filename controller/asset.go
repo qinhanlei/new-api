@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -227,6 +228,23 @@ func GetAssetStorage(c *gin.Context) {
 	common.ApiSuccess(c, config)
 }
 
+func GetAssetStorageSecret(c *gin.Context) {
+	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeAssetStorageSecretRead}) == nil {
+		return
+	}
+	config, err := model.LoadAssetStorageConfig(c.Request.Context())
+	if err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
+	if config.SecretKey == "" {
+		common.ApiErrorStatus(c, http.StatusNotFound, common.NewMessage("No secret is saved."))
+		return
+	}
+	recordManageAudit(c, "asset.storage.secret_view", map[string]any{"revision": config.Revision})
+	common.ApiSuccess(c, gin.H{"secret_key": config.SecretKey})
+}
+
 func UpdateAssetStorage(c *gin.Context) {
 	var request dto.AssetStorageUpdate
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10), &request); err != nil {
@@ -269,6 +287,33 @@ func GetChannelAssets(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, view)
+}
+
+func GetChannelAssetsSecret(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil || id <= 0 {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+		return
+	}
+	context, err := common.Marshal(service.ChannelKeyReadContext{ChannelID: id})
+	if err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
+	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeChannelAssetsSecretRead, Context: context}) == nil {
+		return
+	}
+	config, err := model.LoadAssetChannelConfig(c.Request.Context(), id)
+	if err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
+	if config.SecretKey == "" {
+		common.ApiErrorStatus(c, http.StatusNotFound, common.NewMessage("No secret is saved."))
+		return
+	}
+	recordManageAudit(c, "channel.assets.secret_view", map[string]any{"id": id, "revision": config.Revision})
+	common.ApiSuccess(c, gin.H{"secret_key": config.SecretKey})
 }
 
 func UpdateChannelAssets(c *gin.Context) {

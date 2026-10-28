@@ -221,6 +221,9 @@ func AccessTokenScopeGranted(scopes []string, scope string) bool {
 // scope a PAT needs to obtain its proof. An empty value means PATs can never
 // obtain it; scopes missing from this table are denied too.
 var accessTokenVerificationScopes = map[string]string{
+	VerificationScopeAssetStorageSecretRead:  "option:write",
+	VerificationScopeChannelAssetsSecretRead: AccessTokenScopeOf(authz.ChannelSecretView),
+
 	VerificationScopeChannelKeyRead:        AccessTokenScopeOf(authz.ChannelSecretView),
 	VerificationScopeAdminUserCreate:       "user:write",
 	VerificationScopeAdminUserUpdate:       "user:write",

@@ -59,6 +59,7 @@ import {
   AssetChannelSelect,
   type AssetChannelSearch,
 } from './asset-channel-select'
+import { AssetSecretDisclosure } from './asset-secret-disclosure'
 
 export function ChannelAssetsForm(props: {
   config: AssetChannelConfig
@@ -361,6 +362,10 @@ export function ChannelAssetsForm(props: {
                             ? t('A secret is saved. Leave blank to keep it.')
                             : t('No secret is saved.')}
                         </FormDescription>
+                        <AssetSecretDisclosure
+                          config={config}
+                          disabled={busy}
+                        />
                         <FormMessage />
                       </FormItem>
                     )}
