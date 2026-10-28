@@ -220,8 +220,13 @@ test.each(['storage', 'channel'] as const)(
     const put = vi.spyOn(api, 'put')
     const { user } = await renderSecretSettings(target)
     const secret = `saved-${target}-secret`
-    await user.type(screen.getByLabelText('Secret key'), 'replacement-draft')
-    await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+    expect(
+      screen.queryByRole('button', { name: 'Verify to view' })
+    ).not.toBeInTheDocument()
+    const trigger = screen.getByRole('button', {
+      name: 'Verify to view saved secret',
+    })
+    await user.click(trigger)
     await user.type(
       await screen.findByLabelText('Password', { selector: 'input' }),
       'reveal-password'
@@ -236,7 +241,7 @@ test.each(['storage', 'channel'] as const)(
     expect(
       within(dialog).getByRole('textbox', { name: 'Saved secret key' })
     ).toHaveAttribute('readonly')
-    expect(screen.getByLabelText('Secret key')).toHaveValue('replacement-draft')
+    expect(screen.getByLabelText('Secret key')).toHaveValue('')
     expect(put).not.toHaveBeenCalled()
     expect(api.post).toHaveBeenCalledWith(
       '/api/verify',
@@ -276,6 +281,7 @@ test.each(['storage', 'channel'] as const)(
     )
     expect(await navigator.clipboard.readText()).toBe(secret)
     await user.click(within(dialog).getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(trigger).toHaveFocus())
     expect(put).not.toHaveBeenCalled()
     expect(
       screen.queryByRole('textbox', { name: 'Saved secret key' })
@@ -283,7 +289,9 @@ test.each(['storage', 'channel'] as const)(
     expect(
       screen.queryByRole('button', { name: 'Copied' })
     ).not.toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+    await user.click(
+      screen.getByRole('button', { name: 'Verify to view saved secret' })
+    )
     expect(
       await screen.findByLabelText('Password', { selector: 'input' })
     ).toHaveValue('')
@@ -293,16 +301,52 @@ test.each(['storage', 'channel'] as const)(
   }
 )
 
-test('cancelling verification leaves the saved storage secret unread and the draft untouched', async () => {
+test.each(['storage', 'channel'] as const)(
+  'the %s eye shows and hides a draft without verifying or reading the saved secret',
+  async (target) => {
+    const { user } = await renderSecretSettings(target)
+    const input = screen.getByLabelText('Secret key')
+    await user.type(input, 'replacement-draft')
+    expect(input).toHaveFocus()
+    expect(input).toHaveAttribute('type', 'password')
+    expect(
+      screen.queryByRole('button', { name: 'Verify to view saved secret' })
+    ).not.toBeInTheDocument()
+    const show = screen.getByRole('button', { name: 'Show input' })
+    show.focus()
+    await user.keyboard('{Enter}')
+    expect(input).toHaveAttribute('type', 'text')
+    expect(input).toHaveValue('replacement-draft')
+    await user.click(screen.getByRole('button', { name: 'Hide input' }))
+    expect(input).toHaveAttribute('type', 'password')
+    await user.click(screen.getByRole('button', { name: 'Show input' }))
+    await user.clear(input)
+    expect(
+      screen.getByRole('button', { name: 'Verify to view saved secret' })
+    ).toBeEnabled()
+    await user.type(input, 'another-draft')
+    expect(input).toHaveAttribute('type', 'password')
+    expect(api.get).not.toHaveBeenCalledWith(
+      '/api/verify/methods',
+      expect.anything()
+    )
+    expect(api.post).not.toHaveBeenCalled()
+  }
+)
+
+test('cancelling verification leaves the saved storage secret unread and settings untouched', async () => {
   const { user } = await renderSecretSettings('storage')
-  await user.type(screen.getByLabelText('Secret key'), 'keep-draft')
-  const trigger = screen.getByRole('button', { name: 'Verify to view' })
+  await user.type(screen.getByLabelText('Bucket'), '-draft')
+  const trigger = screen.getByRole('button', {
+    name: 'Verify to view saved secret',
+  })
   trigger.focus()
   await user.keyboard('{Enter}')
   await screen.findByLabelText('Password', { selector: 'input' })
   await user.keyboard('{Escape}')
   expect(api.post).not.toHaveBeenCalled()
-  expect(screen.getByLabelText('Secret key')).toHaveValue('keep-draft')
+  expect(screen.getByLabelText('Bucket')).toHaveValue('assets-draft')
+  expect(screen.getByLabelText('Secret key')).toHaveValue('')
   expect(trigger).toBeEnabled()
   await waitFor(() => expect(trigger).toHaveFocus())
 })
@@ -317,7 +361,9 @@ test('failed password verification does not request the saved secret or submit s
   })
   const put = vi.spyOn(api, 'put')
   const { user } = await renderSecretSettings('storage')
-  await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+  await user.click(
+    screen.getByRole('button', { name: 'Verify to view saved secret' })
+  )
   await user.type(
     await screen.findByLabelText('Password', { selector: 'input' }),
     'wrong-password'
@@ -344,7 +390,9 @@ test('a failed secret read reports the error and requires fresh verification', a
     return post(url, ...args)
   })
   const { user } = await renderSecretSettings('storage')
-  await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+  await user.click(
+    screen.getByRole('button', { name: 'Verify to view saved secret' })
+  )
   await user.type(
     await screen.findByLabelText('Password', { selector: 'input' }),
     'reveal-password'
@@ -356,13 +404,23 @@ test('a failed secret read reports the error and requires fresh verification', a
   expect(
     screen.queryByRole('textbox', { name: 'Saved secret key' })
   ).not.toBeInTheDocument()
-  await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+  await user.click(
+    screen.getByRole('button', { name: 'Verify to view saved secret' })
+  )
   expect(
     await screen.findByLabelText('Password', { selector: 'input' })
   ).toHaveValue('')
 })
 
-test.each(['close', 'unmount', 'revision', 'session', 'logout'] as const)(
+test.each([
+  'close',
+  'unmount',
+  'revision',
+  'session',
+  'logout',
+  'permission',
+  'secret',
+] as const)(
   '%s cancels a pending saved-secret read and ignores its late response',
   async (change) => {
     let resolveRead!: (response: {
@@ -384,7 +442,9 @@ test.each(['close', 'unmount', 'revision', 'session', 'logout'] as const)(
       return post(url, body, options)
     })
     const { user, unmount } = await renderSecretSettings('storage')
-    await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+    await user.click(
+      screen.getByRole('button', { name: 'Verify to view saved secret' })
+    )
     await user.type(
       await screen.findByLabelText('Password', { selector: 'input' }),
       'reveal-password'
@@ -404,6 +464,15 @@ test.each(['close', 'unmount', 'revision', 'session', 'logout'] as const)(
           client.setQueryData(assetQueryKeys.storage, {
             ...config,
             revision: 3,
+          })
+        } else if (change === 'permission') {
+          useAuthStore
+            .getState()
+            .auth.setUser({ id: 1, username: 'root', role: 10 })
+        } else if (change === 'secret') {
+          client.setQueryData(assetQueryKeys.storage, {
+            ...config,
+            has_secret: false,
           })
         } else if (change === 'logout') useAuthStore.getState().auth.reset()
         else {
@@ -428,6 +497,44 @@ test.each(['close', 'unmount', 'revision', 'session', 'logout'] as const)(
   }
 )
 
+test.each(['permission', 'secret'] as const)(
+  'losing %s clears an already displayed secret without clearing settings drafts',
+  async (change) => {
+    const { user } = await renderSecretSettings('storage')
+    await user.type(screen.getByLabelText('Bucket'), '-draft')
+    await user.click(
+      screen.getByRole('button', { name: 'Verify to view saved secret' })
+    )
+    await user.type(
+      await screen.findByLabelText('Password', { selector: 'input' }),
+      'reveal-password'
+    )
+    await user.click(screen.getByRole('button', { name: 'Verify' }))
+    await screen.findByRole('textbox', { name: 'Saved secret key' })
+    act(() => {
+      if (change === 'permission') {
+        useAuthStore
+          .getState()
+          .auth.setUser({ id: 1, username: 'root', role: 10 })
+      } else {
+        client.setQueryData(assetQueryKeys.storage, {
+          ...config,
+          has_secret: false,
+        })
+      }
+    })
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('textbox', { name: 'Saved secret key' })
+      ).not.toBeInTheDocument()
+    )
+    expect(
+      screen.queryByRole('button', { name: 'Verify to view saved secret' })
+    ).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Bucket')).toHaveValue('assets-draft')
+  }
+)
+
 test('changing channels after disclosure requires verification for the newly selected channel', async () => {
   channelConfigs[7] = {
     ...channelConfigs[7],
@@ -435,7 +542,9 @@ test('changing channels after disclosure requires verification for the newly sel
     has_secret: true,
   }
   const { user } = await renderSecretSettings('channel')
-  await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+  await user.click(
+    screen.getByRole('button', { name: 'Verify to view saved secret' })
+  )
   await user.type(
     await screen.findByLabelText('Password', { selector: 'input' }),
     'reveal-password'
@@ -451,7 +560,9 @@ test('changing channels after disclosure requires verification for the newly sel
   expect(
     screen.queryByRole('textbox', { name: 'Saved secret key' })
   ).not.toBeInTheDocument()
-  await user.click(screen.getByRole('button', { name: 'Verify to view' }))
+  await user.click(
+    screen.getByRole('button', { name: 'Verify to view saved secret' })
+  )
   await user.type(
     await screen.findByLabelText('Password', { selector: 'input' }),
     'reveal-password'
@@ -491,7 +602,7 @@ test.each(['no saved secret', 'non-root'] as const)(
     }
     await renderSecretSettings('storage')
     expect(
-      screen.queryByRole('button', { name: 'Verify to view' })
+      screen.queryByRole('button', { name: 'Verify to view saved secret' })
     ).not.toBeInTheDocument()
     expect(api.post).not.toHaveBeenCalled()
   }

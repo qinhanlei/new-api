@@ -25,7 +25,6 @@ import type { z } from 'zod'
 
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
-import { PasswordInput } from '@/components/password-input'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -51,7 +50,7 @@ import {
   saveAssetStorage,
   testAssetStorage,
 } from '@/features/assets/api'
-import { AssetSecretDisclosure } from '@/features/assets/components/asset-secret-disclosure'
+import { AssetSecretInput } from '@/features/assets/components/asset-secret-input'
 import { assetStorageSchema } from '@/features/assets/lib/schemas'
 import {
   assetStoragePathStyle,
@@ -337,8 +336,9 @@ function AssetStorageForm(props: { config: AssetStorageConfig }) {
               <FormItem>
                 <FormLabel>{t('Secret key')}</FormLabel>
                 <FormControl>
-                  <PasswordInput
+                  <AssetSecretInput
                     {...field}
+                    config={props.config}
                     disabled={busy}
                     autoComplete='new-password'
                   />
@@ -348,7 +348,6 @@ function AssetStorageForm(props: { config: AssetStorageConfig }) {
                     ? t('A secret is saved. Leave blank to keep it.')
                     : t('No secret is saved.')}
                 </FormDescription>
-                <AssetSecretDisclosure config={props.config} disabled={busy} />
                 <FormMessage />
               </FormItem>
             )}

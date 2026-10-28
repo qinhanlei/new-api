@@ -16,12 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useEffect, useRef, useState } from 'react'
+import { type ComponentProps, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { CopyButton } from '@/components/copy-button'
 import { Dialog } from '@/components/dialog'
 import { LoadingState } from '@/components/loading-state'
+import { PasswordInput } from '@/components/password-input'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import {
@@ -36,32 +37,36 @@ import { useAuthStore } from '@/stores/auth-store'
 import { getAssetChannelSecret, getAssetStorageSecret } from '../api'
 import type { AssetChannelConfig, AssetStorageConfig } from '../types'
 
-export function AssetSecretDisclosure(props: {
-  config: AssetStorageConfig | AssetChannelConfig
-  disabled?: boolean
-}) {
+export function AssetSecretInput(
+  props: Omit<ComponentProps<typeof PasswordInput>, 'visibilityAction'> & {
+    config: AssetStorageConfig | AssetChannelConfig
+  }
+) {
   const user = useAuthStore((state) => state.auth.user)
   const sessionId = useAuthStore((state) => state.auth.session?.sid)
-  if (user?.role !== ROLE.SUPER_ADMIN || !props.config.has_secret) return null
-  const channelId =
-    'channel_id' in props.config ? props.config.channel_id : undefined
+  const { config, ...inputProps } = props
+  const canReveal = user?.role === ROLE.SUPER_ADMIN && config.has_secret
+  const channelId = 'channel_id' in config ? config.channel_id : undefined
   return (
-    <AssetSecretDisclosureControl
-      key={`${user.id}:${sessionId}:${channelId ?? 'storage'}:${props.config.revision}`}
+    <AssetSecretInputControl
+      key={`${user?.id}:${sessionId}:${channelId ?? 'storage'}:${config.revision}:${canReveal}`}
       channelId={channelId}
-      disabled={props.disabled}
+      canReveal={canReveal}
+      inputProps={inputProps}
     />
   )
 }
 
-function AssetSecretDisclosureControl(props: {
+function AssetSecretInputControl(props: {
   channelId?: number
-  disabled?: boolean
+  canReveal: boolean
+  inputProps: ComponentProps<typeof PasswordInput>
 }) {
   const { t } = useTranslation()
   const verification = useSecureVerification()
   const cancelVerification = verification.cancel
   const operation = useRef<AbortController | null>(null)
+  const trigger = useRef<HTMLButtonElement | null>(null)
   const [secret, setSecret] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
 
@@ -83,7 +88,14 @@ function AssetSecretDisclosureControl(props: {
   }
 
   const reveal = async () => {
-    if (props.disabled || operation.current) return
+    if (
+      !props.canReveal ||
+      props.inputProps.value ||
+      props.inputProps.disabled ||
+      operation.current
+    ) {
+      return
+    }
     const current = new AbortController()
     operation.current = current
     try {
@@ -124,22 +136,27 @@ function AssetSecretDisclosureControl(props: {
   return (
     // The verification dialog has its own form; it must not submit settings.
     <div onSubmit={(event) => event.stopPropagation()}>
+      <PasswordInput
+        {...props.inputProps}
+        visibilityAction={
+          props.canReveal && !props.inputProps.value
+            ? {
+                label: t('Verify to view saved secret'),
+                disabled: verification.isActive || loading,
+                onClick: (event) => {
+                  trigger.current = event.currentTarget
+                  void reveal()
+                },
+              }
+            : undefined
+        }
+      />
       <Dialog
         open={loading || secret !== null}
         onOpenChange={(open) => {
-          if (open) void reveal()
-          else close()
+          if (!open) close()
         }}
-        trigger={
-          <Button
-            type='button'
-            variant='outline'
-            size='sm'
-            disabled={props.disabled || verification.isActive || loading}
-          >
-            {t('Verify to view')}
-          </Button>
-        }
+        finalFocus={trigger}
         title={t('Saved secret key')}
         contentClassName='sm:max-w-md'
         showCloseButton={false}

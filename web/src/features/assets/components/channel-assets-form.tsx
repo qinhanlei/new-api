@@ -26,7 +26,6 @@ import type { z } from 'zod'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Dialog } from '@/components/dialog'
-import { PasswordInput } from '@/components/password-input'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -55,7 +54,7 @@ import {
 } from '@/features/system-settings/components/settings-form-layout'
 import { handleServerError } from '@/lib/handle-server-error'
 
-import { AssetSecretDisclosure } from './asset-secret-disclosure'
+import { AssetSecretInput } from './asset-secret-input'
 
 export function ChannelAssetsForm(props: {
   config: AssetChannelConfig
@@ -355,8 +354,9 @@ export function ChannelAssetsForm(props: {
                       <FormItem>
                         <FormLabel>{t('Secret key')}</FormLabel>
                         <FormControl>
-                          <PasswordInput
+                          <AssetSecretInput
                             {...field}
+                            config={config}
                             disabled={busy}
                             autoComplete='new-password'
                           />
@@ -366,10 +366,6 @@ export function ChannelAssetsForm(props: {
                             ? t('A secret is saved. Leave blank to keep it.')
                             : t('No secret is saved.')}
                         </FormDescription>
-                        <AssetSecretDisclosure
-                          config={config}
-                          disabled={busy}
-                        />
                         <FormMessage />
                       </FormItem>
                     )}
