@@ -195,7 +195,14 @@ func ClaimAssetWork(ctx context.Context, now int64, limit int) ([]Asset, error) 
 				}
 			}
 			token := common.GetUUID()
-			result := tx.Model(&Asset{}).Where("id = ? AND lease_expires_at <= ? AND deleted_at = ?", asset.ID, now, asset.DeletedAt).Updates(map[string]any{"lease_token": token, "lease_expires_at": now + 180})
+			// Another worker may finish or reschedule this candidate before we
+			// acquire the storage lock. Only lease the work state we actually read.
+			result := tx.Model(&Asset{}).
+				Where("id = ? AND deleted_at = ?", asset.ID, asset.DeletedAt).
+				Where("status = ? AND object_state = ?", asset.Status, asset.ObjectState).
+				Where("attempts = ? AND next_attempt_at = ?", asset.Attempts, asset.NextAttemptAt).
+				Where("lease_token = ? AND lease_expires_at = ? AND lease_expires_at <= ?", asset.LeaseToken, asset.LeaseExpiresAt, now).
+				Updates(map[string]any{"lease_token": token, "lease_expires_at": now + 180})
 			if result.Error != nil {
 				return result.Error
 			}

@@ -280,6 +280,130 @@ func TestAssetReadinessLeasesAndDeletionHolds(t *testing.T) {
 	assert.Equal(t, "AssetStorageDisabled", failure.Code)
 }
 
+func TestAssetWorkRejectsStaleCandidates(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		deleted bool
+		finish  func(*testing.T, *model.Asset, int64)
+		reclaim bool
+	}{
+		{
+			name: "source completed",
+			finish: func(t *testing.T, asset *model.Asset, _ int64) {
+				asset.ObjectState = model.AssetReady
+				asset.ContentType = "image/png"
+				asset.Size = 128
+				asset.SHA256 = fmt.Sprintf("%x", sha256.Sum256([]byte("completed source")))
+				require.NoError(t, model.FinishAssetSource(t.Context(), asset, "", "", 0))
+			},
+		},
+		{
+			name: "source failed",
+			finish: func(t *testing.T, asset *model.Asset, _ int64) {
+				require.NoError(t, model.FinishAssetSource(t.Context(), asset, "InvalidSource", "Source is invalid", 0))
+			},
+		},
+		{
+			name: "source retry postponed",
+			finish: func(t *testing.T, asset *model.Asset, now int64) {
+				require.NoError(t, model.FinishAssetSource(t.Context(), asset, "SourceUnavailable", "Source is unavailable", now+60))
+			},
+			reclaim: true,
+		},
+		{
+			name:    "cleanup completed",
+			deleted: true,
+			finish: func(t *testing.T, asset *model.Asset, _ int64) {
+				require.NoError(t, model.FinishAssetCleanup(t.Context(), asset, true))
+			},
+		},
+		{
+			name:    "cleanup retry postponed",
+			deleted: true,
+			finish: func(t *testing.T, asset *model.Asset, _ int64) {
+				require.NoError(t, model.FinishAssetCleanup(t.Context(), asset, false))
+			},
+			reclaim: true,
+		},
+		{name: "lease replaced", reclaim: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assetTestDatabase(t)
+			ctx := t.Context()
+			group := assetTestGroup(t, 1, "group")
+			asset := assetTestAsset(t, group)
+			require.NoError(t, model.DB.Model(&model.Asset{}).Where("id = ?", asset.ID).Updates(map[string]any{
+				"object_state": model.AssetPending,
+				"source_url":   "https://source.example/image.png",
+			}).Error)
+			if tc.deleted {
+				require.NoError(t, model.DeleteAsset(ctx, asset.UserID, asset.PublicID, asset.ProjectName))
+			}
+			now := time.Now().Unix()
+			var expected model.Asset
+			interleaved := false
+			const callback = "test:finish-before-asset-claim"
+			// Let another worker claim and finish after the old candidate was read,
+			// without relying on goroutine scheduling or sleeps.
+			require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+				rows, ok := tx.Statement.Dest.(*[]model.Asset)
+				if interleaved || !ok || len(*rows) != 1 || (*rows)[0].ID != asset.ID {
+					return
+				}
+				interleaved = true
+				claimed, err := model.ClaimAssetWork(ctx, now, 1)
+				require.NoError(t, err)
+				require.Len(t, claimed, 1)
+				if tc.finish != nil {
+					tc.finish(t, &claimed[0], now)
+				}
+				require.NoError(t, model.DB.First(&expected, asset.ID).Error)
+			}))
+			t.Cleanup(func() { require.NoError(t, model.DB.Callback().Query().Remove(callback)) })
+
+			claimed, err := model.ClaimAssetWork(ctx, now, 1)
+			require.NoError(t, err)
+			require.True(t, interleaved)
+			assert.Empty(t, claimed, "an old candidate must not be claimed after another worker changes it")
+			var current model.Asset
+			require.NoError(t, model.DB.First(&current, asset.ID).Error)
+			assert.Equal(t, expected, current, "the stale claim must preserve the other worker's result and lease")
+			if tc.reclaim {
+				claimed, err = model.ClaimAssetWork(ctx, max(current.NextAttemptAt, current.LeaseExpiresAt), 1)
+				require.NoError(t, err)
+				require.Len(t, claimed, 1, "a fresh candidate must remain claimable when due")
+				assert.Equal(t, current.ID, claimed[0].ID)
+				assert.Equal(t, current.Attempts, claimed[0].Attempts)
+				assert.NotEmpty(t, claimed[0].LeaseToken)
+				assert.NotEqual(t, current.LeaseToken, claimed[0].LeaseToken)
+			}
+		})
+	}
+}
+
+func TestAssetWorkReclaimsExpiredUpload(t *testing.T) {
+	assetTestDatabase(t)
+	ctx := t.Context()
+	group := assetTestGroup(t, 1, "group")
+	asset := assetTestAsset(t, group)
+	now := time.Now().Unix()
+	require.NoError(t, model.DB.Model(&model.Asset{}).Where("id = ?", asset.ID).Updates(map[string]any{
+		"object_state":     "uploading",
+		"lease_token":      "interrupted-upload",
+		"lease_expires_at": now,
+	}).Error)
+	require.NoError(t, model.DB.First(&asset, asset.ID).Error)
+	claimed, err := model.ClaimAssetWork(ctx, now, 1)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	assert.Equal(t, asset.ID, claimed[0].ID)
+	assert.NotEmpty(t, claimed[0].LeaseToken)
+	assert.NotEqual(t, asset.LeaseToken, claimed[0].LeaseToken)
+	assert.Greater(t, claimed[0].LeaseExpiresAt, now)
+	asset.ObjectState = model.AssetReady
+	assert.ErrorIs(t, model.FinishAssetSource(ctx, &asset, "", "", 0), model.ErrAssetConflict)
+}
+
 func TestAssetFailedReplicaAndConfigurationContracts(t *testing.T) {
 	assetTestDatabase(t)
 	ctx := t.Context()
