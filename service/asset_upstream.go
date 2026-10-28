@@ -282,7 +282,11 @@ func callAssetUpstream(ctx context.Context, channel *model.Channel, config syste
 		return err
 	}
 	if err = common.Unmarshal(data, result); err != nil {
-		return assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream material result was invalid")
+		code := "UpstreamInvalidResponse"
+		if strings.HasPrefix(action, "Create") {
+			code = "UpstreamResultUnknown"
+		}
+		return assetError(http.StatusBadGateway, code, "The upstream material result was invalid")
 	}
 	return nil
 }

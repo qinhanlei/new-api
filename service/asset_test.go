@@ -712,6 +712,8 @@ func TestAssetUpstreamCanonicalEndpoint(t *testing.T) {
 		{name: "303 not replayed", path: "/ark", status: 303, location: "/ark/?%s", wantCode: "UpstreamInvalidResponse", calls: 1},
 		{name: "second redirect stops", path: "/ark", status: 301, location: "/ark/?%s", redirectNext: true, wantCode: "UpstreamInvalidResponse", calls: 2},
 		{name: "server error not replayed", path: "/ark", status: 503, location: "/ark/?%s", action: "CreateAssetGroup", wantCode: "UpstreamResultUnknown", calls: 1},
+		{name: "create timeout remains unknown", path: "/ark", status: 408, action: "CreateAssetGroup", wantCode: "UpstreamResultUnknown", calls: 1},
+		{name: "create rejection is definitive", path: "/ark", status: 400, action: "CreateAssetGroup", wantCode: "UpstreamHTTP400", calls: 1},
 		{name: "create failure remains unknown", path: "/ark", status: 301, location: "/ark/?%s", action: "CreateAssetGroup", failNext: true, wantCode: "UpstreamResultUnknown", calls: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1261,12 +1263,19 @@ func TestAssetExpiredUsesSkipActiveHeadOfBatch(t *testing.T) {
 }
 
 func TestAssetUnknownCreateReconcilesBeforeFailing(t *testing.T) {
-	for _, tc := range []struct{ unknownGroup, expired, lowerGroupLimit bool }{
-		{false, false, false}, {true, false, false}, {false, true, false}, {true, true, false},
-		{true, false, true},
+	for _, tc := range []struct {
+		unknownGroup, expired, lowerGroupLimit bool
+		invalidGroupResult                     string
+	}{
+		{}, {unknownGroup: true}, {expired: true}, {unknownGroup: true, expired: true},
+		{unknownGroup: true, lowerGroupLimit: true},
+		{unknownGroup: true, invalidGroupResult: "recover"},
+		{unknownGroup: true, expired: true, invalidGroupResult: "empty list"},
+		{unknownGroup: true, expired: true, invalidGroupResult: "duplicate match"},
+		{unknownGroup: true, expired: true, invalidGroupResult: "incomplete list"},
 	} {
 		unknownGroup := tc.unknownGroup
-		t.Run(fmt.Sprintf("group=%t/expired=%t/lower_group_limit=%t", unknownGroup, tc.expired, tc.lowerGroupLimit), func(t *testing.T) {
+		t.Run(fmt.Sprintf("group=%t/expired=%t/lower_group_limit=%t/invalid_group_result=%s", unknownGroup, tc.expired, tc.lowerGroupLimit, tc.invalidGroupResult), func(t *testing.T) {
 			assetTestDatabase(t)
 			previousRegistry := jsplugin.DefaultRegistry
 			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
@@ -1294,6 +1303,10 @@ func TestAssetUnknownCreateReconcilesBeforeFailing(t *testing.T) {
 				case "CreateAssetGroup":
 					groupName = payload["Name"].(string)
 					if unknownGroup {
+						if tc.invalidGroupResult != "" {
+							result["Id"] = 123
+							break
+						}
 						w.WriteHeader(http.StatusBadGateway)
 						_, _ = io.WriteString(w, `{"ResponseMetadata":{"Error":{"Code":"InternalError","Message":"Try later"}}}`)
 						return
@@ -1301,8 +1314,19 @@ func TestAssetUnknownCreateReconcilesBeforeFailing(t *testing.T) {
 					result["Id"] = "remote-group"
 				case "ListAssetGroups":
 					result["Items"] = []any{}
-					if counts[action] > 1 {
+					switch tc.invalidGroupResult {
+					case "duplicate match":
+						result["Items"] = []any{
+							map[string]any{"Id": "remote-group", "Name": groupName, "GroupType": "AIGC"},
+							map[string]any{"Id": "duplicate-group", "Name": groupName, "GroupType": "AIGC"},
+						}
+					case "incomplete list":
 						result["Items"] = []any{map[string]any{"Id": "remote-group", "Name": groupName, "GroupType": "AIGC"}}
+						result["TotalCount"] = 2
+					default:
+						if counts[action] > 1 {
+							result["Items"] = []any{map[string]any{"Id": "remote-group", "Name": groupName, "GroupType": "AIGC"}}
+						}
 					}
 				case "CreateAsset":
 					name = payload["Name"].(string)
@@ -1368,6 +1392,12 @@ func TestAssetUnknownCreateReconcilesBeforeFailing(t *testing.T) {
 					leases[0].Attempts = 9
 				}
 				require.NoError(t, processAssetReplica(t.Context(), &leases[0]))
+				if tc.invalidGroupResult != "" && step == 0 {
+					groupReplica, err := model.GetAssetGroupReplica(t.Context(), group.ID, 1)
+					require.NoError(t, err)
+					assert.Equal(t, model.AssetUnknown, groupReplica.State)
+					assert.Equal(t, "UpstreamResultUnknown", groupReplica.ErrorCode)
+				}
 				stored, err := model.GetAssetByID(t.Context(), asset.ID)
 				require.NoError(t, err)
 				if tc.expired && step == 1 {
