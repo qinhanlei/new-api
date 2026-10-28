@@ -118,6 +118,11 @@ func selectAssetChannel(c *gin.Context, modelName string, retry *RetryParam) (*m
 }
 
 func assetChannelError(c *gin.Context, err error) *ChannelSelectError {
+	if errors.Is(err, model.ErrAssetGroupUnavailable) {
+		err = assetError(http.StatusConflict, "AssetGroupUnavailable", "The material group is being deleted")
+	} else if errors.Is(err, model.ErrAssetChannelConflict) {
+		err = assetError(http.StatusBadRequest, "AssetChannelConflict", "Referenced portraits must share one verification channel")
+	}
 	var assetErr *AssetError
 	if errors.As(err, &assetErr) {
 		if assetErr.Retryable {

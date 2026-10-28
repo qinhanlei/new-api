@@ -18,8 +18,10 @@ func SetAssetRouter(engine *gin.Engine) {
 }
 
 func registerAssetManagementRoutes(api *gin.RouterGroup) {
+	api.GET("/assets/validation/callback/:state", middleware.DisableCache(), controller.AssetValidationCallback)
 	assets := api.Group("/assets", middleware.UserAuth(), middleware.DisableCache())
 	assets.GET("/config", controller.GetAssetAvailability)
+	assets.GET("/validation/sessions", controller.ListAssetValidationSessions)
 	assets.POST("/actions", assetMutationRateLimit(), controller.ManageAssetAction)
 	assets.POST("/upload", middleware.UserCriticalRateLimit("assets"), controller.UploadAsset)
 	assets.GET("/:id/replicas", controller.GetAssetReplicas)

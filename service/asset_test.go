@@ -57,7 +57,7 @@ func assetTestDatabase(t *testing.T) {
 	previousDB, previousType := model.DB, common.MainDatabaseType()
 	model.DB = database
 	common.SetMainDatabaseType(dbType)
-	tables := append(model.AssetModels(), &model.Option{}, &model.Channel{}, &model.Task{}, &model.Ability{}, &model.User{}, &model.Token{})
+	tables := append(model.AssetModels(), &model.Option{}, &model.Channel{}, &model.Task{}, &model.Ability{}, &model.User{}, &model.Token{}, &model.UserSession{}, &model.UserAccessToken{})
 	for range 2 {
 		require.NoError(t, database.AutoMigrate(tables...))
 	}
@@ -172,7 +172,7 @@ func TestAssetActionsPaginationAndOwnership(t *testing.T) {
 	_, err = ExecuteAssetAction(t.Context(), actor, "GetAssetGroup", request)
 	require.ErrorAs(t, err, &failure)
 	assert.Equal(t, http.StatusNotFound, failure.HTTPStatus)
-	for _, body := range []string{`{"Filter":{"GroupType":"AIGC"},"PageNumber":1}`, `{"Filter":{"GroupType":"AIGC"},"PageNumber":1,"PageSize":10,"NextToken":""}`, `{"Filter":{"GroupType":"LivenessFace"}}`, `{"Filter":{"GroupType":"AIGC"},"NextToken":""}`} {
+	for _, body := range []string{`{"Filter":{"GroupType":"AIGC"},"PageNumber":1}`, `{"Filter":{"GroupType":"AIGC"},"PageNumber":1,"PageSize":10,"NextToken":""}`, `{"Filter":{"GroupType":"Unknown"}}`, `{"Filter":{"GroupType":"AIGC"},"NextToken":""}`} {
 		_, err = ExecuteAssetAction(t.Context(), actor, "ListAssetGroups", []byte(body))
 		require.ErrorAs(t, err, &failure)
 		assert.Equal(t, http.StatusBadRequest, failure.HTTPStatus)
@@ -1032,6 +1032,7 @@ func TestAssetReplicaRetryRejectsUncertainLists(t *testing.T) {
 
 func TestAssetUpstreamLookupUsesPageNumbers(t *testing.T) {
 	assetTestDatabase(t)
+	group := assetTestGroup(t, 1, "lookup")
 	config, err := model.LoadAssetChannelConfig(t.Context(), 1)
 	require.NoError(t, err)
 	channel, err := model.GetChannelById(1, true)
@@ -1078,7 +1079,7 @@ func TestAssetUpstreamLookupUsesPageNumbers(t *testing.T) {
 				if action == "ListAssetGroups" {
 					id, err = findUpstreamAssetGroup(t.Context(), channel, config, "managed-name")
 				} else {
-					id, err = findUpstreamAsset(t.Context(), channel, config, &model.Asset{PublicID: "managed-name", AssetType: "Image"}, "remote-group")
+					id, err = findUpstreamAsset(t.Context(), channel, config, &model.Asset{PublicID: "managed-name", AssetType: "Image", GroupID: group.ID}, "remote-group")
 				}
 				if tc.wantError {
 					require.Error(t, err)
@@ -1858,7 +1859,7 @@ func TestAssetS3AndArkTransportContracts(t *testing.T) {
 	assert.Equal(t, "UpstreamResultUnknown", failure.Code)
 	assert.NotContains(t, failure.Message, channel.Key)
 	assert.NotContains(t, failure.Message, "signature=")
-	unknown := &model.Asset{PublicID: "asset-na-unknown", AssetType: "Image"}
+	unknown := &model.Asset{PublicID: "asset-na-unknown", AssetType: "Image", GroupID: group.ID}
 	id, err := findUpstreamAsset(t.Context(), channel, upstream, unknown, "remote-group")
 	require.NoError(t, err)
 	assert.Equal(t, "remote-asset", id)
@@ -1886,4 +1887,240 @@ func TestAssetS3AndArkTransportContracts(t *testing.T) {
 	assert.Equal(t, model.AssetDeleted, replicas[0].State)
 	unknownGroup := &model.AssetGroupReplica{GroupID: group.ID, ChannelID: 1, State: model.AssetUnknown, CreateStartedAt: time.Now().Add(-6 * time.Minute).Unix()}
 	require.NoError(t, cleanupAssetGroup(t.Context(), unknownGroup))
+}
+
+// Portrait authorization creates the upstream group before any local upload.
+func assetTestPortrait(t *testing.T, channelID int) (model.AssetGroup, model.Asset) {
+	t.Helper()
+	group := model.AssetGroup{PublicID: model.NewAssetGroupID(), UserID: 1, ProjectName: "default", Name: "portrait", GroupType: model.AssetGroupLivenessFace, InitialChannelID: channelID, Lifecycle: model.AssetGroupActive}
+	require.NoError(t, model.DB.Create(&group).Error)
+	require.NoError(t, model.DB.Create(&model.AssetGroupReplica{GroupID: group.ID, ChannelID: channelID, UpstreamID: "remote-" + group.PublicID, State: model.AssetReady}).Error)
+	asset := model.Asset{PublicID: model.NewAssetID(), UserID: 1, ProjectName: "default", GroupID: group.ID, GroupPublicID: group.PublicID, Name: "portrait", AssetType: "Image", ObjectKey: "new-api-assets/" + common.GetUUID(), ObjectState: model.AssetReady, Status: model.AssetActive}
+	require.NoError(t, model.ReserveAsset(t.Context(), &asset, channelID))
+	require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ?", asset.ID).Updates(map[string]any{"status": model.AssetActive, "state": model.AssetReady, "upstream_id": "remote-" + asset.PublicID}).Error)
+	return group, asset
+}
+
+func TestAssetPortraitFiltersAndChannelBinding(t *testing.T) {
+	assetTestDatabase(t)
+	ctx := t.Context()
+	virtualGroup := assetTestGroup(t, 1, "virtual")
+	virtual := assetTestAsset(t, virtualGroup)
+	group, portrait := assetTestPortrait(t, 2)
+	actor := dto.AssetActor{UserID: 1, ChannelIDs: []int{1, 2}}
+	for _, item := range []struct{ kind, groupID, assetID string }{
+		{model.AssetGroupAIGC, virtualGroup.PublicID, virtual.PublicID},
+		{model.AssetGroupLivenessFace, group.PublicID, portrait.PublicID},
+	} {
+		for _, action := range []string{"ListAssetGroups", "ListAssets"} {
+			raw, err := common.Marshal(map[string]any{"Filter": map[string]any{"GroupType": item.kind}, "PageSize": 10, "PageNumber": 1})
+			require.NoError(t, err)
+			result, err := ExecuteAssetAction(ctx, actor, action, raw)
+			require.NoError(t, err)
+			page := result.(map[string]any)
+			require.EqualValues(t, 1, page["TotalCount"], action+item.kind)
+			body, err := common.Marshal(page["Items"])
+			require.NoError(t, err)
+			var items []struct {
+				ID string `json:"Id"`
+			}
+			require.NoError(t, common.Unmarshal(body, &items))
+			if action == "ListAssets" {
+				assert.Equal(t, item.assetID, items[0].ID)
+			} else {
+				assert.Equal(t, item.groupID, items[0].ID)
+			}
+		}
+	}
+
+	_, err := PrepareAssetRouting(ctx, actor, []string{portrait.PublicID, virtual.PublicID}, 1)
+	var failure *AssetError
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, "AssetNotReady", failure.Code)
+	replicas, err := model.AssetReplicas(ctx, []int64{portrait.ID})
+	require.NoError(t, err)
+	require.Len(t, replicas, 1, "a portrait is never copied to the preferred unverified channel")
+	assert.Equal(t, 2, replicas[0].ChannelID)
+	require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("asset_id = ? AND channel_id = 2", virtual.ID).Updates(map[string]any{"status": model.AssetActive, "state": model.AssetReady, "upstream_id": "remote-virtual-2"}).Error)
+	ready, err := PrepareAssetRouting(ctx, actor, []string{portrait.PublicID, virtual.PublicID}, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []int{2}, ready)
+	_, other := assetTestPortrait(t, 1)
+	_, err = PrepareAssetRouting(ctx, actor, []string{portrait.PublicID, other.PublicID}, 1)
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, "AssetChannelConflict", failure.Code)
+	_, err = PrepareAssetRouting(ctx, dto.AssetActor{UserID: 1, ChannelIDs: []int{1}}, []string{portrait.PublicID}, 1)
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, "AssetChannelUnavailable", failure.Code)
+	assert.ErrorIs(t, model.EnsureAssetReplicas(ctx, []model.Asset{portrait}, 1, 0), model.ErrAssetChannelConflict)
+	_, err = model.HoldAssetUses(ctx, 1, 1, []string{portrait.PublicID}, "forbidden-channel")
+	assert.ErrorIs(t, err, model.ErrAssetChannelConflict)
+}
+
+func TestAssetPortraitDeletionPreservesOriginalUntilConfirmed(t *testing.T) {
+	assetTestDatabase(t)
+	ctx := t.Context()
+	group, asset := assetTestPortrait(t, 1)
+	_, err := model.HoldAssetUses(ctx, 1, 1, []string{asset.PublicID}, "ongoing-video")
+	require.NoError(t, err)
+	calls := 0
+	status, response := http.StatusForbidden, `{"ResponseMetadata":{"Error":{"Code":"OperationDenied","Message":"Authorization is still active"}}}`
+	httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+		calls++
+		assert.Equal(t, "DeleteAssetGroup", request.URL.Query().Get("Action"))
+		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(response)), Request: request}, nil
+	})
+	require.NoError(t, model.DeleteAssetGroup(ctx, 1, group.PublicID, "default"))
+	require.NoError(t, deleteHumanAssetGroups(ctx, time.Now().Unix()))
+	assert.Zero(t, calls, "in-flight videos keep the upstream group alive")
+	_, err = model.HoldAssetUses(ctx, 1, 1, []string{asset.PublicID}, "new-video")
+	assert.ErrorIs(t, err, model.ErrAssetGroupUnavailable)
+	assert.ErrorIs(t, model.DeleteAsset(ctx, 1, asset.PublicID, "default"), model.ErrAssetGroupUnavailable)
+	assert.ErrorIs(t, model.EnsureAssetReplicas(ctx, []model.Asset{asset}, 1, 0), model.ErrAssetGroupUnavailable)
+	require.NoError(t, model.ReleaseAssetUses(ctx, "ongoing-video"))
+	require.NoError(t, deleteHumanAssetGroups(ctx, time.Now().Unix()))
+	assert.Equal(t, 1, calls)
+	stored, err := model.GetAssetGroup(ctx, 1, group.PublicID, "default")
+	require.NoError(t, err)
+	assert.Equal(t, model.AssetGroupDeleteBlocked, stored.Lifecycle)
+	original, err := model.GetAsset(ctx, 1, asset.PublicID, "default")
+	require.NoError(t, err)
+	assert.Equal(t, asset.ObjectKey, original.ObjectKey)
+	assert.Equal(t, model.AssetReady, original.ObjectState)
+	cleanup, err := model.ClaimAssetWork(ctx, time.Now().Unix(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, cleanup)
+	require.NoError(t, model.CancelAssetGroupDeletion(ctx, 1, group.PublicID, "default"))
+	_, err = model.HoldAssetUses(ctx, 1, 1, []string{asset.PublicID}, "after-cancel")
+	require.NoError(t, err)
+	require.NoError(t, model.ReleaseAssetUses(ctx, "after-cancel"))
+
+	status, response = http.StatusOK, `{"Result":{}}`
+	require.NoError(t, model.DeleteAssetGroup(ctx, 1, group.PublicID, "default"))
+	require.NoError(t, deleteHumanAssetGroups(ctx, time.Now().Unix()))
+	stored, err = model.GetAssetGroup(ctx, 1, group.PublicID, "default")
+	require.NoError(t, err, "completed deletion keeps an owner-scoped tombstone")
+	assert.Equal(t, model.AssetGroupDeleted, stored.Lifecycle)
+	replica, err := model.GetAssetReplica(ctx, asset.ID, 1)
+	require.NoError(t, err)
+	assert.Equal(t, model.AssetDeleted, replica.State)
+	cleanup, err = model.ClaimAssetWork(ctx, time.Now().Unix(), 10)
+	require.NoError(t, err)
+	require.Len(t, cleanup, 1, "S3 cleanup starts only after confirmed upstream deletion")
+	assert.Equal(t, asset.ID, cleanup[0].ID)
+}
+
+func TestAssetPortraitUnknownDeletionCannotBeCancelled(t *testing.T) {
+	assetTestDatabase(t)
+	ctx := t.Context()
+	group, asset := assetTestPortrait(t, 1)
+	response := `{"Result":{}}`
+	status := http.StatusOK
+	transportError := true
+	httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if transportError {
+			return nil, fmt.Errorf("connection closed before response")
+		}
+		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(response)), Request: request}, nil
+	})
+	require.NoError(t, model.DeleteAssetGroup(ctx, 1, group.PublicID, "default"))
+	require.NoError(t, deleteHumanAssetGroups(ctx, time.Now().Unix()))
+	stored, err := model.GetAssetGroup(ctx, 1, group.PublicID, "default")
+	require.NoError(t, err)
+	assert.Equal(t, model.AssetGroupDeleteUnknown, stored.Lifecycle)
+	assert.Error(t, model.CancelAssetGroupDeletion(ctx, 1, group.PublicID, "default"))
+	transportError, status, response = false, http.StatusForbidden, `{"ResponseMetadata":{"Error":{"Code":"AccessDenied","Message":"Access denied"}}}`
+	require.NoError(t, model.DeleteAssetGroup(ctx, 1, group.PublicID, "default"))
+	require.NoError(t, deleteHumanAssetGroups(ctx, time.Now().Unix()))
+	assert.Error(t, model.CancelAssetGroupDeletion(ctx, 1, group.PublicID, "default"), "a later denial cannot prove an earlier uncertain delete failed")
+	original, err := model.GetAsset(ctx, 1, asset.PublicID, "default")
+	require.NoError(t, err)
+	assert.Equal(t, model.AssetReady, original.ObjectState)
+}
+
+func TestAssetDeletionRequiresExplicitUpstreamAbsence(t *testing.T) {
+	for _, tc := range []struct {
+		code   string
+		status int
+		absent bool
+	}{
+		{"UpstreamHTTP404", 404, false},
+		{"UpstreamError", 404, false},
+		{"ResourceNotFoundWrongPrefix", 404, false},
+		{"ResourceNotFound", 404, true},
+		{"ResourceNotFound.AssetGroup", 400, true},
+	} {
+		assert.Equal(t, tc.absent, assetUpstreamNotFound(assetError(tc.status, tc.code, "safe error")), tc.code)
+	}
+}
+
+func TestAssetPortraitDeleteRejectsUnconfirmedSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"boolean result", 200, `{"Result":false}`},
+		{"string result", 200, `{"Result":"queued"}`},
+		{"queued result", 200, `{"Result":{"Status":"pending"}}`},
+		{"async accepted", 202, `{"Result":{}}`},
+		{"proxy routing 404", 404, `not found`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assetTestDatabase(t)
+			group, asset := assetTestPortrait(t, 1)
+			httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tc.status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(tc.body)), Request: request}, nil
+			})
+			require.NoError(t, model.DeleteAssetGroup(t.Context(), 1, group.PublicID, "default"))
+			require.NoError(t, deleteHumanAssetGroups(t.Context(), time.Now().Unix()))
+			stored, err := model.GetAssetGroup(t.Context(), 1, group.PublicID, "default")
+			require.NoError(t, err)
+			assert.Zero(t, stored.DeletedAt)
+			assert.NotEqual(t, model.AssetGroupDeleted, stored.Lifecycle)
+			original, err := model.GetAsset(t.Context(), 1, asset.PublicID, "default")
+			require.NoError(t, err)
+			assert.Equal(t, model.AssetReady, original.ObjectState)
+			cleanup, err := model.ClaimAssetWork(t.Context(), time.Now().Unix(), 10)
+			require.NoError(t, err)
+			assert.Empty(t, cleanup)
+		})
+	}
+}
+
+func TestAssetPortraitDeletionFencesActiveAndExpiredWorkers(t *testing.T) {
+	for _, kind := range []string{"source", "replica", "group"} {
+		t.Run(kind, func(t *testing.T) {
+			assetTestDatabase(t)
+			group, asset := assetTestPortrait(t, 1)
+			now := time.Now().Unix()
+			var row any = &asset
+			if kind == "replica" {
+				replica, err := model.GetAssetReplica(t.Context(), asset.ID, 1)
+				require.NoError(t, err)
+				row = &replica
+			} else if kind == "group" {
+				replica, err := model.GetAssetGroupReplica(t.Context(), group.ID, 1)
+				require.NoError(t, err)
+				row = &replica
+			}
+			require.NoError(t, model.DB.Model(row).Updates(map[string]any{"lease_token": "active-worker", "lease_expires_at": now + 180}).Error)
+			require.NoError(t, model.DeleteAssetGroup(t.Context(), 1, group.PublicID, "default"))
+			claims, err := model.ClaimHumanAssetGroupDeletions(t.Context(), now, 1)
+			require.NoError(t, err)
+			assert.Empty(t, claims, "an in-flight network operation must finish before deletion")
+			claims, err = model.ClaimHumanAssetGroupDeletions(t.Context(), now+181, 1)
+			require.NoError(t, err)
+			require.Len(t, claims, 1)
+			newClaims, err := model.ClaimHumanAssetGroupDeletions(t.Context(), claims[0].LeaseExpiresAt+1, 1)
+			require.NoError(t, err)
+			require.Len(t, newClaims, 1)
+			assert.ErrorIs(t, model.FinishHumanAssetGroupDeletion(t.Context(), &claims[0], model.AssetGroupDeleted, "", "", 0), model.ErrAssetConflict)
+			require.NoError(t, model.FinishHumanAssetGroupDeletion(t.Context(), &newClaims[0], model.AssetGroupDeleteBlocked, "AccessDenied", "Access denied", 0))
+			assert.Error(t, model.CancelAssetGroupDeletion(t.Context(), 1, group.PublicID, "default"), "an expired worker might already have deleted the upstream group")
+			original, err := model.GetAsset(t.Context(), 1, asset.PublicID, "default")
+			require.NoError(t, err)
+			assert.Equal(t, model.AssetReady, original.ObjectState)
+		})
+	}
 }

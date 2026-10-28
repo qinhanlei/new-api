@@ -31,6 +31,8 @@ func TestSetUpLoggerMasksQueryCredentials(t *testing.T) {
 		{"/v1/models?alt=sse&api-version=2024-02-01", "/v1/models?alt=sse&api-version=2024-02-01"},
 		{"/v1/models", "/v1/models"},
 		{"/%61pi/oauth/test?code=secret&state=secret", "/api/oauth/test"},
+		{"/api/assets/validation/callback/secret-state?bytedToken=secret-token&resultCode=10000", "/api/assets/validation/callback/[redacted]"},
+		{"/%61pi/assets/validation/callback/secret-state?bytedToken=secret-token", "/api/assets/validation/callback/[redacted]"},
 	} {
 		t.Run(tc.target, func(t *testing.T) {
 			var output bytes.Buffer

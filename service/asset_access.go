@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // ResolveAssetActor deliberately does not select a model for management
@@ -22,6 +23,7 @@ func ResolveAssetActor(c *gin.Context) (dto.AssetActor, error) {
 	if err != nil {
 		return actor, err
 	}
+	actor.InitiatorID = actor.UserID
 	pin, pinned, _ := GetChannelConstraints(c).ResolvedPin()
 	if pinned {
 		if slices.Contains(actor.ChannelIDs, pin.ChannelId) {
@@ -50,14 +52,23 @@ func AssetChannelAuthorized(ctx context.Context, userID, tokenID, channelID int)
 }
 
 func authorizedAssetChannels(ctx context.Context, userID, tokenID, channelID int) ([]int, error) {
-	user, err := model.GetUserById(userID, false)
+	return authorizedAssetChannelsWithDB(ctx, model.DB, userID, tokenID, channelID)
+}
+
+// A validation completion reads policy through its transaction, after locking
+// the original credential, owner and channel. Normal routing uses the same rules.
+func authorizedAssetChannelsWithDB(ctx context.Context, db *gorm.DB, userID, tokenID, channelID int) ([]int, error) {
+	db = db.WithContext(ctx)
+	var user model.User
+	err := db.Omit("password", "access_token").First(&user, userID).Error
 	if err != nil || user.Status != common.UserStatusEnabled {
 		return nil, &AssetError{HTTPStatus: http.StatusForbidden, Code: "AccessDenied", Message: "The asset owner is unavailable."}
 	}
 	groups := []string{user.Group}
 	var modelLimits map[string]bool
 	if tokenID > 0 {
-		token, tokenErr := model.GetTokenById(tokenID)
+		var token model.Token
+		tokenErr := db.First(&token, tokenID).Error
 		if tokenErr != nil || token.UserId != userID || token.Status != common.TokenStatusEnabled ||
 			(token.ExpiredTime != -1 && token.ExpiredTime <= time.Now().Unix()) {
 			return nil, &AssetError{HTTPStatus: http.StatusForbidden, Code: "AccessDenied", Message: "The asset API token is unavailable."}
@@ -92,7 +103,7 @@ func authorizedAssetChannels(ctx context.Context, userID, tokenID, channelID int
 			}
 		}
 	}
-	abilities, err := model.LoadAssetAccessAbilities(ctx, channelID)
+	abilities, err := model.LoadAssetAccessAbilitiesWithDB(db, channelID)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +120,8 @@ func authorizedAssetChannels(ctx context.Context, userID, tokenID, channelID int
 		}
 		channel, loaded := channels[ability.ChannelId]
 		if !loaded {
-			channel, err = model.GetChannelById(ability.ChannelId, true)
+			channel = &model.Channel{}
+			err = db.First(channel, ability.ChannelId).Error
 			if err != nil {
 				return nil, err
 			}
@@ -118,7 +130,7 @@ func authorizedAssetChannels(ctx context.Context, userID, tokenID, channelID int
 		if !AssetPluginSupportsChannel(channel, ability.Model) {
 			continue
 		}
-		config, configErr := model.LoadAssetChannelConfig(ctx, channel.Id)
+		config, configErr := model.LoadAssetChannelConfigWithDB(db, channel.Id)
 		if configErr != nil {
 			return nil, configErr
 		}

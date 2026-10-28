@@ -74,8 +74,16 @@ export function AssetListTable({
   const [deleting, setDeleting] = useState<Asset | null>(null)
   const [replicas, setReplicas] = useState<Asset | null>(null)
   const [preview, setPreview] = useState<Asset | null>(null)
+  const frozen = Boolean(group?.Status && group.Status !== 'active')
   const query = useQuery({
-    queryKey: [...assetQueryKeys.all, 'list', group?.Id, scope, pagination],
+    queryKey: [
+      ...assetQueryKeys.all,
+      'list',
+      group?.GroupType,
+      group?.Id,
+      scope,
+      pagination,
+    ],
     enabled: Boolean(group),
     queryFn: ({ signal }) => {
       if (!group) return { Items: [], TotalCount: 0 }
@@ -83,7 +91,7 @@ export function AssetListTable({
         'ListAssets',
         {
           ProjectName: group.ProjectName,
-          Filter: { GroupType: 'AIGC', GroupIds: [group.Id] },
+          Filter: { GroupType: group.GroupType, GroupIds: [group.Id] },
           PageNumber: pagination.pageIndex + 1,
           PageSize: pagination.pageSize,
         },
@@ -121,10 +129,12 @@ export function AssetListTable({
           <p>{asset.Name}</p>
           <div className='text-muted-foreground flex items-center gap-1 text-xs'>
             <code className='max-w-64 truncate'>asset://{asset.Id}</code>
-            <CopyButton
-              value={`asset://${asset.Id}`}
-              tooltip={t('Copy asset URI')}
-            />
+            {!frozen && (
+              <CopyButton
+                value={`asset://${asset.Id}`}
+                tooltip={t('Copy asset URI')}
+              />
+            )}
           </div>
         </div>
       ),
@@ -186,7 +196,7 @@ export function AssetListTable({
             variant='ghost'
             size='icon-sm'
             aria-label={t('Delete {{name}}', { name: asset.Name })}
-            disabled={scope.allUsers}
+            disabled={scope.allUsers || frozen}
             onClick={() => {
               remove.reset()
               setDeleting(asset)
@@ -255,6 +265,7 @@ export function AssetListTable({
         confirmText={t('Delete')}
         destructive
         isLoading={remove.isPending}
+        disabled={frozen}
         handleConfirm={() => deleting && remove.mutate(deleting)}
       >
         {remove.isError && (
@@ -267,6 +278,7 @@ export function AssetListTable({
         <AssetReplicasDialog
           asset={replicas}
           scope={{ userId: replicas.UserId ?? scope.userId }}
+          readOnly={frozen}
           onClose={() => setReplicas(null)}
         />
       )}

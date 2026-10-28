@@ -22,7 +22,14 @@ import {
   useQueryClient,
 } from '@tanstack/react-query'
 import { Copy, MoreHorizontal, Plus, RefreshCw } from 'lucide-react'
-import { useId, useState, type ReactNode } from 'react'
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useId,
+  useState,
+  type ReactNode,
+} from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -47,10 +54,17 @@ import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { getServerErrorMessage } from '@/lib/server-error-message'
 
 import { assetQueryKeys, executeAssetAction } from '../api'
-import type { AssetGroup, AssetScope } from '../types'
+import type { AssetGroup, AssetGroupType, AssetScope } from '../types'
 import { AssetCreateDialog } from './asset-create-dialog'
 import { AssetGroupDialog } from './asset-group-dialog'
+import { AssetGroupLifecycle } from './asset-group-lifecycle'
 import { AssetListTable } from './asset-list-table'
+
+const AssetValidationDialog = lazy(() =>
+  import('./asset-validation-dialog').then((module) => ({
+    default: module.AssetValidationDialog,
+  }))
+)
 
 export function AssetBrowser({
   project,
@@ -72,20 +86,22 @@ export function AssetBrowser({
   const client = useQueryClient()
   const { copyToClipboard } = useCopyToClipboard()
   const [groupId, setGroupId] = useState('')
-  const [groupDialog, setGroupDialog] = useState<'create' | 'rename' | null>(
+  const [groupType, setGroupType] = useState<AssetGroupType>('AIGC')
+  const [validating, setValidating] = useState(false)
+  const [groupDialog, setGroupDialog] = useState<'create' | AssetGroup | null>(
     null
   )
-  const [adding, setAdding] = useState(false)
-  const [deleting, setDeleting] = useState(false)
+  const [adding, setAdding] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState<AssetGroup | null>(null)
   const groups = useInfiniteQuery({
-    queryKey: [...assetQueryKeys.all, 'groups', project, scope],
+    queryKey: [...assetQueryKeys.all, 'groups', groupType, project, scope],
     initialPageParam: '',
     queryFn: ({ signal, pageParam }) =>
       executeAssetAction<{ Items: AssetGroup[]; NextToken?: string }>(
         'ListAssetGroups',
         {
           ProjectName: project,
-          Filter: { GroupType: 'AIGC' },
+          Filter: { GroupType: groupType },
           MaxResults: 100,
           ...(pageParam ? { NextToken: pageParam } : {}),
         },
@@ -93,21 +109,34 @@ export function AssetBrowser({
         signal
       ),
     getNextPageParam: (page) => page.NextToken || undefined,
+    refetchInterval: groupType === 'LivenessFace' ? 10_000 : false,
     meta: { errorToast: false },
   })
   const items = groups.data?.pages.flatMap((page) => page.Items) ?? []
   const group = items.find((item) => item.Id === groupId) ?? items[0]
+  const frozen = Boolean(group?.Status && group.Status !== 'active')
+  const addingGroup = items.find((item) => item.Id === adding)
+  const canAddToGroup = Boolean(
+    addingGroup && (!addingGroup.Status || addingGroup.Status === 'active')
+  )
+  useEffect(() => {
+    if (adding && !canAddToGroup) setAdding(null)
+  }, [adding, canAddToGroup])
   const remove = useMutation({
     mutationFn: (target: AssetGroup) =>
-      executeAssetAction(
+      executeAssetAction<{ Status?: AssetGroup['Status'] }>(
         'DeleteAssetGroup',
         { ProjectName: project, Id: target.Id },
         scope
       ),
-    onSuccess: () => {
-      setDeleting(false)
+    onSuccess: (result) => {
+      setDeleting(null)
       void client.invalidateQueries({ queryKey: assetQueryKeys.all })
-      toast.success(t('Deleted successfully'))
+      toast.success(
+        result.Status && result.Status !== 'deleted'
+          ? t('Group deletion requested')
+          : t('Deleted successfully')
+      )
     },
     meta: { errorToast: false },
   })
@@ -116,8 +145,16 @@ export function AssetBrowser({
       title={t('No asset groups')}
       action={
         !scope.allUsers && (
-          <Button onClick={() => setGroupDialog('create')}>
-            {t('Create asset group')}
+          <Button
+            onClick={() =>
+              groupType === 'LivenessFace'
+                ? setValidating(true)
+                : setGroupDialog('create')
+            }
+          >
+            {groupType === 'LivenessFace'
+              ? t('Verify a person')
+              : t('Create asset group')}
           </Button>
         )
       }
@@ -140,8 +177,8 @@ export function AssetBrowser({
         <SectionPageLayout.Actions>
           {settingsActions}
           <Button
-            disabled={!group || scope.allUsers}
-            onClick={() => setAdding(true)}
+            disabled={!group || scope.allUsers || frozen}
+            onClick={() => setAdding(group?.Id ?? null)}
           >
             <Plus className='size-4' />
             {t('Add asset')}
@@ -160,9 +197,19 @@ export function AssetBrowser({
                 }
               />
             )}
+            {group?.GroupType === 'LivenessFace' && (
+              <AssetGroupLifecycle
+                group={group}
+                scope={scope}
+                onRetryDelete={() => {
+                  remove.reset()
+                  setDeleting(group ?? null)
+                }}
+              />
+            )}
             <div className='min-h-0 flex-1'>
               <AssetListTable
-                key={group?.Id ?? 'empty'}
+                key={`${groupType}:${group?.Id ?? 'empty'}`}
                 group={group}
                 scope={scope}
                 admin={admin}
@@ -171,6 +218,24 @@ export function AssetBrowser({
                   hideViewOptions: true,
                   additionalSearch: (
                     <>
+                      <Label className='sr-only' htmlFor={`${id}-type`}>
+                        {t('Library type')}
+                      </Label>
+                      <NativeSelect
+                        id={`${id}-type`}
+                        value={groupType}
+                        onChange={(event) => {
+                          setGroupType(event.target.value as AssetGroupType)
+                          setGroupId('')
+                          setAdding(null)
+                          setGroupDialog(null)
+                          setValidating(false)
+                          setDeleting(null)
+                        }}
+                      >
+                        <option value='AIGC'>{t('Virtual people')}</option>
+                        <option value='LivenessFace'>{t('Real people')}</option>
+                      </NativeSelect>
                       <div className='flex min-w-0 items-center gap-2'>
                         <Label className='sr-only' htmlFor={id}>
                           {t('Asset group')}
@@ -223,13 +288,19 @@ export function AssetBrowser({
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 disabled={scope.allUsers}
-                                onClick={() => setGroupDialog('create')}
+                                onClick={() =>
+                                  groupType === 'LivenessFace'
+                                    ? setValidating(true)
+                                    : setGroupDialog('create')
+                                }
                               >
-                                {t('Create asset group')}
+                                {groupType === 'LivenessFace'
+                                  ? t('Verify a person')
+                                  : t('Create asset group')}
                               </DropdownMenuItem>
                               <DropdownMenuItem
-                                disabled={!group || scope.allUsers}
-                                onClick={() => setGroupDialog('rename')}
+                                disabled={!group || scope.allUsers || frozen}
+                                onClick={() => setGroupDialog(group ?? null)}
                               >
                                 {t('Rename')}
                               </DropdownMenuItem>
@@ -238,10 +309,10 @@ export function AssetBrowser({
                             <DropdownMenuGroup>
                               <DropdownMenuItem
                                 variant='destructive'
-                                disabled={!group || scope.allUsers}
+                                disabled={!group || scope.allUsers || frozen}
                                 onClick={() => {
                                   remove.reset()
-                                  setDeleting(true)
+                                  setDeleting(group ?? null)
                                 }}
                               >
                                 {t('Delete group')}
@@ -291,34 +362,54 @@ export function AssetBrowser({
           </div>
         </SectionPageLayout.Content>
       </SectionPageLayout>
-      {groupDialog && (
+      {groupDialog && !frozen && (
         <AssetGroupDialog
-          group={groupDialog === 'rename' ? group : undefined}
+          group={groupDialog === 'create' ? undefined : groupDialog}
           project={project}
           scope={scope}
           onClose={() => setGroupDialog(null)}
         />
       )}
-      {adding && group && (
+      {validating && !scope.allUsers && (
+        <Suspense fallback={<LoadingState />}>
+          <AssetValidationDialog
+            project={project}
+            scope={scope}
+            onClose={() => setValidating(false)}
+            onCreated={(createdId) => {
+              setGroupId(createdId)
+              setValidating(false)
+            }}
+          />
+        </Suspense>
+      )}
+      {addingGroup && canAddToGroup && (
         <AssetCreateDialog
-          group={group}
+          group={addingGroup}
           scope={scope}
-          onClose={() => setAdding(false)}
+          onClose={() => setAdding(null)}
         />
       )}
       <ConfirmDialog
-        open={deleting}
-        onOpenChange={(open) => !remove.isPending && setDeleting(open)}
+        open={Boolean(deleting)}
+        onOpenChange={(open) => !open && !remove.isPending && setDeleting(null)}
         title={t('Delete asset group')}
         desc={t(
           'Delete {{name}} and all assets in this group? Their asset URIs will no longer work.',
-          { name: group?.Name }
+          { name: deleting?.Name }
         )}
         destructive
         confirmText={t('Delete')}
         isLoading={remove.isPending}
-        handleConfirm={() => group && remove.mutate(group)}
+        handleConfirm={() => deleting && remove.mutate(deleting)}
       >
+        {deleting?.GroupType === 'LivenessFace' && (
+          <p className='text-muted-foreground text-sm'>
+            {t(
+              'Uploads and new uses are paused while the provider confirms deletion. Originals are kept until deletion is confirmed.'
+            )}
+          </p>
+        )}
         {remove.isError && (
           <p role='alert' className='text-destructive text-sm'>
             {getServerErrorMessage(remove.error)}

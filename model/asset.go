@@ -15,20 +15,29 @@ import (
 )
 
 const (
-	AssetIDPrefix      = "asset-na-"
-	AssetGroupIDPrefix = "group-na-"
-	AssetProcessing    = "Processing"
-	AssetActive        = "Active"
-	AssetFailed        = "Failed"
-	AssetPending       = "pending"
-	AssetReady         = "ready"
-	AssetUnknown       = "unknown"
-	AssetDeleted       = "deleted"
+	AssetIDPrefix           = "asset-na-"
+	AssetGroupIDPrefix      = "group-na-"
+	AssetProcessing         = "Processing"
+	AssetActive             = "Active"
+	AssetFailed             = "Failed"
+	AssetPending            = "pending"
+	AssetReady              = "ready"
+	AssetUnknown            = "unknown"
+	AssetDeleted            = "deleted"
+	AssetGroupAIGC          = "AIGC"
+	AssetGroupLivenessFace  = "LivenessFace"
+	AssetGroupActive        = "active"
+	AssetGroupDeletePending = "delete_pending"
+	AssetGroupDeleteUnknown = "delete_unknown"
+	AssetGroupDeleteBlocked = "delete_blocked"
+	AssetGroupDeleted       = "deleted"
 )
 
 var ErrAssetConflict = errors.New("asset configuration or state changed; retry the operation")
 var ErrAssetInUse = errors.New("asset resources must be removed before changing their storage or upstream account")
 var ErrAssetStorageDisabled = errors.New("asset storage is disabled")
+var ErrAssetGroupUnavailable = errors.New("asset group is unavailable while deletion is pending")
+var ErrAssetChannelConflict = errors.New("real-person assets must use their authorized channel")
 
 type AssetGroup struct {
 	ID               int64  `gorm:"primaryKey"`
@@ -39,12 +48,24 @@ type AssetGroup struct {
 	Description      string `gorm:"size:300"`
 	GroupType        string `gorm:"size:32"`
 	InitialChannelID int
+	Lifecycle        string `gorm:"size:24;index"`
+	ErrorCode        string `gorm:"size:128"`
+	ErrorMessage     string `gorm:"type:text"`
+	DeleteUncertain  bool
+	NextAttemptAt    int64
+	LeaseToken       string `gorm:"size:64"`
+	LeaseExpiresAt   int64
 	CreatedAt        int64
 	UpdatedAt        int64
 	DeletedAt        int64 `gorm:"index"`
 }
 
 func (AssetGroup) TableName(namer schema.Namer) string { return namer.TableName("ArkAssetGroup") }
+
+// Empty lifecycle values belong to groups created before deletion tracking.
+func (group AssetGroup) Usable() bool {
+	return group.DeletedAt == 0 && (group.Lifecycle == "" || group.Lifecycle == AssetGroupActive)
+}
 
 type Asset struct {
 	ID                 int64  `gorm:"primaryKey"`
@@ -129,7 +150,7 @@ type AssetUse struct {
 func (AssetUse) TableName(namer schema.Namer) string { return namer.TableName("ArkAssetUse") }
 
 func AssetModels() []any {
-	return []any{&AssetGroup{}, &Asset{}, &AssetGroupReplica{}, &AssetReplica{}, &AssetUse{}}
+	return []any{&AssetGroup{}, &Asset{}, &AssetGroupReplica{}, &AssetReplica{}, &AssetUse{}, &AssetValidationSession{}, &AssetValidationRateWindow{}}
 }
 
 func CreateAssetGroup(ctx context.Context, group *AssetGroup) error {
@@ -138,7 +159,8 @@ func CreateAssetGroup(ctx context.Context, group *AssetGroup) error {
 
 func GetAssetGroup(ctx context.Context, userID int, publicID, project string) (*AssetGroup, error) {
 	var group AssetGroup
-	err := protectedAssetDB(ctx).Where("user_id = ? AND public_id = ? AND project_name = ? AND deleted_at = 0", userID, publicID, project).First(&group).Error
+	err := protectedAssetDB(ctx).Where("user_id = ? AND public_id = ? AND project_name = ?", userID, publicID, project).
+		Where("deleted_at = 0 OR (group_type = ? AND lifecycle = ?)", AssetGroupLivenessFace, AssetGroupDeleted).First(&group).Error
 	return &group, err
 }
 
@@ -179,6 +201,12 @@ func ReserveAsset(ctx context.Context, asset *Asset, channelID int) error {
 		if err = lockForUpdate(tx).Where("id = ? AND user_id = ? AND deleted_at = 0", asset.GroupID, asset.UserID).First(&group).Error; err != nil {
 			return err
 		}
+		if !group.Usable() {
+			return ErrAssetGroupUnavailable
+		}
+		if group.GroupType == AssetGroupLivenessFace && (channelID <= 0 || group.InitialChannelID != channelID) {
+			return ErrAssetChannelConflict
+		}
 		if group.InitialChannelID == 0 {
 			if err = tx.Model(&group).Update("initial_channel_id", channelID).Error; err != nil {
 				return err
@@ -192,26 +220,42 @@ func ReserveAsset(ctx context.Context, asset *Asset, channelID int) error {
 }
 
 func UpdateAssetGroup(ctx context.Context, userID int, id, project string, name, description *string) error {
-	values := map[string]any{"updated_at": time.Now().Unix()}
-	if name != nil {
-		values["name"] = *name
-	}
-	if description != nil {
-		values["description"] = *description
-	}
-	result := protectedAssetDB(ctx).Model(&AssetGroup{}).Where("user_id = ? AND public_id = ? AND project_name = ? AND deleted_at = 0", userID, id, project).Updates(values)
-	if result.Error == nil && result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return result.Error
+	return protectedAssetDB(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockAssetStorage(tx); err != nil {
+			return err
+		}
+		var group AssetGroup
+		if err := lockForUpdate(tx).Where("user_id = ? AND public_id = ? AND project_name = ? AND deleted_at = 0", userID, id, project).First(&group).Error; err != nil {
+			return err
+		}
+		if !group.Usable() {
+			return ErrAssetGroupUnavailable
+		}
+		values := map[string]any{"updated_at": time.Now().Unix()}
+		if name != nil {
+			values["name"] = *name
+		}
+		if description != nil {
+			values["description"] = *description
+		}
+		return tx.Model(&group).Updates(values).Error
+	})
 }
 
 func UpdateAssetName(ctx context.Context, userID int, id, project, name string) error {
-	result := protectedAssetDB(ctx).Model(&Asset{}).Where("user_id = ? AND public_id = ? AND project_name = ? AND deleted_at = 0", userID, id, project).Updates(map[string]any{"name": name, "updated_at": time.Now().Unix()})
-	if result.Error == nil && result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return result.Error
+	return protectedAssetDB(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockAssetStorage(tx); err != nil {
+			return err
+		}
+		var asset Asset
+		if err := tx.Where("user_id = ? AND public_id = ? AND project_name = ? AND deleted_at = 0", userID, id, project).First(&asset).Error; err != nil {
+			return err
+		}
+		if _, err := checkAssetGroupChannel(tx, asset.GroupID, 0); err != nil {
+			return err
+		}
+		return tx.Model(&asset).Updates(map[string]any{"name": name, "updated_at": time.Now().Unix()}).Error
+	})
 }
 
 func DeleteAsset(ctx context.Context, userID int, id, project string) error {
@@ -219,12 +263,15 @@ func DeleteAsset(ctx context.Context, userID int, id, project string) error {
 		if _, err := lockAssetStorage(tx); err != nil {
 			return err
 		}
-		now := time.Now().Unix()
-		result := tx.Model(&Asset{}).Where("user_id = ? AND public_id = ? AND project_name = ? AND deleted_at = 0", userID, id, project).Updates(map[string]any{"deleted_at": now, "updated_at": now, "next_attempt_at": now})
-		if result.Error == nil && result.RowsAffected == 0 {
-			return gorm.ErrRecordNotFound
+		var asset Asset
+		if err := tx.Where("user_id = ? AND public_id = ? AND project_name = ? AND deleted_at = 0", userID, id, project).First(&asset).Error; err != nil {
+			return err
 		}
-		return result.Error
+		if _, err := checkAssetGroupChannel(tx, asset.GroupID, 0); err != nil {
+			return err
+		}
+		now := time.Now().Unix()
+		return tx.Model(&asset).Updates(map[string]any{"deleted_at": now, "updated_at": now, "next_attempt_at": now}).Error
 	})
 }
 
@@ -234,8 +281,14 @@ func DeleteAssetGroup(ctx context.Context, userID int, id, project string) error
 			return err
 		}
 		var group AssetGroup
-		if err := lockForUpdate(tx).Where("user_id = ? AND public_id = ? AND project_name = ? AND deleted_at = 0", userID, id, project).First(&group).Error; err != nil {
+		if err := lockForUpdate(tx).Where("user_id = ? AND public_id = ? AND project_name = ?", userID, id, project).First(&group).Error; err != nil {
 			return err
+		}
+		if group.GroupType == AssetGroupLivenessFace {
+			return requestHumanAssetGroupDeletion(tx, &group)
+		}
+		if group.DeletedAt > 0 {
+			return gorm.ErrRecordNotFound
 		}
 		now := time.Now().Unix()
 		if err := tx.Model(&group).Updates(map[string]any{"deleted_at": now, "updated_at": now}).Error; err != nil {
@@ -249,6 +302,7 @@ type AssetListQuery struct {
 	UserID      int
 	AllUsers    bool
 	ProjectName string
+	GroupType   string
 	GroupIDs    []string
 	Name        string
 	Statuses    []string
@@ -268,6 +322,14 @@ func assetListQuery(ctx context.Context, q AssetListQuery, groups bool) *gorm.DB
 		query = query.Model(&Asset{})
 	}
 	query = query.Where("deleted_at = 0")
+	if q.GroupType != "" {
+		if groups {
+			query = query.Where("group_type = ?", q.GroupType)
+		} else {
+			groupIDs := protectedAssetDB(ctx).Model(&AssetGroup{}).Select("id").Where("group_type = ?", q.GroupType)
+			query = query.Where("group_id IN (?)", groupIDs)
+		}
+	}
 	if !q.AllUsers {
 		query = query.Where("user_id = ?", q.UserID)
 	}
@@ -332,9 +394,18 @@ func ListAssets(ctx context.Context, q AssetListQuery) ([]Asset, int64, error) {
 }
 
 func ensureAssetReplica(tx *gorm.DB, asset *Asset, channelID, tokenID int) error {
-	group := AssetGroupReplica{GroupID: asset.GroupID, ChannelID: channelID, State: AssetPending}
-	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&group).Error; err != nil {
+	if channelID <= 0 {
+		return ErrAssetChannelConflict
+	}
+	sourceGroup, err := checkAssetGroupChannel(tx, asset.GroupID, channelID)
+	if err != nil {
 		return err
+	}
+	if sourceGroup.GroupType != AssetGroupLivenessFace {
+		group := AssetGroupReplica{GroupID: asset.GroupID, ChannelID: channelID, State: AssetPending}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&group).Error; err != nil {
+			return err
+		}
 	}
 	replica := AssetReplica{AssetID: asset.ID, ChannelID: channelID, TokenID: tokenID, Status: AssetProcessing, State: AssetPending, NextAttemptAt: time.Now().Unix()}
 	return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&replica).Error
@@ -365,6 +436,9 @@ func AssetReplicas(ctx context.Context, assetIDs []int64) ([]AssetReplica, error
 }
 
 func HoldAssetUses(ctx context.Context, userID, channelID int, ids []string, taskID string) ([]dto.ResolvedAssetReference, error) {
+	if channelID <= 0 {
+		return nil, ErrAssetChannelConflict
+	}
 	var result []dto.ResolvedAssetReference
 	err := protectedAssetDB(ctx).Transaction(func(tx *gorm.DB) error {
 		config, err := lockAssetStorage(tx)
@@ -377,6 +451,9 @@ func HoldAssetUses(ctx context.Context, userID, channelID int, ids []string, tas
 		for _, id := range ids {
 			var asset Asset
 			if err = tx.Where("public_id = ? AND user_id = ? AND deleted_at = 0", id, userID).First(&asset).Error; err != nil {
+				return err
+			}
+			if _, err = checkAssetGroupChannel(tx, asset.GroupID, channelID); err != nil {
 				return err
 			}
 			var replica AssetReplica

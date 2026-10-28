@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 export type AssetType = 'Image' | 'Video' | 'Audio'
+export type AssetGroupType = 'AIGC' | 'LivenessFace'
 
 export interface AssetSizeLimits {
   image: number
@@ -36,6 +37,40 @@ export interface AssetGroup {
   ProjectName: string
   GroupType: string
   UserId?: number
+  ChannelId?: number
+  Status?:
+    | 'active'
+    | 'delete_pending'
+    | 'delete_unknown'
+    | 'delete_blocked'
+    | 'deleted'
+  Error?: { Code: string; Message: string }
+}
+
+export interface AssetValidationSummary {
+  SessionId: string
+  Name: string
+  Status:
+    | 'creating'
+    | 'pending'
+    | 'verifying'
+    | 'created'
+    | 'failed'
+    | 'expired'
+    | 'unknown'
+  GroupId?: string
+  ChannelId: number
+  ExpiresAt: number
+  Error?: { Code: string; Message: string }
+}
+
+export interface AssetValidationView extends Omit<
+  AssetValidationSummary,
+  'SessionId'
+> {
+  BytedToken: string
+  H5Link?: string
+  CallbackURL?: string
 }
 
 export interface Asset {

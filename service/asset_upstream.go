@@ -274,6 +274,14 @@ func callAssetUpstream(ctx context.Context, channel *model.Channel, config syste
 	if envelope.Result == nil {
 		return assetError(http.StatusBadGateway, "UpstreamResultUnknown", "The upstream material response did not contain a result")
 	}
+	if action == "DeleteAssetGroup" || action == "DeleteAsset" {
+		// Deletion releases the only original. A queued or malformed 2xx is
+		// not the documented synchronous HTTP 200 with an empty Result object.
+		deleted, object := envelope.Result.(map[string]any)
+		if response.StatusCode != http.StatusOK || !object || len(deleted) != 0 {
+			return assetError(http.StatusBadGateway, "UpstreamResultUnknown", "The upstream material response could not be confirmed")
+		}
+	}
 	if result == nil {
 		return nil
 	}

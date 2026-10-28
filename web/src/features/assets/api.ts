@@ -28,6 +28,7 @@ import type {
   AssetSizeLimits,
   AssetStorageConfig,
   AssetStorageUpdate,
+  AssetValidationSummary,
 } from './types'
 
 interface AssetResponse<T> {
@@ -81,6 +82,22 @@ export async function uploadAsset(body: FormData, scope: AssetScope) {
       ...authRequestOptions,
       params: { user_id: scope.userId },
       headers: { 'Content-Type': undefined },
+    }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function getAssetValidationSessions(
+  project: string,
+  scope: AssetScope,
+  signal?: AbortSignal
+) {
+  const { data } = await api.get<AssetResponse<AssetValidationSummary[]>>(
+    '/api/assets/validation/sessions',
+    {
+      ...authRequestOptions,
+      signal,
+      params: { project_name: project, user_id: scope.userId },
     }
   )
   return requireServerSuccess(data).data

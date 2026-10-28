@@ -165,6 +165,10 @@ func LoadAssetChannelConfig(ctx context.Context, channelID int) (system_setting.
 	return loadAssetChannelConfig(protectedAssetDB(ctx), channelID)
 }
 
+func LoadAssetChannelConfigWithDB(tx *gorm.DB, channelID int) (system_setting.AssetChannelConfig, error) {
+	return loadAssetChannelConfig(tx.Session(&gorm.Session{Logger: logger.Discard}), channelID)
+}
+
 func loadAssetChannelConfig(tx *gorm.DB, channelID int) (system_setting.AssetChannelConfig, error) {
 	config := system_setting.AssetChannelConfig{}
 	config.ProjectName = "default"
@@ -210,6 +214,11 @@ func SaveAssetChannelConfig(ctx context.Context, channelID int, next system_sett
 		if next.ChannelScope != AssetChannelScope(&channel) {
 			return ErrAssetConflict
 		}
+		if current.SecretKey != next.SecretKey {
+			if err = PendingValidationChannelGuard(tx, []int{channelID}); err != nil {
+				return err
+			}
+		}
 		if current.Endpoint != next.Endpoint || current.ProjectName != next.ProjectName || current.AuthType != next.AuthType || current.AccessKey != next.AccessKey || current.ChannelScope != next.ChannelScope {
 			if err = checkAssetChannelResources(tx, []int{channelID}); err != nil {
 				if !errors.Is(err, ErrAssetInUse) {
@@ -233,6 +242,9 @@ func SaveAssetChannelConfig(ctx context.Context, channelID int, next system_sett
 // Only a path correction on the same account is recoverable without removing
 // resources. Uncertain creations stay recorded for explicit reconciliation.
 func checkAssetEndpointRepair(tx *gorm.DB, channelID int, current, next system_setting.AssetChannelConfig) error {
+	if err := PendingValidationChannelGuard(tx, []int{channelID}); err != nil {
+		return err
+	}
 	before, beforeErr := url.Parse(current.Endpoint)
 	after, afterErr := url.Parse(next.Endpoint)
 	if !next.Enabled || beforeErr != nil || afterErr != nil || before.Scheme != after.Scheme || !strings.EqualFold(before.Host, after.Host) ||
@@ -275,6 +287,9 @@ func checkAssetEndpointRepair(tx *gorm.DB, channelID int, current, next system_s
 }
 
 func checkAssetChannelResources(tx *gorm.DB, ids []int) error {
+	if err := PendingValidationChannelGuard(tx, ids); err != nil {
+		return err
+	}
 	var count int64
 	if err := tx.Model(&AssetGroupReplica{}).Where("channel_id IN ? AND state <> ?", ids, AssetDeleted).Count(&count).Error; err != nil {
 		return err

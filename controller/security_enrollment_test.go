@@ -593,6 +593,59 @@ func TestAssetManagementRejectsCrossUserAndReadOnlyTokens(t *testing.T) {
 	}
 }
 
+func TestVisualValidationResultRequiresWritePermission(t *testing.T) {
+	for _, action := range []string{"CreateVisualValidateSession", "GetVisualValidateResult", "CancelAssetGroupDeletion"} {
+		t.Run(action, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(response)
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/assets/actions?Action="+action+"&Version=2024-01-01", strings.NewReader(`{}`))
+			c.Set("id", 1)
+			c.Set("role", common.RoleCommonUser)
+			c.Set("use_access_token", true)
+			c.Set("access_token_id", 1)
+			c.Set("access_token_scopes", []string{"asset:read"})
+			ManageAssetAction(c)
+			assert.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+		})
+	}
+}
+
+func TestHumanAssetGroupDeletionIsAcceptedAndQueryable(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	group := model.AssetGroup{PublicID: model.NewAssetGroupID(), UserID: user.Id, ProjectName: "default", Name: "portrait", GroupType: model.AssetGroupLivenessFace, InitialChannelID: 1, Lifecycle: model.AssetGroupActive}
+	require.NoError(t, model.DB.Create(&group).Error)
+	body, err := common.Marshal(map[string]string{"Id": group.PublicID})
+	require.NoError(t, err)
+	for range 2 {
+		response := securityEnrollmentRequest(http.MethodPost, "/api/assets/actions?Action=DeleteAssetGroup&Version=2024-01-01", string(body), "", identity, ManageAssetAction)
+		require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"Status":"delete_pending"`)
+		assert.Contains(t, response.Body.String(), group.PublicID)
+	}
+	response := securityEnrollmentRequest(http.MethodPost, "/api/assets/actions?Action=GetAssetGroup&Version=2024-01-01", string(body), "", identity, ManageAssetAction)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"Status":"delete_pending"`)
+	stored, err := model.GetAssetGroup(t.Context(), user.Id, group.PublicID, "default")
+	require.NoError(t, err)
+	assert.Zero(t, stored.DeletedAt)
+}
+
+func TestHumanAssetCallbackDoesNotExposeRedirectCredentials(t *testing.T) {
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/assets/validation/callback/private-state?bytedToken=private-token&resultCode=10000", nil)
+	c.Params = gin.Params{{Key: "state", Value: "private-state"}}
+	AssetValidationCallback(c)
+	assert.Equal(t, http.StatusBadRequest, response.Code)
+	assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+	assert.Equal(t, "no-referrer", response.Header().Get("Referrer-Policy"))
+	assert.Contains(t, response.Header().Get("Content-Security-Policy"), "default-src 'none'")
+	assert.NotContains(t, response.Body.String(), "private-state")
+	assert.NotContains(t, response.Body.String(), "private-token")
+	assert.NotContains(t, response.Body.String(), "10000")
+}
+
 func TestAssetReplicaRetryAuthorization(t *testing.T) {
 	user, identity := setupSecurityEnrollmentTest(t)
 	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
