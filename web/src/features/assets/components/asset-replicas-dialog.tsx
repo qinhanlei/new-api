@@ -45,10 +45,12 @@ export function AssetReplicasDialog({
   asset,
   scope,
   onClose,
+  readOnly = false,
 }: {
   asset: Asset
   scope: AssetScope
   onClose: () => void
+  readOnly?: boolean
 }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
@@ -120,7 +122,7 @@ export function AssetReplicasDialog({
                 return (
                   <div className='flex flex-col items-start gap-1'>
                     <AssetStatus status={replica.status} />
-                    {canWriteChannel && replica.can_retry && (
+                    {canWriteChannel && !readOnly && replica.can_retry && (
                       <Button
                         variant='outline'
                         size='sm'

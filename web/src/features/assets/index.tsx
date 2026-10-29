@@ -101,7 +101,7 @@ export function Assets() {
     <>
       {config.data?.enabled ? (
         <AssetBrowser
-          key={`${filters.project}:${filters.scope.userId ?? 'self'}:${filters.scope.allUsers ?? false}`}
+          key={`${user?.id}:${filters.project}:${filters.scope.userId ?? 'self'}:${filters.scope.allUsers ?? false}`}
           project={filters.project}
           scope={filters.scope}
           admin={admin}

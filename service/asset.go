@@ -30,6 +30,8 @@ type assetActionRequest struct {
 	GroupID     string  `json:"GroupId"`
 	URL         string  `json:"URL"`
 	AssetType   string  `json:"AssetType"`
+	BytedToken  string  `json:"BytedToken"`
+	CallbackURL string  `json:"CallbackURL"`
 	Moderation  *struct {
 		Strategy string `json:"Strategy"`
 	} `json:"Moderation"`
@@ -95,6 +97,17 @@ func ExecuteAssetAction(ctx context.Context, actor dto.AssetActor, action string
 	}
 	var result any
 	switch action {
+	case "CreateVisualValidateSession":
+		if request.CallbackURL != "" {
+			return nil, assetError(http.StatusBadRequest, "InvalidParameter.CallbackURL", "The gateway manages the verification callback URL")
+		}
+		var input dto.AssetValidationCreate
+		if err = common.Unmarshal(raw, &input); err != nil {
+			return nil, assetError(http.StatusBadRequest, "InvalidParameter", "The request body must be a JSON object")
+		}
+		return CreateAssetValidationSession(ctx, actor, input)
+	case "GetVisualValidateResult":
+		return GetAssetValidationResult(ctx, actor, request.BytedToken, request.ProjectName)
 	case "CreateAssetGroup":
 		if request.GroupType == "" {
 			request.GroupType = "AIGC"
@@ -129,6 +142,18 @@ func ExecuteAssetAction(ctx context.Context, actor dto.AssetActor, action string
 	case "DeleteAssetGroup":
 		err = model.DeleteAssetGroup(ctx, actor.UserID, request.ID, request.ProjectName)
 		result = map[string]any{}
+		if err == nil {
+			// Human groups stay visible until upstream deletion is confirmed.
+			group, loadErr := model.GetAssetGroup(ctx, actor.UserID, request.ID, request.ProjectName)
+			if loadErr == nil && group.GroupType == model.AssetGroupLivenessFace {
+				result = assetGroupView(*group, false)
+			} else if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {
+				err = loadErr
+			}
+		}
+	case "CancelAssetGroupDeletion":
+		err = model.CancelAssetGroupDeletion(ctx, actor.UserID, request.ID, request.ProjectName)
+		result = map[string]string{"Id": request.ID}
 	case "CreateAsset":
 		if request.Moderation != nil && request.Moderation.Strategy != "Default" {
 			return nil, assetError(http.StatusBadRequest, "InvalidParameter.Moderation", "Only the default moderation strategy is supported")
@@ -236,6 +261,12 @@ func reserveAsset(ctx context.Context, actor dto.AssetActor, input dto.AssetUplo
 	if err != nil {
 		return nil, err
 	}
+	if !group.Usable() {
+		return nil, assetError(http.StatusConflict, "AssetGroupUnavailable", "The material group is being deleted")
+	}
+	if group.GroupType == model.AssetGroupLivenessFace && !slices.Contains(actor.ChannelIDs, group.InitialChannelID) {
+		return nil, assetError(http.StatusForbidden, "AssetChannelUnavailable", "The portrait verification channel is unavailable")
+	}
 	channelID, err := assetCreationChannel(ctx, actor, group.InitialChannelID)
 	if err != nil {
 		return nil, err
@@ -294,6 +325,16 @@ func assetGroupView(group model.AssetGroup, allUsers bool) dto.AssetGroupView {
 	if allUsers {
 		view.UserID = group.UserID
 	}
+	if group.GroupType == model.AssetGroupLivenessFace {
+		view.Status = group.Lifecycle
+		if view.Status == "" {
+			view.Status = model.AssetGroupActive
+		}
+		view.ChannelID = group.InitialChannelID
+		if group.ErrorCode != "" {
+			view.Error = &dto.AssetFailure{Code: group.ErrorCode, Message: group.ErrorMessage}
+		}
+	}
 	return view
 }
 
@@ -317,8 +358,8 @@ func assetView(ctx context.Context, asset model.Asset, allUsers bool) (dto.Asset
 }
 
 func listAssets(ctx context.Context, actor dto.AssetActor, action string, request assetActionRequest) (any, error) {
-	if request.Filter == nil || request.Filter.GroupType != "AIGC" {
-		return nil, assetError(http.StatusBadRequest, "InvalidParameter.Filter", "Filter.GroupType must be AIGC")
+	if request.Filter == nil || (request.Filter.GroupType != model.AssetGroupAIGC && request.Filter.GroupType != model.AssetGroupLivenessFace) {
+		return nil, assetError(http.StatusBadRequest, "InvalidParameter.Filter", "Filter.GroupType must be AIGC or LivenessFace")
 	}
 	if len(request.Filter.GroupIDs) > 100 || utf8.RuneCountInString(request.Filter.Name) > 64 {
 		return nil, assetError(http.StatusBadRequest, "InvalidParameter.Filter", "The material filter is too large")
@@ -340,7 +381,7 @@ func listAssets(ctx context.Context, actor dto.AssetActor, action string, reques
 	if request.SortOrder != "Asc" && request.SortOrder != "Desc" {
 		return nil, assetError(http.StatusBadRequest, "InvalidParameter.SortOrder", "SortOrder must be Asc or Desc")
 	}
-	q := model.AssetListQuery{UserID: actor.UserID, AllUsers: actor.AllUsers, ProjectName: request.ProjectName, GroupIDs: request.Filter.GroupIDs, Name: request.Filter.Name, Statuses: request.Filter.Statuses, SortBy: request.SortBy, Descending: request.SortOrder == "Desc", Limit: 10}
+	q := model.AssetListQuery{UserID: actor.UserID, AllUsers: actor.AllUsers, ProjectName: request.ProjectName, GroupType: request.Filter.GroupType, GroupIDs: request.Filter.GroupIDs, Name: request.Filter.Name, Statuses: request.Filter.Statuses, SortBy: request.SortBy, Descending: request.SortOrder == "Desc", Limit: 10}
 	paged := request.PageNumber != nil || request.PageSize != nil
 	if paged {
 		if request.PageNumber == nil || request.PageSize == nil || request.MaxResults != nil || request.NextToken != nil || *request.PageNumber < 1 || *request.PageSize < 1 || *request.PageSize > 100 || *request.PageNumber > 20000 / *request.PageSize {
@@ -455,6 +496,7 @@ func PrepareAssetRouting(ctx context.Context, actor dto.AssetActor, ids []string
 	assets := make([]model.Asset, 0, len(ids))
 	databaseIDs := make([]int64, 0, len(ids))
 	project := ""
+	portraitChannelID := 0
 	for _, id := range ids {
 		asset, loadErr := model.GetAsset(ctx, actor.UserID, id, "")
 		if errors.Is(loadErr, gorm.ErrRecordNotFound) {
@@ -466,9 +508,34 @@ func PrepareAssetRouting(ctx context.Context, actor dto.AssetActor, ids []string
 		if project != "" && project != asset.ProjectName {
 			return nil, assetError(http.StatusBadRequest, "InvalidParameter.ProjectName", "All referenced materials must belong to one project")
 		}
+		group, groupErr := model.GetAssetGroupByID(ctx, asset.GroupID)
+		if groupErr != nil {
+			return nil, groupErr
+		}
+		if !group.Usable() {
+			return nil, assetError(http.StatusConflict, "AssetGroupUnavailable", "The material group is being deleted")
+		}
+		if group.GroupType == model.AssetGroupLivenessFace {
+			if portraitChannelID != 0 && portraitChannelID != group.InitialChannelID {
+				return nil, assetError(http.StatusBadRequest, "AssetChannelConflict", "Referenced portraits must share one verification channel")
+			}
+			portraitChannelID = group.InitialChannelID
+			if portraitChannelID <= 0 {
+				return nil, assetError(http.StatusConflict, "AssetGroupUnavailable", "The portrait group requires verification")
+			}
+		}
 		project = asset.ProjectName
 		assets = append(assets, *asset)
 		databaseIDs = append(databaseIDs, asset.ID)
+	}
+	if portraitChannelID != 0 {
+		if !slices.Contains(actor.ChannelIDs, portraitChannelID) {
+			return nil, assetError(http.StatusForbidden, "AssetChannelUnavailable", "The portrait verification channel is unavailable")
+		}
+		// Virtual references may be prepared on this account; a person's
+		// authorization cannot be copied to a different account or channel.
+		actor.ChannelIDs = []int{portraitChannelID}
+		preferredChannelID = portraitChannelID
 	}
 	if len(actor.ChannelIDs) == 0 {
 		return nil, assetError(http.StatusForbidden, "NoAvailableChannel", "No material channel is available to this caller")
@@ -513,6 +580,12 @@ func ResolveAssetReferences(ctx context.Context, actor dto.AssetActor, channelID
 		return nil, assetError(http.StatusForbidden, "AccessDenied", "The material channel is unavailable to this caller")
 	}
 	result, err := model.HoldAssetUses(ctx, actor.UserID, channelID, ids, taskID)
+	if errors.Is(err, model.ErrAssetGroupUnavailable) {
+		return nil, assetError(http.StatusConflict, "AssetGroupUnavailable", "The material group is being deleted")
+	}
+	if errors.Is(err, model.ErrAssetChannelConflict) {
+		return nil, assetError(http.StatusBadRequest, "AssetChannelConflict", "Referenced portraits must share one verification channel")
+	}
 	if errors.Is(err, model.ErrAssetStorageDisabled) {
 		return nil, assetError(http.StatusServiceUnavailable, "AssetStorageDisabled", "Material storage is not enabled")
 	}

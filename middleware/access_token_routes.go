@@ -42,6 +42,7 @@ func accessTokenScopeRule(scope string) accessTokenRouteRule {
 // DeclareAccessTokenPermissionRoute when they are registered.
 var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/assets/config":                          accessTokenScopeRule("asset:read"),
+	"GET /api/assets/validation/sessions":             accessTokenScopeRule("asset:read"),
 	"POST /api/assets/actions":                        accessTokenAnyRule,
 	"POST /api/assets/upload":                         accessTokenScopeRule("asset:write"),
 	"GET /api/assets/:id/replicas":                    accessTokenScopeRule("asset:read"),

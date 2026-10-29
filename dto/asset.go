@@ -3,10 +3,15 @@ package dto
 // AssetActor contains authenticated identity and the channels currently allowed
 // by the host's token, model and group policies. It never contains credentials.
 type AssetActor struct {
-	UserID     int
-	TokenID    int
-	ChannelIDs []int
-	AllUsers   bool
+	UserID          int
+	TokenID         int
+	ChannelIDs      []int
+	AllUsers        bool
+	InitiatorID     int
+	AccessTokenID   int
+	AuthSessionID   string
+	UserAuthVersion int64
+	SessionVersion  int64
 }
 
 type AssetStorageFields struct {
@@ -101,14 +106,17 @@ type AssetFailure struct {
 }
 
 type AssetGroupView struct {
-	UserID      int    `json:"UserId,omitempty"`
-	ID          string `json:"Id"`
-	Name        string `json:"Name"`
-	Description string `json:"Description"`
-	GroupType   string `json:"GroupType"`
-	ProjectName string `json:"ProjectName"`
-	CreateTime  string `json:"CreateTime"`
-	UpdateTime  string `json:"UpdateTime"`
+	UserID      int           `json:"UserId,omitempty"`
+	ID          string        `json:"Id"`
+	Name        string        `json:"Name"`
+	Description string        `json:"Description"`
+	GroupType   string        `json:"GroupType"`
+	ProjectName string        `json:"ProjectName"`
+	CreateTime  string        `json:"CreateTime"`
+	UpdateTime  string        `json:"UpdateTime"`
+	Status      string        `json:"Status,omitempty"`
+	ChannelID   int           `json:"ChannelId,omitempty"`
+	Error       *AssetFailure `json:"Error,omitempty"`
 }
 
 type AssetView struct {

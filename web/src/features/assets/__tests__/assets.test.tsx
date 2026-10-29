@@ -37,7 +37,9 @@ import { AssetBrowser } from '../components/asset-browser'
 import { AssetCreateDialog } from '../components/asset-create-dialog'
 import { AssetGroupDialog } from '../components/asset-group-dialog'
 import { AssetReplicasDialog } from '../components/asset-replicas-dialog'
+import { AssetValidationDialog } from '../components/asset-validation-dialog'
 import { Assets } from '../index'
+import { assetValidationH5Link } from '../lib/validation'
 import type { Asset, AssetGroup } from '../types'
 
 const group: AssetGroup = {
@@ -272,6 +274,104 @@ test('a size-rejected replica shows the file size and current channel limit', as
       "FileSizeTooLarge: Material exceeds this channel's size limit"
     )
   ).toBeVisible()
+})
+
+test('a result arriving after close cannot replace or close a reopened verification', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [
+        { SessionId: 'validation-na-one', Name: 'Alice', Status: 'pending' },
+      ],
+    },
+  })
+  let finish!: (response: unknown) => void
+  vi.spyOn(api, 'post').mockImplementation(async (_url, _body, options) => {
+    const action = (options?.params as { Action?: string })?.Action
+    if (action === 'GetVisualValidateResult') {
+      return new Promise((resolve) => {
+        finish = resolve
+      })
+    }
+    if (action === 'CreateVisualValidateSession') {
+      return {
+        data: {
+          success: true,
+          data: {
+            BytedToken: 'validation-na-two',
+            Name: 'Bob',
+            Status: 'pending',
+            ExpiresAt: Date.now() / 1000 + 1800,
+            H5Link: 'https://verify.example/bob',
+          },
+        },
+      }
+    }
+    return {
+      data: {
+        success: true,
+        data: {
+          Items:
+            action === 'ListAssetGroups'
+              ? [{ ...group, GroupType: 'LivenessFace' }]
+              : [],
+          TotalCount: 0,
+        },
+      },
+    }
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetBrowser project='default' scope={{}} admin={false} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Avatars' })
+  await user.selectOptions(
+    screen.getByLabelText('Library type'),
+    'LivenessFace'
+  )
+  expect(screen.getByLabelText('Library type')).toHaveValue('LivenessFace')
+  await user.click(screen.getByRole('button', { name: 'Group actions' }))
+  await user.click(screen.getByRole('menuitem', { name: 'Verify a person' }))
+  await user.click(
+    await screen.findByRole('button', {
+      name: 'Continue verification for Alice',
+    })
+  )
+  await user.click(
+    within(screen.getByRole('dialog')).getAllByRole('button', {
+      name: 'Close',
+    })[0]
+  )
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  await user.click(screen.getByRole('button', { name: 'Group actions' }))
+  await user.click(screen.getByRole('menuitem', { name: 'Verify a person' }))
+  await user.type(await screen.findByLabelText('Name'), 'Bob')
+  await user.click(screen.getByRole('button', { name: 'Start verification' }))
+  expect(
+    await screen.findByRole('button', { name: 'Open verification' })
+  ).toHaveAttribute('href', 'https://verify.example/bob?lng=en')
+  await act(async () =>
+    finish({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'created',
+          GroupId: 'group-alice',
+        },
+      },
+    })
+  )
+  expect(screen.getByRole('dialog')).toHaveTextContent('Bob')
+  expect(
+    screen.getByRole('button', { name: 'Open verification' })
+  ).toHaveAttribute('href', 'https://verify.example/bob?lng=en')
+  expect(screen.getByLabelText('Asset group')).toHaveValue(group.Id)
 })
 
 test.each([
@@ -1265,4 +1365,748 @@ test('a failed list refresh keeps existing assets and pagination available', asy
   await waitFor(() =>
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   )
+})
+
+test('switching library types isolates group filters, asset queries and mutations', async () => {
+  const user = userEvent.setup()
+  const human = {
+    ...group,
+    Id: 'group-person',
+    Name: 'Person',
+    GroupType: 'LivenessFace',
+    Status: 'active',
+  }
+  const post = vi
+    .spyOn(api, 'post')
+    .mockImplementation(async (_url, body, options) => {
+      const action = (options?.params as { Action?: string })?.Action
+      const filter = (body as { Filter?: { GroupType?: string } })?.Filter
+      return {
+        data: {
+          success: true,
+          data: {
+            Items:
+              action === 'ListAssetGroups'
+                ? [filter?.GroupType === 'LivenessFace' ? human : group]
+                : [],
+            TotalCount: 0,
+          },
+        },
+      }
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetBrowser project='studio' scope={{ userId: 23 }} admin />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('option', { name: 'Avatars' })
+  await user.selectOptions(
+    screen.getByLabelText('Library type'),
+    'LivenessFace'
+  )
+  await screen.findByRole('option', { name: 'Person' })
+  expect(screen.getByLabelText('Asset group')).toHaveValue('group-person')
+  expect(
+    screen.queryByRole('option', { name: 'Avatars' })
+  ).not.toBeInTheDocument()
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith(
+      '/api/assets/actions',
+      expect.objectContaining({
+        Filter: {
+          GroupType: 'LivenessFace',
+          GroupIds: ['group-person'],
+          Name: '',
+        },
+      }),
+      expect.objectContaining({
+        params: expect.objectContaining({ Action: 'ListAssets', user_id: 23 }),
+      })
+    )
+  )
+  await user.type(screen.getByPlaceholderText('Filter by name...'), 'Portrait')
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith(
+      '/api/assets/actions',
+      expect.objectContaining({
+        PageNumber: 1,
+        Filter: {
+          GroupType: 'LivenessFace',
+          GroupIds: ['group-person'],
+          Name: 'Portrait',
+        },
+      }),
+      expect.objectContaining({
+        params: expect.objectContaining({ Action: 'ListAssets', user_id: 23 }),
+      })
+    )
+  )
+  await user.click(screen.getByRole('button', { name: 'Group actions' }))
+  expect(
+    screen.getByRole('menuitem', { name: 'Verify a person' })
+  ).toBeEnabled()
+  expect(
+    screen.queryByRole('menuitem', { name: 'Create asset group' })
+  ).not.toBeInTheDocument()
+  await user.keyboard('{Escape}')
+  await user.selectOptions(screen.getByLabelText('Library type'), 'AIGC')
+  expect(await screen.findByRole('option', { name: 'Avatars' })).toBeVisible()
+  expect(screen.getByLabelText('Asset group')).toHaveValue(group.Id)
+  expect(screen.getByPlaceholderText('Filter by name...')).toHaveValue('')
+})
+
+test('verification creation retries the same request key and exposes only the secured H5 link', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockRejectedValueOnce(new Error('Connection interrupted'))
+    .mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          ChannelId: 7,
+          ExpiresAt: Date.now() / 1000 + 1800,
+          H5Link: 'https://verify.example/face?token=upstream-private',
+          CallbackURL:
+            'https://gateway.example/api/assets/validation/callback/private',
+        },
+      },
+    })
+  const persist = vi.spyOn(localStorage, 'setItem')
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='studio'
+        scope={{ userId: 23 }}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await user.type(screen.getByLabelText('Name'), 'Alice')
+  await user.click(screen.getByRole('button', { name: 'Start verification' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Connection interrupted'
+  )
+  expect(screen.getByLabelText('Name')).toHaveValue('Alice')
+  await user.click(screen.getByRole('button', { name: 'Start verification' }))
+  const link = await screen.findByRole('button', { name: 'Open verification' })
+  expect(link).toHaveAttribute(
+    'href',
+    'https://verify.example/face?token=upstream-private&lng=en'
+  )
+  expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+  expect(link).toHaveAttribute('referrerpolicy', 'no-referrer')
+  expect(
+    screen.getByRole('button', { name: 'Copy verification link' })
+  ).toBeVisible()
+  expect(post.mock.calls[0][1]).toEqual(post.mock.calls[1][1])
+  expect(post.mock.calls[1][1]).toEqual({
+    ProjectName: 'studio',
+    Name: 'Alice',
+    IdempotencyKey: expect.any(String),
+  })
+  expect(post.mock.calls[1][2]).toEqual(
+    expect.objectContaining({
+      params: expect.objectContaining({
+        Action: 'CreateVisualValidateSession',
+        user_id: 23,
+      }),
+    })
+  )
+  expect(persist).not.toHaveBeenCalled()
+})
+
+test('a saved verification resumes through a write action and selects its created group', async () => {
+  const user = userEvent.setup()
+  const created = vi.fn()
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [
+        {
+          SessionId: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          ChannelId: 7,
+          ExpiresAt: Date.now() / 1000 + 1800,
+        },
+      ],
+    },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          ChannelId: 7,
+          ExpiresAt: Date.now() / 1000 + 1800,
+          H5Link: 'https://verify.example/face',
+        },
+      },
+    })
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'created',
+          GroupId: 'group-na-person',
+        },
+      },
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='studio'
+        scope={{ userId: 23 }}
+        onClose={vi.fn()}
+        onCreated={created}
+      />
+    </QueryClientProvider>
+  )
+  const resume = await screen.findByRole('button', {
+    name: 'Continue verification for Alice',
+  })
+  expect(post).not.toHaveBeenCalled()
+  expect(
+    screen.queryByRole('button', { name: 'Open verification' })
+  ).not.toBeInTheDocument()
+  await user.click(resume)
+  expect(
+    await screen.findByRole('button', { name: 'Open verification' })
+  ).toBeVisible()
+  expect(api.get).toHaveBeenCalledWith(
+    '/api/assets/validation/sessions',
+    expect.objectContaining({ params: { project_name: 'studio', user_id: 23 } })
+  )
+  expect(post).toHaveBeenCalledWith(
+    '/api/assets/actions',
+    { ProjectName: 'studio', BytedToken: 'validation-na-one' },
+    expect.objectContaining({
+      params: expect.objectContaining({
+        Action: 'GetVisualValidateResult',
+        user_id: 23,
+      }),
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Check verification' }))
+  await waitFor(() => expect(created).toHaveBeenCalledWith('group-na-person'))
+  expect(
+    screen.queryByRole('button', { name: 'Open verification' })
+  ).not.toBeInTheDocument()
+})
+
+test.each([
+  { Status: 'expired', ExpiresAt: 1, H5Link: 'https://verify.example/expired' },
+  { Status: 'pending', ExpiresAt: 1, H5Link: 'https://verify.example/expired' },
+  { Status: 'pending', ExpiresAt: 9999999999, H5Link: 'javascript:alert(1)' },
+])(
+  'expired or unsafe verification links are never offered (%j)',
+  async (result) => {
+    const user = userEvent.setup()
+    vi.mocked(api.get).mockResolvedValue({
+      data: {
+        success: true,
+        data: [
+          { SessionId: 'validation-na-one', Name: 'Alice', Status: 'pending' },
+        ],
+      },
+    })
+    vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        success: true,
+        data: { ...result, BytedToken: 'validation-na-one', Name: 'Alice' },
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <AssetValidationDialog
+          project='default'
+          scope={{}}
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+        />
+      </QueryClientProvider>
+    )
+    await user.click(
+      await screen.findByRole('button', {
+        name: 'Continue verification for Alice',
+      })
+    )
+    expect(
+      await screen.findByRole('button', { name: 'Check verification' })
+    ).toBeVisible()
+    expect(
+      screen.queryByRole('button', { name: 'Open verification' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Copy verification link' })
+    ).not.toBeInTheDocument()
+  }
+)
+
+test.each([
+  ['zhCN', 'zh'],
+  ['zhTW', 'zh-Hant'],
+  ['zh-Hant', 'zh-Hant'],
+  ['en', 'en'],
+  ['fr', 'en'],
+  ['ru', 'en'],
+  ['ja', 'en'],
+  ['vi', 'en'],
+  ['invalid_language', 'en'],
+])(
+  'verification language %s maps to provider language %s',
+  (language, expected) => {
+    expect(
+      assetValidationH5Link(
+        'https://verify.example/face?token=preserved&lng=zh',
+        language
+      )
+    ).toBe(`https://verify.example/face?token=preserved&lng=${expected}`)
+  }
+)
+
+test.each([
+  { status: 'delete_pending', cancel: false, retry: false },
+  { status: 'delete_unknown', cancel: false, retry: true },
+  { status: 'delete_blocked', cancel: true, retry: true },
+])(
+  'human group $status freezes writes and exposes only valid recovery actions',
+  async ({ status, cancel, retry }) => {
+    const user = userEvent.setup()
+    const human = {
+      ...group,
+      GroupType: 'LivenessFace',
+      Status: status,
+      Error: {
+        Code: 'UpstreamDenied',
+        Message: 'Provider authorization is active',
+      },
+    }
+    vi.spyOn(api, 'post').mockImplementation(async (_url, _body, options) => ({
+      data: {
+        success: true,
+        data: {
+          Items:
+            (options?.params as { Action?: string })?.Action ===
+            'ListAssetGroups'
+              ? [human]
+              : [replicaAsset],
+          TotalCount: 1,
+        },
+      },
+    }))
+    render(
+      <QueryClientProvider client={client}>
+        <AssetBrowser project='default' scope={{}} admin={false} />
+      </QueryClientProvider>
+    )
+    await user.selectOptions(
+      screen.getByLabelText('Library type'),
+      'LivenessFace'
+    )
+    expect(
+      await screen.findByText(
+        'UpstreamDenied: Provider authorization is active'
+      )
+    ).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Add asset' })).toBeDisabled()
+    expect(
+      await screen.findByRole('button', { name: 'Delete Avatar' })
+    ).toBeDisabled()
+    expect(
+      screen.queryByRole('button', { name: 'Copy asset URI' })
+    ).not.toBeInTheDocument()
+    expect(
+      Boolean(screen.queryByRole('button', { name: 'Cancel deletion' }))
+    ).toBe(cancel)
+    expect(
+      Boolean(screen.queryByRole('button', { name: 'Retry deletion' }))
+    ).toBe(retry)
+    await user.click(screen.getByRole('button', { name: 'Group actions' }))
+    expect(screen.getByRole('menuitem', { name: 'Rename' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    )
+    expect(
+      screen.getByRole('menuitem', { name: 'Delete group' })
+    ).toHaveAttribute('aria-disabled', 'true')
+  }
+)
+
+test('accepted human deletion stays visible as pending and does not report completion', async () => {
+  const user = userEvent.setup()
+  const success = vi.spyOn(toast, 'success')
+  let status = 'active'
+  vi.spyOn(api, 'post').mockImplementation(async (_url, _body, options) => {
+    const action = (options?.params as { Action?: string })?.Action
+    if (action === 'DeleteAssetGroup') {
+      status = 'delete_pending'
+      return {
+        status: 202,
+        data: { success: true, data: { Id: group.Id, Status: status } },
+      }
+    }
+    return {
+      data: {
+        success: true,
+        data: {
+          Items:
+            action === 'ListAssetGroups'
+              ? [{ ...group, GroupType: 'LivenessFace', Status: status }]
+              : [],
+          TotalCount: 0,
+        },
+      },
+    }
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetBrowser project='default' scope={{}} admin={false} />
+    </QueryClientProvider>
+  )
+  await user.selectOptions(
+    screen.getByLabelText('Library type'),
+    'LivenessFace'
+  )
+  await screen.findByRole('option', { name: 'Avatars' })
+  await user.click(screen.getByRole('button', { name: 'Group actions' }))
+  await user.click(screen.getByRole('menuitem', { name: 'Delete group' }))
+  await user.click(
+    within(screen.getByRole('alertdialog')).getByRole('button', {
+      name: 'Delete',
+    })
+  )
+  expect(await screen.findByText('Deletion pending')).toBeVisible()
+  expect(screen.getByLabelText('Asset group')).toHaveValue(group.Id)
+  expect(screen.getByRole('button', { name: 'Add asset' })).toBeDisabled()
+  expect(success).toHaveBeenCalledWith('Group deletion requested')
+  expect(success).not.toHaveBeenCalledWith('Deleted successfully')
+})
+
+test('an open verification polls once, pauses on failure and keeps manual recovery available', async () => {
+  const user = userEvent.setup()
+  const created = vi.fn()
+  const scheduled: (() => void)[] = []
+  const setTimeout = window.setTimeout.bind(window)
+  vi.spyOn(window, 'setTimeout').mockImplementation(
+    (callback, delay, ...args) => {
+      if (delay === 10_000 && typeof callback === 'function') {
+        scheduled.push(() => callback(...args))
+        return setTimeout(() => undefined, 0) as unknown as ReturnType<
+          typeof window.setTimeout
+        >
+      }
+      return setTimeout(callback, delay, ...args) as unknown as ReturnType<
+        typeof window.setTimeout
+      >
+    }
+  )
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [
+        { SessionId: 'validation-na-one', Name: 'Alice', Status: 'pending' },
+      ],
+    },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          ExpiresAt: Date.now() / 1000 + 1800,
+          H5Link: 'https://verify.example/face',
+        },
+      },
+    })
+    .mockRejectedValueOnce(new Error('Verification temporarily unavailable'))
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'created',
+          GroupId: 'group-na-person',
+        },
+      },
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={created}
+      />
+    </QueryClientProvider>
+  )
+  await user.click(
+    await screen.findByRole('button', {
+      name: 'Continue verification for Alice',
+    })
+  )
+  expect(
+    await screen.findByRole('button', { name: 'Open verification' })
+  ).toBeVisible()
+  expect(scheduled).toHaveLength(1)
+  await act(async () => scheduled.shift()?.())
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Verification temporarily unavailable'
+  )
+  expect(post).toHaveBeenCalledTimes(2)
+  expect(scheduled).toHaveLength(0)
+  await user.click(screen.getByRole('button', { name: 'Check verification' }))
+  await waitFor(() => expect(created).toHaveBeenCalledWith('group-na-person'))
+})
+
+test('cancelling a blocked human deletion uses its owner and unfreezes the group after success', async () => {
+  const user = userEvent.setup()
+  let status = 'delete_blocked'
+  const post = vi
+    .spyOn(api, 'post')
+    .mockImplementation(async (_url, _body, options) => {
+      const action = (options?.params as { Action?: string })?.Action
+      if (action === 'CancelAssetGroupDeletion') {
+        status = 'active'
+        return { data: { success: true, data: {} } }
+      }
+      return {
+        data: {
+          success: true,
+          data: {
+            Items:
+              action === 'ListAssetGroups'
+                ? [{ ...group, GroupType: 'LivenessFace', Status: status }]
+                : [],
+            TotalCount: 0,
+          },
+        },
+      }
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetBrowser project='default' scope={{ userId: 23 }} admin />
+    </QueryClientProvider>
+  )
+  await user.selectOptions(
+    screen.getByLabelText('Library type'),
+    'LivenessFace'
+  )
+  await user.click(
+    await screen.findByRole('button', { name: 'Cancel deletion' })
+  )
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Add asset' })).toBeEnabled()
+  )
+  expect(post).toHaveBeenCalledWith(
+    '/api/assets/actions',
+    { ProjectName: 'default', Id: group.Id },
+    expect.objectContaining({
+      params: expect.objectContaining({
+        Action: 'CancelAssetGroupDeletion',
+        user_id: 23,
+      }),
+    })
+  )
+})
+
+test.each(['removed', 'delete_pending'] as const)(
+  'an open upload closes when its original group becomes %s and never moves to another person',
+  async (change) => {
+    const user = userEvent.setup()
+    let changed = false
+    vi.spyOn(api, 'post').mockImplementation(async (_url, _body, options) => {
+      const action = (options?.params as { Action?: string })?.Action
+      const original: AssetGroup = { ...group, GroupType: 'LivenessFace' }
+      const next = { ...original, Id: 'group-next', Name: 'Another person' }
+      let items = [original, next]
+      if (changed) {
+        items =
+          change === 'removed'
+            ? [next]
+            : [{ ...original, Status: 'delete_pending' }, next]
+      }
+      return {
+        data: {
+          success: true,
+          data: {
+            Items: action === 'ListAssetGroups' ? items : [],
+            TotalCount: 0,
+          },
+        },
+      }
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <AssetBrowser project='default' scope={{}} admin={false} />
+      </QueryClientProvider>
+    )
+    await user.selectOptions(
+      screen.getByLabelText('Library type'),
+      'LivenessFace'
+    )
+    await screen.findByRole('option', { name: 'Avatars' })
+    await user.click(screen.getByRole('button', { name: 'Add asset' }))
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    changed = true
+    await act(() => client.invalidateQueries({ queryKey: ['assets'] }))
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    )
+    changed = false
+    await act(() => client.invalidateQueries({ queryKey: ['assets'] }))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  }
+)
+
+test('background group refresh never retargets an open delete confirmation', async () => {
+  const user = userEvent.setup()
+  let removedFromList = false
+  const post = vi
+    .spyOn(api, 'post')
+    .mockImplementation(async (_url, _body, options) => {
+      const action = (options?.params as { Action?: string })?.Action
+      if (action === 'DeleteAssetGroup') {
+        return {
+          data: { success: false, message: 'Original group unavailable' },
+        }
+      }
+      const next = {
+        ...group,
+        Id: 'group-next',
+        Name: 'Another person',
+        GroupType: 'LivenessFace',
+      }
+      const items = removedFromList
+        ? [next]
+        : [{ ...group, GroupType: 'LivenessFace' }, next]
+      return {
+        data: {
+          success: true,
+          data: {
+            Items: action === 'ListAssetGroups' ? items : [],
+            TotalCount: 0,
+          },
+        },
+      }
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetBrowser project='default' scope={{}} admin={false} />
+    </QueryClientProvider>
+  )
+  await user.selectOptions(
+    screen.getByLabelText('Library type'),
+    'LivenessFace'
+  )
+  await screen.findByRole('option', { name: 'Avatars' })
+  await user.click(screen.getByRole('button', { name: 'Group actions' }))
+  await user.click(screen.getByRole('menuitem', { name: 'Delete group' }))
+  removedFromList = true
+  await act(() => client.invalidateQueries({ queryKey: ['assets'] }))
+  const dialog = screen.getByRole('alertdialog')
+  expect(dialog).toHaveTextContent(
+    'Delete Avatars and all assets in this group?'
+  )
+  await user.click(within(dialog).getByRole('button', { name: 'Delete' }))
+  expect(await within(dialog).findByRole('alert')).toHaveTextContent(
+    'Original group unavailable'
+  )
+  expect(post).toHaveBeenCalledWith(
+    '/api/assets/actions',
+    { ProjectName: 'default', Id: 'group-one' },
+    expect.objectContaining({
+      params: expect.objectContaining({ Action: 'DeleteAssetGroup' }),
+    })
+  )
+})
+
+test('a verification link disappears at its deadline even when result polling has failed', async () => {
+  const user = userEvent.setup()
+  let expire: (() => void) | undefined
+  const timer = window.setTimeout.bind(window)
+  vi.spyOn(window, 'setTimeout').mockImplementation(
+    (callback, delay, ...args) => {
+      if (delay && delay > 10_000 && typeof callback === 'function') {
+        expire = () => callback(...args)
+        return timer(() => undefined, 0) as unknown as ReturnType<
+          typeof window.setTimeout
+        >
+      }
+      return timer(callback, delay, ...args) as unknown as ReturnType<
+        typeof window.setTimeout
+      >
+    }
+  )
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [
+        { SessionId: 'validation-na-one', Name: 'Alice', Status: 'pending' },
+      ],
+    },
+  })
+  vi.spyOn(api, 'post')
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          ExpiresAt: Date.now() / 1000 + 1800,
+          H5Link: 'https://verify.example/face',
+        },
+      },
+    })
+    .mockRejectedValueOnce(new Error('Permission revoked'))
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await user.click(
+    await screen.findByRole('button', {
+      name: 'Continue verification for Alice',
+    })
+  )
+  expect(
+    await screen.findByRole('button', { name: 'Open verification' })
+  ).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Check verification' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Permission revoked'
+  )
+  expect(expire).toBeDefined()
+  act(() => expire?.())
+  expect(
+    screen.queryByRole('button', { name: 'Open verification' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByText(
+      'This verification link has expired. Start a new verification if no group was created.'
+    )
+  ).toBeVisible()
 })

@@ -219,3 +219,31 @@ const (
 	MsgAssetUrlRequired              = "asset.url_required"
 	MsgAssetVideoOnly                = "asset.video_only"
 )
+
+// Human portrait validation and deletion diagnostics.
+const (
+	MsgAssetValidationSecretRequired       = "asset.validation_secret_required"
+	MsgAssetValidationSecretUnavailable    = "asset.validation_secret_unavailable"
+	MsgAssetValidationBusy                 = "asset.validation_busy"
+	MsgAssetValidationAuthorizationRevoked = "asset.validation_authorization_revoked"
+	MsgAssetValidationNotFound             = "asset.validation_not_found"
+	MsgAssetValidationChannelForbidden     = "asset.validation_channel_forbidden"
+	MsgAssetValidationIdentityRequired     = "asset.validation_identity_required"
+	MsgAssetValidationNameInvalid          = "asset.validation_name_invalid"
+	MsgAssetValidationIdempotencyInvalid   = "asset.validation_idempotency_invalid"
+	MsgAssetValidationServerAddress        = "asset.validation_server_address"
+	MsgAssetValidationAkskRequired         = "asset.validation_aksk_required"
+	MsgAssetValidationResultUnknown        = "asset.validation_result_unknown"
+	MsgAssetValidationLocalTokenRequired   = "asset.validation_local_token_required"
+	MsgAssetValidationPending              = "asset.validation_pending"
+	MsgAssetValidationGroupMismatch        = "asset.validation_group_mismatch"
+	MsgAssetValidationOwnerRequired        = "asset.validation_owner_required"
+	MsgAssetValidationCallbackInvalid      = "asset.validation_callback_invalid"
+	MsgAssetValidationCallbackReturn       = "asset.validation_callback_return"
+	MsgAssetValidationCallbackExpired      = "asset.validation_callback_expired"
+	MsgAssetValidationCallbackManaged      = "asset.validation_callback_managed"
+	MsgAssetGroupDeleting                  = "asset.group_deleting"
+	MsgAssetPortraitChannelUnavailable     = "asset.portrait_channel_unavailable"
+	MsgAssetPortraitVerificationRequired   = "asset.portrait_verification_required"
+	MsgAssetPortraitChannelConflict        = "asset.portrait_channel_conflict"
+)

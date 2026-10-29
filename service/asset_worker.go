@@ -28,6 +28,16 @@ func RetryAssetReplica(ctx context.Context, userID int, publicID string, channel
 	if err != nil {
 		return err
 	}
+	sourceGroup, err := model.GetAssetGroupByID(ctx, asset.GroupID)
+	if err != nil {
+		return err
+	}
+	if !sourceGroup.Usable() {
+		return assetError(http.StatusConflict, "AssetGroupUnavailable", "The material group is being deleted")
+	}
+	if sourceGroup.GroupType == model.AssetGroupLivenessFace && sourceGroup.InitialChannelID != channelID {
+		return assetError(http.StatusForbidden, "AssetChannelUnavailable", "The portrait verification channel is unavailable")
+	}
 	if asset.ObjectState != model.AssetReady {
 		return assetError(http.StatusConflict, "AssetNotReady", "The material source is not ready")
 	}
@@ -62,6 +72,9 @@ func RetryAssetReplica(ctx context.Context, userID int, publicID string, channel
 		return err
 	}
 	groupID := group.UpstreamID
+	if sourceGroup.GroupType == model.AssetGroupLivenessFace && (group.State != model.AssetReady || groupID == "") {
+		return assetError(http.StatusConflict, "AssetGroupUnavailable", "The portrait group requires verification")
+	}
 	if groupID == "" && (group.State == model.AssetCreating || group.State == model.AssetUnknown) {
 		if time.Now().Before(time.Unix(group.CreateStartedAt, 0).Add(assetCreateConsistencyWindow)) {
 			return assetError(http.StatusConflict, "UpstreamResultUnknown", "The upstream create result is still settling; retry later")
@@ -110,7 +123,13 @@ func StartAssetWorker(ctx context.Context) {
 
 func runAssetWork(ctx context.Context) error {
 	now := time.Now().Unix()
+	if err := model.ExpireAssetValidationSecrets(ctx, now); err != nil {
+		return err
+	}
 	if err := model.ExpiredAssetUses(ctx, now-int64((73*time.Hour).Seconds())); err != nil {
+		return err
+	}
+	if err := deleteHumanAssetGroups(ctx, now); err != nil {
 		return err
 	}
 	assets, err := model.ClaimAssetWork(ctx, now, 1)
@@ -324,6 +343,26 @@ func finishAssetReplicaError(ctx context.Context, replica *model.AssetReplica, e
 }
 
 func ensureUpstreamAssetGroup(ctx context.Context, asset *model.Asset, channel *model.Channel, config system_setting.AssetChannelConfig) (string, error) {
+	group, err := model.GetAssetGroupByID(ctx, asset.GroupID)
+	if err != nil {
+		return "", err
+	}
+	if !group.Usable() {
+		return "", assetError(http.StatusConflict, "AssetGroupUnavailable", "The material group is being deleted")
+	}
+	if group.GroupType == model.AssetGroupLivenessFace {
+		if group.InitialChannelID != channel.Id {
+			return "", assetError(http.StatusForbidden, "AssetChannelUnavailable", "The portrait verification channel is unavailable")
+		}
+		replica, loadErr := model.GetAssetGroupReplica(ctx, group.ID, channel.Id)
+		if loadErr != nil {
+			return "", loadErr
+		}
+		if replica.State != model.AssetReady || replica.UpstreamID == "" {
+			return "", assetError(http.StatusConflict, "AssetGroupUnavailable", "The portrait group requires verification")
+		}
+		return replica.UpstreamID, nil
+	}
 	replica, claimed, err := model.ClaimAssetGroupReplica(ctx, asset.GroupID, channel.Id, time.Now().Unix())
 	if err != nil {
 		return "", err
@@ -336,10 +375,6 @@ func ensureUpstreamAssetGroup(ctx context.Context, asset *model.Asset, channel *
 	}
 	if !claimed {
 		return "", nil
-	}
-	group, err := model.GetAssetGroupByID(ctx, asset.GroupID)
-	if err != nil {
-		return "", err
 	}
 	if replica.State == model.AssetCreating || replica.State == model.AssetUnknown {
 		replica.State = model.AssetUnknown
@@ -440,6 +475,10 @@ func findUpstreamAssetGroup(ctx context.Context, channel *model.Channel, config 
 }
 
 func findUpstreamAsset(ctx context.Context, channel *model.Channel, config system_setting.AssetChannelConfig, asset *model.Asset, groupID string) (string, error) {
+	group, err := model.GetAssetGroupByID(ctx, asset.GroupID)
+	if err != nil {
+		return "", err
+	}
 	type assetPage struct {
 		Items []struct {
 			ID        string  `json:"Id"`
@@ -453,7 +492,7 @@ func findUpstreamAsset(ctx context.Context, channel *model.Channel, config syste
 		NextToken  string `json:"NextToken"`
 	}
 	id := ""
-	payload := map[string]any{"Filter": map[string]any{"GroupType": "AIGC", "GroupIds": []string{groupID}, "Name": asset.PublicID}, "PageSize": 100}
+	payload := map[string]any{"Filter": map[string]any{"GroupType": group.GroupType, "GroupIds": []string{groupID}, "Name": asset.PublicID}, "PageSize": 100}
 	for page := range 20 {
 		payload["PageNumber"] = page + 1
 		var result assetPage
@@ -491,6 +530,13 @@ func findUpstreamAsset(ctx context.Context, channel *model.Channel, config syste
 }
 
 func cleanupAsset(ctx context.Context, asset *model.Asset) error {
+	group, err := model.GetAssetGroupByID(ctx, asset.GroupID)
+	if err != nil {
+		return err
+	}
+	if group.GroupType == model.AssetGroupLivenessFace && !group.Usable() && group.Lifecycle != model.AssetGroupDeleted {
+		return model.ErrAssetGroupUnavailable
+	}
 	replicas, err := model.AssetReplicas(ctx, []int64{asset.ID})
 	if err != nil {
 		return err
@@ -586,5 +632,40 @@ func cleanupAssetGroup(ctx context.Context, replica *model.AssetGroupReplica) er
 
 func assetUpstreamNotFound(err error) bool {
 	var failure *AssetError
-	return errors.As(err, &failure) && (failure.HTTPStatus == http.StatusNotFound || strings.HasPrefix(failure.Code, "ResourceNotFound"))
+	// A proxy's routing 404 is not proof that a remote resource was removed.
+	return errors.As(err, &failure) && (failure.Code == "ResourceNotFound" || strings.HasPrefix(failure.Code, "ResourceNotFound."))
+}
+
+func deleteHumanAssetGroups(ctx context.Context, now int64) error {
+	groups, err := model.ClaimHumanAssetGroupDeletions(ctx, now, 1)
+	if err != nil {
+		return err
+	}
+	for i := range groups {
+		group := &groups[i]
+		operation, cancel := context.WithTimeout(ctx, time.Minute)
+		replica, deleteErr := model.GetAssetGroupReplica(operation, group.ID, group.InitialChannelID)
+		if deleteErr == nil && replica.UpstreamID == "" {
+			deleteErr = assetError(http.StatusConflict, "UpstreamResultUnknown", "The portrait group requires verification")
+		}
+		if deleteErr == nil {
+			deleteErr = cleanupAssetGroup(operation, &replica)
+		}
+		cancel()
+		status, code, message, retryAt := model.AssetGroupDeleted, "", "", int64(0)
+		if deleteErr != nil {
+			code, message, _ = assetFailure(deleteErr)
+			status = model.AssetGroupDeleteUnknown
+			retryAt = time.Now().Add(time.Minute).Unix()
+			var failure *AssetError
+			if errors.As(deleteErr, &failure) && failure.HTTPStatus >= 400 && failure.HTTPStatus < 500 && failure.HTTPStatus != http.StatusRequestTimeout && failure.HTTPStatus != http.StatusTooManyRequests && failure.Code != "UpstreamResultUnknown" {
+				status = model.AssetGroupDeleteBlocked
+				retryAt = 0
+			}
+		}
+		if err = model.FinishHumanAssetGroupDeletion(ctx, group, status, code, message, retryAt); err != nil {
+			return err
+		}
+	}
+	return nil
 }

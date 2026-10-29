@@ -362,6 +362,8 @@ func migrateDB() error {
 		&AssetGroupReplica{},
 		&AssetReplica{},
 		&AssetUse{},
+		&AssetValidationSession{},
+		&AssetValidationRateWindow{},
 		&Model{},
 		&Vendor{},
 		&PrefillGroup{},

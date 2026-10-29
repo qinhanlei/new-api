@@ -30,6 +30,10 @@ func GetAssetReplicaViews(ctx context.Context, userID int, publicID string) ([]d
 	if err != nil {
 		return nil, err
 	}
+	group, err := GetAssetGroupByID(ctx, asset.GroupID)
+	if err != nil {
+		return nil, err
+	}
 	result := make([]dto.AssetReplicaView, 0, len(replicas))
 	for _, replica := range replicas {
 		var channel Channel
@@ -43,7 +47,8 @@ func GetAssetReplicaViews(ctx context.Context, userID int, publicID string) ([]d
 		if replica.State == AssetUnknown {
 			status = "Unknown"
 		}
-		view := dto.AssetReplicaView{ChannelID: replica.ChannelID, ChannelName: name, Status: status, ErrorCode: replica.ErrorCode, ErrorMessage: replica.ErrorMessage, LastAttemptAt: replica.UpdatedAt, CanRetry: replica.Status == AssetFailed && replica.State != AssetDeleted && replica.LeaseExpiresAt <= time.Now().Unix()}
+		canRetry := group.Usable() && (group.GroupType != AssetGroupLivenessFace || group.InitialChannelID == replica.ChannelID) && replica.Status == AssetFailed && replica.State != AssetDeleted && replica.LeaseExpiresAt <= time.Now().Unix()
+		view := dto.AssetReplicaView{ChannelID: replica.ChannelID, ChannelName: name, Status: status, ErrorCode: replica.ErrorCode, ErrorMessage: replica.ErrorMessage, LastAttemptAt: replica.UpdatedAt, CanRetry: canRetry}
 		if replica.ErrorCode == "FileSizeTooLarge" && replica.ErrorMessage == "Material exceeds this channel's size limit" {
 			config, err := LoadAssetChannelConfig(ctx, replica.ChannelID)
 			if err != nil {
@@ -77,8 +82,7 @@ func GetAssetGroupReplica(ctx context.Context, groupID int64, channelID int) (As
 }
 
 // RequeueAssetReplica publishes a read-only reconciliation only if its source
-// state is still current. Row locks also fence group workers, which do not take
-// the storage lock. No network operation runs inside this transaction.
+// state is still current. No network operation runs inside this transaction.
 func RequeueAssetReplica(ctx context.Context, asset *Asset, replica AssetReplica, group AssetGroupReplica, upstreamID, groupUpstreamID string, revision int64) error {
 	return protectedAssetDB(ctx).Transaction(func(tx *gorm.DB) error {
 		storage, err := lockAssetStorage(tx)
@@ -113,12 +117,8 @@ func RequeueAssetReplica(ctx context.Context, asset *Asset, replica AssetReplica
 		if owner.Status != common.UserStatusEnabled {
 			return ErrAssetConflict
 		}
-		var sourceGroup AssetGroup
-		if err = lockForUpdate(tx).First(&sourceGroup, asset.GroupID).Error; err != nil {
+		if _, err = checkAssetGroupChannel(tx, asset.GroupID, replica.ChannelID); err != nil {
 			return err
-		}
-		if sourceGroup.DeletedAt > 0 {
-			return ErrAssetConflict
 		}
 		var currentGroup AssetGroupReplica
 		if err = lockForUpdate(tx).First(&currentGroup, group.ID).Error; err != nil {
@@ -168,7 +168,9 @@ func ClaimAssetWork(ctx context.Context, now int64, limit int) ([]Asset, error) 
 	var candidates []Asset
 	inUse := protectedAssetDB(ctx).Model(&AssetUse{}).Select("asset_id")
 	busyReplicas := protectedAssetDB(ctx).Model(&AssetReplica{}).Select("asset_id").Where("lease_expires_at > ?", now)
+	frozenGroups := protectedAssetDB(ctx).Model(&AssetGroup{}).Select("id").Where("group_type = ? AND lifecycle NOT IN ?", AssetGroupLivenessFace, []string{"", AssetGroupActive, AssetGroupDeleted})
 	err := protectedAssetDB(ctx).Where("next_attempt_at <= ? AND lease_expires_at <= ?", now, now).
+		Where("group_id NOT IN (?)", frozenGroups).
 		Where("(deleted_at > 0 AND object_state <> ? AND id NOT IN (?) AND id NOT IN (?)) OR (deleted_at = 0 AND status = ? AND object_state IN ?)", AssetDeleted, inUse, busyReplicas, AssetProcessing, []string{AssetPending, "uploading"}).Order("next_attempt_at, id").Limit(limit).Find(&candidates).Error
 	if err != nil {
 		return nil, err
@@ -178,6 +180,23 @@ func ClaimAssetWork(ctx context.Context, now int64, limit int) ([]Asset, error) 
 		err = protectedAssetDB(ctx).Transaction(func(tx *gorm.DB) error {
 			if _, err := lockAssetStorage(tx); err != nil {
 				return err
+			}
+			var group AssetGroup
+			if err := lockForUpdate(tx).First(&group, asset.GroupID).Error; err != nil {
+				return err
+			}
+			if group.GroupType == AssetGroupLivenessFace && !group.Usable() && group.Lifecycle != AssetGroupDeleted {
+				return nil
+			}
+			if asset.DeletedAt == 0 {
+				if !group.Usable() {
+					return nil
+				}
+				if group.GroupType == AssetGroupLivenessFace {
+					if _, err := checkAssetGroupChannel(tx, asset.GroupID, group.InitialChannelID); err != nil {
+						return err
+					}
+				}
 			}
 			if asset.DeletedAt > 0 {
 				var count int64
@@ -249,7 +268,8 @@ func FinishAssetCleanup(ctx context.Context, asset *Asset, done bool) error {
 
 func ClaimAssetReplicas(ctx context.Context, now int64, limit int) ([]AssetReplica, error) {
 	var candidates []AssetReplica
-	readyAssets := protectedAssetDB(ctx).Model(&Asset{}).Select("id").Where("deleted_at = 0 AND object_state = ?", AssetReady)
+	activeGroups := protectedAssetDB(ctx).Model(&AssetGroup{}).Select("id").Where("deleted_at = 0 AND (lifecycle IS NULL OR lifecycle IN ?)", []string{"", AssetGroupActive})
+	readyAssets := protectedAssetDB(ctx).Model(&Asset{}).Select("id").Where("deleted_at = 0 AND object_state = ? AND group_id IN (?)", AssetReady, activeGroups)
 	err := protectedAssetDB(ctx).Where("status = ? AND state <> ? AND next_attempt_at <= ? AND lease_expires_at <= ? AND asset_id IN (?)", AssetProcessing, AssetDeleted, now, now, readyAssets).Order("next_attempt_at, id").Limit(limit).Find(&candidates).Error
 	if err != nil {
 		return nil, err
@@ -266,6 +286,12 @@ func ClaimAssetReplicas(ctx context.Context, now int64, limit int) ([]AssetRepli
 			}
 			if asset.DeletedAt > 0 || asset.ObjectState != AssetReady {
 				return nil
+			}
+			if _, err := checkAssetGroupChannel(tx, asset.GroupID, replica.ChannelID); err != nil {
+				if errors.Is(err, ErrAssetGroupUnavailable) || errors.Is(err, ErrAssetChannelConflict) {
+					return nil
+				}
+				return err
 			}
 			token := common.GetUUID()
 			result := tx.Model(&AssetReplica{}).
@@ -292,16 +318,32 @@ func ClaimAssetReplicas(ctx context.Context, now int64, limit int) ([]AssetRepli
 }
 
 func MarkAssetReplicaCreating(ctx context.Context, replica *AssetReplica) error {
-	now := time.Now().Unix()
-	result := protectedAssetDB(ctx).Model(&AssetReplica{}).Where("id = ? AND lease_token = ? AND state = ?", replica.ID, replica.LeaseToken, AssetPending).Updates(map[string]any{"state": AssetCreating, "create_started_at": now})
-	if result.Error == nil && result.RowsAffected == 0 {
-		return ErrAssetConflict
-	}
-	if result.Error == nil {
+	return protectedAssetDB(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockAssetStorage(tx); err != nil {
+			return err
+		}
+		var asset Asset
+		if err := tx.First(&asset, replica.AssetID).Error; err != nil {
+			return err
+		}
+		if asset.DeletedAt > 0 {
+			return ErrAssetConflict
+		}
+		if _, err := checkAssetGroupChannel(tx, asset.GroupID, replica.ChannelID); err != nil {
+			return err
+		}
+		now := time.Now().Unix()
+		result := tx.Model(&AssetReplica{}).Where("id = ? AND lease_token = ? AND state = ? AND lease_expires_at > ?", replica.ID, replica.LeaseToken, AssetPending, now).Updates(map[string]any{"state": AssetCreating, "create_started_at": now})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrAssetConflict
+		}
 		replica.State = AssetCreating
 		replica.CreateStartedAt = now
-	}
-	return result.Error
+		return nil
+	})
 }
 
 func FinishAssetReplica(ctx context.Context, replica *AssetReplica, retryAt int64) error {
@@ -350,36 +392,59 @@ func ClaimAssetGroupReplica(ctx context.Context, groupID int64, channelID int, n
 	if err != nil {
 		return nil, false, err
 	}
-	if replica.State == AssetReady || replica.State == AssetFailed {
-		return &replica, false, nil
-	}
-	token := common.GetUUID()
-	result := protectedAssetDB(ctx).Model(&AssetGroupReplica{}).
-		Where("id = ? AND state = ? AND upstream_id = ? AND create_started_at = ? AND lease_token = ? AND lease_expires_at = ? AND lease_expires_at <= ?",
-			replica.ID, replica.State, replica.UpstreamID, replica.CreateStartedAt, replica.LeaseToken, replica.LeaseExpiresAt, now).
-		Updates(map[string]any{"lease_token": token, "lease_expires_at": now + 90})
-	if result.Error != nil {
-		return nil, false, result.Error
-	}
-	if result.RowsAffected == 0 {
-		return &replica, false, nil
-	}
-	replica.LeaseToken = token
-	replica.LeaseExpiresAt = now + 90
-	return &replica, true, nil
+	claimed := false
+	err = protectedAssetDB(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockAssetStorage(tx); err != nil {
+			return err
+		}
+		if _, err := checkAssetGroupChannel(tx, groupID, channelID); err != nil {
+			return err
+		}
+		if replica.State == AssetReady || replica.State == AssetFailed {
+			return nil
+		}
+		token := common.GetUUID()
+		result := tx.Model(&AssetGroupReplica{}).
+			Where("id = ? AND state = ? AND upstream_id = ? AND create_started_at = ? AND lease_token = ? AND lease_expires_at = ? AND lease_expires_at <= ?",
+				replica.ID, replica.State, replica.UpstreamID, replica.CreateStartedAt, replica.LeaseToken, replica.LeaseExpiresAt, now).
+			Updates(map[string]any{"lease_token": token, "lease_expires_at": now + 90})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected > 0 {
+			replica.LeaseToken = token
+			replica.LeaseExpiresAt = now + 90
+			claimed = true
+		}
+		return nil
+	})
+	return &replica, claimed, err
 }
 
 func MarkAssetGroupCreating(ctx context.Context, replica *AssetGroupReplica) error {
-	now := time.Now().Unix()
-	result := protectedAssetDB(ctx).Model(&AssetGroupReplica{}).Where("id = ? AND lease_token = ? AND state = ?", replica.ID, replica.LeaseToken, AssetPending).Updates(map[string]any{"state": AssetCreating, "create_started_at": now})
-	if result.Error == nil && result.RowsAffected == 0 {
-		return ErrAssetConflict
-	}
-	if result.Error == nil {
+	return protectedAssetDB(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockAssetStorage(tx); err != nil {
+			return err
+		}
+		group, err := checkAssetGroupChannel(tx, replica.GroupID, replica.ChannelID)
+		if err != nil {
+			return err
+		}
+		if group.GroupType == AssetGroupLivenessFace {
+			return ErrAssetChannelConflict
+		}
+		now := time.Now().Unix()
+		result := tx.Model(&AssetGroupReplica{}).Where("id = ? AND lease_token = ? AND state = ? AND lease_expires_at > ?", replica.ID, replica.LeaseToken, AssetPending, now).Updates(map[string]any{"state": AssetCreating, "create_started_at": now})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrAssetConflict
+		}
 		replica.State = AssetCreating
 		replica.CreateStartedAt = now
-	}
-	return result.Error
+		return nil
+	})
 }
 
 func FinishAssetGroupReplica(ctx context.Context, replica *AssetGroupReplica) error {
@@ -395,7 +460,7 @@ func MarkAssetReplicaDeleted(ctx context.Context, id int64) error {
 }
 
 func ClaimDeletedAssetGroups(ctx context.Context, now int64, limit int) ([]AssetGroupReplica, error) {
-	deletedGroups := protectedAssetDB(ctx).Model(&AssetGroup{}).Select("id").Where("deleted_at > 0")
+	deletedGroups := protectedAssetDB(ctx).Model(&AssetGroup{}).Select("id").Where("deleted_at > 0 AND (group_type IS NULL OR group_type <> ?)", AssetGroupLivenessFace)
 	remainingAssets := protectedAssetDB(ctx).Model(&Asset{}).Select("group_id").Where("object_state <> ?", AssetDeleted)
 	var candidates []AssetGroupReplica
 	if err := protectedAssetDB(ctx).Where("group_id IN (?) AND group_id NOT IN (?) AND state <> ? AND lease_expires_at <= ? AND updated_at <= ?", deletedGroups, remainingAssets, AssetDeleted, now, now-30).Order("id").Limit(limit).Find(&candidates).Error; err != nil {

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"errors"
+	"html"
 	"io"
 	"net/http"
 	"strconv"
@@ -27,7 +28,8 @@ func assetRequestAction(c *gin.Context) (string, error) {
 	}
 	switch action {
 	case "CreateAssetGroup", "GetAssetGroup", "ListAssetGroups", "UpdateAssetGroup", "DeleteAssetGroup",
-		"CreateAsset", "GetAsset", "ListAssets", "UpdateAsset", "DeleteAsset":
+		"CreateAsset", "GetAsset", "ListAssets", "UpdateAsset", "DeleteAsset",
+		"CreateVisualValidateSession", "GetVisualValidateResult", "CancelAssetGroupDeletion":
 		return action, nil
 	default:
 		return action, &service.AssetError{HTTPStatus: http.StatusBadRequest, Code: "InvalidAction", Message: "The asset action is not supported."}
@@ -36,6 +38,8 @@ func assetRequestAction(c *gin.Context) (string, error) {
 
 // ArkAssets is a resource API. It never enters the video task/billing pipeline.
 func ArkAssets(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Header("Referrer-Policy", "no-referrer")
 	action, err := assetRequestAction(c)
 	if err != nil {
 		writeAssetActionResponse(c, action, nil, err)
@@ -66,7 +70,14 @@ func writeAssetActionResponse(c *gin.Context, action string, result any, err err
 		c.JSON(failure.HTTPStatus, gin.H{"ResponseMetadata": metadata})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ResponseMetadata": metadata, "Result": result})
+	c.JSON(assetActionStatus(action, result), gin.H{"ResponseMetadata": metadata, "Result": result})
+}
+
+func assetActionStatus(action string, result any) int {
+	if group, ok := result.(dto.AssetGroupView); ok && action == "DeleteAssetGroup" && group.Status != model.AssetGroupDeleted {
+		return http.StatusAccepted
+	}
+	return http.StatusOK
 }
 
 func assetHTTPError(err error) *service.AssetError {
@@ -86,6 +97,12 @@ func assetHTTPError(err error) *service.AssetError {
 	if errors.Is(err, model.ErrAssetStorageDisabled) {
 		return &service.AssetError{HTTPStatus: http.StatusServiceUnavailable, Code: "AssetStorageDisabled", Message: "Material storage is not enabled"}
 	}
+	if errors.Is(err, model.ErrAssetGroupUnavailable) {
+		return &service.AssetError{HTTPStatus: http.StatusConflict, Code: "AssetGroupUnavailable", Message: "The material group is being deleted"}
+	}
+	if errors.Is(err, model.ErrAssetChannelConflict) {
+		return &service.AssetError{HTTPStatus: http.StatusBadRequest, Code: "AssetChannelConflict", Message: "Referenced portraits must share one verification channel"}
+	}
 	return &service.AssetError{HTTPStatus: http.StatusInternalServerError, Code: "InternalError", Message: "The asset operation could not be completed."}
 }
 
@@ -97,7 +114,8 @@ func writeAssetManagementError(c *gin.Context, err error) {
 // assetManagementActor permits administrative ownership selection explicitly;
 // a user-supplied owner never changes the authenticated identity in the context.
 func assetManagementActor(c *gin.Context, action string) (dto.AssetActor, bool) {
-	read := strings.HasPrefix(action, "Get") || strings.HasPrefix(action, "List")
+	// GetVisualValidateResult also persists a verified portrait group.
+	read := action != "GetVisualValidateResult" && (strings.HasPrefix(action, "Get") || strings.HasPrefix(action, "List"))
 	scope := "asset:write"
 	if read {
 		scope = "asset:read"
@@ -144,6 +162,13 @@ func assetManagementActor(c *gin.Context, action string) (dto.AssetActor, bool) 
 		}
 	}
 	actor.AllUsers = allUsers
+	actor.InitiatorID = c.GetInt("id")
+	actor.AccessTokenID = c.GetInt("access_token_id")
+	if identity, ok := middleware.GetStepUpIdentity(c); ok {
+		actor.AuthSessionID = identity.SessionID
+		actor.UserAuthVersion = identity.UserAuthVersion
+		actor.SessionVersion = identity.SessionVersion
+	}
 	return actor, true
 }
 
@@ -167,10 +192,44 @@ func ManageAssetAction(c *gin.Context) {
 		writeAssetManagementError(c, err)
 		return
 	}
-	if strings.HasPrefix(action, "Create") || strings.HasPrefix(action, "Update") || strings.HasPrefix(action, "Delete") {
+	if strings.HasPrefix(action, "Create") || strings.HasPrefix(action, "Update") || strings.HasPrefix(action, "Delete") || action == "GetVisualValidateResult" || action == "CancelAssetGroupDeletion" {
 		recordManageAuditFor(c, actor.UserID, "asset.manage", map[string]any{"action": action})
 	}
+	c.JSON(assetActionStatus(action, result), gin.H{"success": true, "message": "", "data": result})
+}
+
+func ListAssetValidationSessions(c *gin.Context) {
+	actor, ok := assetManagementActor(c, "ListVisualValidateSessions")
+	if !ok {
+		return
+	}
+	if actor.AllUsers {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Select an asset owner before changing assets."))
+		return
+	}
+	result, err := service.ListAssetValidationSessions(c.Request.Context(), actor, c.Query("project_name"))
+	if err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
 	common.ApiSuccess(c, result)
+}
+
+// The provider redirects a browser here; this is not a signed webhook. Even a
+// valid state/token pair never authorizes creation or trusts resultCode.
+func AssetValidationCallback(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Header("Referrer-Policy", "no-referrer")
+	c.Header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+	c.Header("X-Content-Type-Options", "nosniff")
+	message := "Return to the page where you started verification to confirm the result."
+	status := http.StatusOK
+	if err := service.ValidateAssetValidationCallback(c.Request.Context(), c.Param("state"), c.Query("bytedToken")); err != nil {
+		status = http.StatusBadRequest
+		message = "This verification link is invalid or expired. Return to the page where you started verification."
+	}
+	message = html.EscapeString(i18n.TSource(c, message))
+	c.Data(status, "text/html; charset=utf-8", []byte("<!doctype html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>New API</title></head><body><main><p>"+message+"</p></main></body></html>"))
 }
 
 func UploadAsset(c *gin.Context) {
