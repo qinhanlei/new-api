@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { nanoid } from 'nanoid'
 import { QRCodeSVG } from 'qrcode.react'
 import { useEffect, useId, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
@@ -83,7 +84,7 @@ export function AssetValidationDialog(props: {
   const create = useMutation({
     mutationFn: (values: { name: string }) => {
       if (!request.current || request.current.name !== values.name) {
-        request.current = { name: values.name, key: crypto.randomUUID() }
+        request.current = { name: values.name, key: nanoid() }
       }
       return executeAssetAction<AssetValidationView>(
         'CreateVisualValidateSession',

@@ -110,6 +110,7 @@ beforeEach(() => {
 })
 afterEach(() => {
   client.clear()
+  vi.unstubAllGlobals()
   useAuthStore.getState().auth.reset()
 })
 
@@ -1455,71 +1456,83 @@ test('switching library types isolates group filters, asset queries and mutation
   expect(screen.getByPlaceholderText('Filter by name...')).toHaveValue('')
 })
 
-test('verification creation retries the same request key and exposes only the secured H5 link', async () => {
-  const user = userEvent.setup()
-  vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
-  const post = vi
-    .spyOn(api, 'post')
-    .mockRejectedValueOnce(new Error('Connection interrupted'))
-    .mockResolvedValue({
-      data: {
-        success: true,
+test.each([true, false])(
+  'verification creation with randomUUID available: %s retries the same request key and exposes only the secured H5 link',
+  async (hasRandomUUID) => {
+    if (!hasRandomUUID) {
+      vi.stubGlobal('crypto', {
+        getRandomValues: globalThis.crypto.getRandomValues.bind(
+          globalThis.crypto
+        ),
+      })
+    }
+    const user = userEvent.setup()
+    vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
+    const post = vi
+      .spyOn(api, 'post')
+      .mockRejectedValueOnce(new Error('Connection interrupted'))
+      .mockResolvedValue({
         data: {
-          BytedToken: 'validation-na-one',
-          Name: 'Alice',
-          Status: 'pending',
-          ChannelId: 7,
-          ExpiresAt: Date.now() / 1000 + 1800,
-          H5Link: 'https://verify.example/face?token=upstream-private',
-          CallbackURL:
-            'https://gateway.example/api/assets/validation/callback/private',
+          success: true,
+          data: {
+            BytedToken: 'validation-na-one',
+            Name: 'Alice',
+            Status: 'pending',
+            ChannelId: 7,
+            ExpiresAt: Date.now() / 1000 + 1800,
+            H5Link: 'https://verify.example/face?token=upstream-private',
+            CallbackURL:
+              'https://gateway.example/api/assets/validation/callback/private',
+          },
         },
-      },
+      })
+    const persist = vi.spyOn(localStorage, 'setItem')
+    render(
+      <QueryClientProvider client={client}>
+        <AssetValidationDialog
+          project='studio'
+          scope={{ userId: 23 }}
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+        />
+      </QueryClientProvider>
+    )
+    await user.type(screen.getByLabelText('Name'), 'Alice')
+    await user.click(screen.getByRole('button', { name: 'Start verification' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Connection interrupted'
+    )
+    expect(screen.getByLabelText('Name')).toHaveValue('Alice')
+    await user.click(screen.getByRole('button', { name: 'Start verification' }))
+    const link = await screen.findByRole('button', {
+      name: 'Open verification',
     })
-  const persist = vi.spyOn(localStorage, 'setItem')
-  render(
-    <QueryClientProvider client={client}>
-      <AssetValidationDialog
-        project='studio'
-        scope={{ userId: 23 }}
-        onClose={vi.fn()}
-        onCreated={vi.fn()}
-      />
-    </QueryClientProvider>
-  )
-  await user.type(screen.getByLabelText('Name'), 'Alice')
-  await user.click(screen.getByRole('button', { name: 'Start verification' }))
-  expect(await screen.findByRole('alert')).toHaveTextContent(
-    'Connection interrupted'
-  )
-  expect(screen.getByLabelText('Name')).toHaveValue('Alice')
-  await user.click(screen.getByRole('button', { name: 'Start verification' }))
-  const link = await screen.findByRole('button', { name: 'Open verification' })
-  expect(link).toHaveAttribute(
-    'href',
-    'https://verify.example/face?token=upstream-private&lng=en'
-  )
-  expect(link).toHaveAttribute('rel', 'noopener noreferrer')
-  expect(link).toHaveAttribute('referrerpolicy', 'no-referrer')
-  expect(
-    screen.getByRole('button', { name: 'Copy verification link' })
-  ).toBeVisible()
-  expect(post.mock.calls[0][1]).toEqual(post.mock.calls[1][1])
-  expect(post.mock.calls[1][1]).toEqual({
-    ProjectName: 'studio',
-    Name: 'Alice',
-    IdempotencyKey: expect.any(String),
-  })
-  expect(post.mock.calls[1][2]).toEqual(
-    expect.objectContaining({
-      params: expect.objectContaining({
-        Action: 'CreateVisualValidateSession',
-        user_id: 23,
-      }),
+    expect(link).toHaveAttribute(
+      'href',
+      'https://verify.example/face?token=upstream-private&lng=en'
+    )
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+    expect(link).toHaveAttribute('referrerpolicy', 'no-referrer')
+    expect(
+      screen.getByRole('button', { name: 'Copy verification link' })
+    ).toBeVisible()
+    expect(post.mock.calls[0][1]).toEqual(post.mock.calls[1][1])
+    expect(post.mock.calls[1][1]).toEqual({
+      ProjectName: 'studio',
+      Name: 'Alice',
+      IdempotencyKey: expect.stringMatching(/^[A-Za-z0-9_-]{8,128}$/),
     })
-  )
-  expect(persist).not.toHaveBeenCalled()
-})
+    expect(post.mock.calls[1][2]).toEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({
+          Action: 'CreateVisualValidateSession',
+          user_id: 23,
+        }),
+      })
+    )
+    expect(persist).not.toHaveBeenCalled()
+  }
+)
 
 test('a saved verification resumes through a write action and selects its created group', async () => {
   const user = userEvent.setup()
