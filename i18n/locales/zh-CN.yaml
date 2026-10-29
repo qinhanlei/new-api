@@ -196,7 +196,6 @@ asset.url_required: "URL 为必填项"
 asset.video_only: "网关素材仅支持视频生成"
 
 # Human portrait verification and lifecycle
-asset.validation_secret_required: "真人认证需要配置至少 32 个字符的共享密钥"
 asset.validation_secret_unavailable: "当前密钥无法恢复此认证会话"
 asset.validation_busy: "真人认证繁忙，请稍后重试"
 asset.validation_authorization_revoked: "发起认证时的授权已失效"

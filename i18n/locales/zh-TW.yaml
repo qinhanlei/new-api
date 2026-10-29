@@ -196,7 +196,6 @@ asset.url_required: "URL 為必填項"
 asset.video_only: "閘道素材僅支援影片生成"
 
 # Human portrait verification and lifecycle
-asset.validation_secret_required: "真人認證需要設定至少 32 個字元的共用密鑰"
 asset.validation_secret_unavailable: "目前密鑰無法還原此認證工作階段"
 asset.validation_busy: "真人認證忙碌中，請稍後重試"
 asset.validation_authorization_revoked: "發起認證時的授權已失效"

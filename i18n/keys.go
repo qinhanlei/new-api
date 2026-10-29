@@ -222,7 +222,6 @@ const (
 
 // Human portrait validation and deletion diagnostics.
 const (
-	MsgAssetValidationSecretRequired       = "asset.validation_secret_required"
 	MsgAssetValidationSecretUnavailable    = "asset.validation_secret_unavailable"
 	MsgAssetValidationBusy                 = "asset.validation_busy"
 	MsgAssetValidationAuthorizationRevoked = "asset.validation_authorization_revoked"

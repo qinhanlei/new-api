@@ -3217,7 +3217,6 @@
     "Human verification has not completed": "La vérification n’est pas terminée",
     "Human verification is busy; retry shortly": "La vérification est occupée ; réessayez bientôt",
     "Human verification requires a current session or scoped API credential": "La vérification nécessite une session active ou un identifiant API doté des autorisations requises",
-    "Human verification requires a shared secret of at least 32 characters": "La vérification nécessite un secret partagé d’au moins 32 caractères",
     "Human verification requires an HTTPS server address without a path or query": "La vérification nécessite une adresse serveur HTTPS sans chemin ni paramètres",
     "Human-readable name shown to users during Passkey prompts.": "Nom lisible par l'homme affiché aux utilisateurs lors des invites de clé d'accès (Passkey).",
     "I confirm enabling high-risk retry": "Je confirme l'activation de la relance à haut risque",

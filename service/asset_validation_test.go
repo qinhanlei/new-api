@@ -23,12 +23,13 @@ import (
 func assetValidationFixture(t *testing.T) (dto.AssetActor, dto.AssetValidationCreate) {
 	t.Helper()
 	assetTestDatabase(t)
-	t.Setenv("CRYPTO_SECRET", "asset-validation-isolated-secret-32-characters")
-	previousAddress, previousRegistry := system_setting.ServerAddress, jsplugin.DefaultRegistry
+	previousAddress, previousRegistry, previousSecret := system_setting.ServerAddress, jsplugin.DefaultRegistry, common.CryptoSecret
+	common.CryptoSecret = "asset-validation-isolated-secret-32-characters"
 	system_setting.ServerAddress = "https://gateway.example"
 	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
 	t.Cleanup(func() {
 		system_setting.ServerAddress = previousAddress
+		common.CryptoSecret = previousSecret
 		_ = jsplugin.DefaultRegistry.Unregister("doubao")
 		jsplugin.DefaultRegistry = previousRegistry
 	})
@@ -246,7 +247,7 @@ func TestAssetValidationPersistsResultBeforeBinding(t *testing.T) {
 	require.NoError(t, model.DB.Model(row).Update("expires_at", time.Now().Add(-time.Minute).Unix()).Error)
 	// A different process can continue with the durable GroupId after the H5
 	// credential and even the old encryption key have expired or been rotated.
-	t.Setenv("CRYPTO_SECRET", "another-isolated-secret-with-at-least-32-characters")
+	common.CryptoSecret = "another-application-secret"
 	allowAssetValidationPoll(t, created.BytedToken)
 	failGroup = false
 	ready, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
@@ -334,18 +335,64 @@ func TestAssetValidationRateAndLeaseFences(t *testing.T) {
 	assert.ErrorIs(t, model.SaveAssetValidationAttempt(t.Context(), &stale), model.ErrAssetConflict)
 }
 
-func TestAssetValidationRequiresDurableConfiguration(t *testing.T) {
+func TestAssetValidationRequiresHTTPSAddress(t *testing.T) {
 	actor, input := assetValidationFixture(t)
 	calls := assetValidationUpstream(t, func(string, map[string]any) (int, any) { return 0, nil })
-	t.Setenv("CRYPTO_SECRET", "")
-	t.Setenv("SESSION_SECRET", "")
+	system_setting.ServerAddress = "http://gateway.example"
 	_, err := CreateAssetValidationSession(t.Context(), actor, input)
 	require.Error(t, err)
-	t.Setenv("CRYPTO_SECRET", "asset-validation-isolated-secret-32-characters")
-	system_setting.ServerAddress = "http://gateway.example"
-	_, err = CreateAssetValidationSession(t.Context(), actor, input)
-	require.Error(t, err)
 	assert.Empty(t, *calls)
+}
+
+func TestAssetValidationUsesApplicationSecret(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		cryptoEnv      string
+		sessionEnv     string
+		applicationKey string
+	}{
+		{"short crypto secret", "short-crypto", "session-secret", "short-crypto"},
+		{"short session fallback", "", "short-session", "short-session"},
+		{"process secret without environment", "", "", "isolated-process-secret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actor, input := assetValidationFixture(t)
+			t.Setenv("CRYPTO_SECRET", tc.cryptoEnv)
+			t.Setenv("SESSION_SECRET", tc.sessionEnv)
+			// Use the effective key supplied by the application's initialization.
+			common.CryptoSecret = tc.applicationKey
+			assetValidationUpstream(t, func(string, map[string]any) (int, any) { return 0, nil })
+			created, err := CreateAssetValidationSession(t.Context(), actor, input)
+			require.NoError(t, err)
+			require.Equal(t, "pending", created.Status)
+			row, err := model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
+			require.NoError(t, err)
+			require.NotEmpty(t, row.SecretCipher)
+			assert.NotContains(t, row.SecretCipher, "upstream-portrait-token")
+			secrets, err := openAssetValidationSecrets(row)
+			require.NoError(t, err)
+			assert.Equal(t, "upstream-portrait-token", secrets.BytedToken)
+			assert.Equal(t, created.H5Link, secrets.H5Link)
+
+			common.CryptoSecret = "different-application-key"
+			_, err = openAssetValidationSecrets(row)
+			var failure *AssetError
+			require.ErrorAs(t, err, &failure)
+			assert.Equal(t, "ValidationSecretUnavailable", failure.Code)
+			common.CryptoSecret = tc.applicationKey
+
+			otherSession := *row
+			otherSession.PublicID = "validation-na-other-session"
+			_, err = openAssetValidationSecrets(&otherSession)
+			require.ErrorAs(t, err, &failure)
+			assert.Equal(t, "ValidationSecretUnavailable", failure.Code)
+			allowAssetValidationPoll(t, created.BytedToken)
+			ready, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+			require.NoError(t, err)
+			assert.Equal(t, "created", ready.Status)
+			assert.NotEmpty(t, ready.GroupID)
+		})
+	}
 }
 
 func TestAssetValidationRetainsCreateResultAfterClientDisconnect(t *testing.T) {

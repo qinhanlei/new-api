@@ -195,7 +195,6 @@ asset.url_required: "URL is required"
 asset.video_only: "Gateway assets are only supported for video generation"
 
 # Human portrait verification and lifecycle
-asset.validation_secret_required: "Human verification requires a shared secret of at least 32 characters"
 asset.validation_secret_unavailable: "The verification session cannot be restored with the current secret"
 asset.validation_busy: "Human verification is busy; retry shortly"
 asset.validation_authorization_revoked: "The original verification authorization is no longer valid"

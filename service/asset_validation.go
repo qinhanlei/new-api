@@ -12,7 +12,6 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -34,16 +33,7 @@ type assetValidationSecrets struct {
 }
 
 func assetValidationCipher() (cipher.AEAD, error) {
-	secret := os.Getenv("CRYPTO_SECRET")
-	if secret == "" {
-		secret = os.Getenv("SESSION_SECRET")
-	}
-	// common.CryptoSecret may contain a process-random fallback, which cannot
-	// safely decrypt durable H5 sessions after a restart or on another node.
-	if len(secret) < 32 {
-		return nil, assetError(http.StatusServiceUnavailable, "ValidationConfigurationRequired", "Human verification requires a shared secret of at least 32 characters")
-	}
-	key := sha256.Sum256([]byte("new-api:asset-validation:v1\x00" + secret))
+	key := sha256.Sum256([]byte("new-api:asset-validation:v1\x00" + common.CryptoSecret))
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
 		return nil, err
@@ -188,9 +178,6 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 		return assetValidationView(existing)
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return empty, err
-	}
-	if _, err = assetValidationCipher(); err != nil {
 		return empty, err
 	}
 	callbackBase, err := url.Parse(strings.TrimRight(system_setting.ServerAddress, "/"))
