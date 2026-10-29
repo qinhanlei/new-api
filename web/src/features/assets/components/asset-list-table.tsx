@@ -18,8 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { CellContext, ColumnDef } from '@tanstack/react-table'
-import { Eye, Trash2 } from 'lucide-react'
-import { useState, type ReactNode } from 'react'
+import { Trash2 } from 'lucide-react'
+import { useMemo, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -28,6 +28,7 @@ import { CopyButton } from '@/components/copy-button'
 import {
   DataTablePage,
   DataTableToolbar,
+  TruncatedCell,
   useDataTable,
   type DataTablePageProps,
 } from '@/components/data-table'
@@ -42,12 +43,14 @@ import {
 } from '@/lib/admin-permissions'
 import { formatNumber } from '@/lib/format'
 import { getServerErrorMessage } from '@/lib/server-error-message'
+import { formatDateTimeObject } from '@/lib/time'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { assetQueryKeys, executeAssetAction } from '../api'
 import type { Asset, AssetGroup, AssetList, AssetScope } from '../types'
 import { AssetReplicasDialog } from './asset-replicas-dialog'
 import { AssetStatus } from './asset-status'
+import { AssetThumbnail } from './asset-thumbnail'
 
 export function AssetListTable({
   group,
@@ -127,16 +130,37 @@ export function AssetListTable({
     },
     meta: { errorToast: false },
   })
-  const columns: ColumnDef<Asset>[] = [
-    {
-      id: 'name',
-      accessorKey: 'Name',
-      header: t('Name'),
-      cell: ({ row: { original: asset } }) => (
-        <div className='space-y-1'>
-          <p>{asset.Name}</p>
-          <div className='text-muted-foreground flex items-center gap-1 text-xs'>
-            <code className='max-w-64 truncate'>asset://{asset.Id}</code>
+  const resetRemove = remove.reset
+  const columns = useMemo<ColumnDef<Asset>[]>(
+    () => [
+      {
+        id: 'preview',
+        header: t('Preview'),
+        size: 80,
+        minSize: 80,
+        maxSize: 80,
+        cell: ({ row: { original: asset } }) => (
+          <AssetThumbnail key={asset.Id} asset={asset} onPreview={setPreview} />
+        ),
+      },
+      {
+        id: 'name',
+        accessorKey: 'Name',
+        header: t('Name'),
+        size: 180,
+        cell: ({ row: { original: asset } }) => (
+          <TruncatedCell tabIndex={0}>{asset.Name}</TruncatedCell>
+        ),
+      },
+      {
+        id: 'uri',
+        header: t('Asset URI'),
+        size: 300,
+        cell: ({ row: { original: asset } }) => (
+          <div className='flex min-w-0 items-center gap-1'>
+            <TruncatedCell className='min-w-0 font-mono text-xs' tabIndex={0}>
+              {`asset://${asset.Id}`}
+            </TruncatedCell>
             {!frozen && (
               <CopyButton
                 value={`asset://${asset.Id}`}
@@ -144,78 +168,88 @@ export function AssetListTable({
               />
             )}
           </div>
-        </div>
-      ),
-    },
-    {
-      id: 'type',
-      accessorKey: 'AssetType',
-      header: t('Asset type'),
-      cell: ({ row: { original: asset } }) => t(asset.AssetType),
-    },
-    ...(scope.allUsers
-      ? [
-          {
-            id: 'owner',
-            header: t('User ID'),
-            cell: ({ row: { original: asset } }: CellContext<Asset, unknown>) =>
-              asset.UserId ?? group?.UserId ?? '—',
-          },
-        ]
-      : []),
-    {
-      id: 'status',
-      header: t('Status'),
-      cell: ({ row: { original: asset } }) => (
-        <div className='space-y-1'>
-          <AssetStatus status={asset.Status} />
-          {asset.Error?.Message && (
-            <p className='text-destructive max-w-sm text-xs break-words whitespace-normal'>
-              {asset.Error.Code}: {t(asset.Error.Message)}
-            </p>
-          )}
-        </div>
-      ),
-    },
-    {
-      id: 'actions',
-      header: t('Actions'),
-      cell: ({ row: { original: asset } }) => (
-        <div className='flex items-center gap-1'>
-          <Button
-            variant='ghost'
-            size='icon-sm'
-            aria-label={t('Preview {{name}}', { name: asset.Name })}
-            disabled={!/^https?:\/\//i.test(asset.URL)}
-            onClick={() => setPreview(asset)}
-          >
-            <Eye className='size-4' />
-          </Button>
-          {canReadChannel && (
+        ),
+      },
+      {
+        id: 'type',
+        accessorKey: 'AssetType',
+        header: t('Asset type'),
+        size: 100,
+        cell: ({ row: { original: asset } }) => t(asset.AssetType),
+      },
+      ...(scope.allUsers
+        ? [
+            {
+              id: 'owner',
+              header: t('User ID'),
+              cell: ({
+                row: { original: asset },
+              }: CellContext<Asset, unknown>) =>
+                asset.UserId ?? group?.UserId ?? '—',
+            },
+          ]
+        : []),
+      {
+        id: 'status',
+        header: t('Status'),
+        cell: ({ row: { original: asset } }) => (
+          <div className='space-y-1'>
+            <AssetStatus status={asset.Status} />
+            {asset.Error?.Message && (
+              <p className='text-destructive max-w-sm text-xs break-words whitespace-normal'>
+                {asset.Error.Code}: {t(asset.Error.Message)}
+              </p>
+            )}
+          </div>
+        ),
+      },
+      {
+        id: 'createdAt',
+        accessorKey: 'CreateTime',
+        header: t('Created At'),
+        size: 180,
+        cell: ({ row: { original: asset } }) => {
+          const created = asset.CreateTime ? new Date(asset.CreateTime) : null
+          if (!created || !Number.isFinite(created.getTime())) return '—'
+          return (
+            <time dateTime={asset.CreateTime}>
+              {formatDateTimeObject(created)}
+            </time>
+          )
+        },
+      },
+      {
+        id: 'actions',
+        header: t('Actions'),
+        cell: ({ row: { original: asset } }) => (
+          <div className='flex items-center gap-1'>
+            {canReadChannel && (
+              <Button
+                size='sm'
+                variant='ghost'
+                onClick={() => setReplicas(asset)}
+              >
+                {t('Channel replicas')}
+              </Button>
+            )}
             <Button
-              size='sm'
               variant='ghost'
-              onClick={() => setReplicas(asset)}
+              size='icon-sm'
+              aria-label={t('Delete {{name}}', { name: asset.Name })}
+              disabled={scope.allUsers || frozen}
+              onClick={() => {
+                resetRemove()
+                setDeleting(asset)
+              }}
             >
-              {t('Channel replicas')}
+              <Trash2 className='size-4' />
             </Button>
-          )}
-          <Button
-            variant='ghost'
-            size='icon-sm'
-            aria-label={t('Delete {{name}}', { name: asset.Name })}
-            disabled={scope.allUsers || frozen}
-            onClick={() => {
-              remove.reset()
-              setDeleting(asset)
-            }}
-          >
-            <Trash2 className='size-4' />
-          </Button>
-        </div>
-      ),
-    },
-  ]
+          </div>
+        ),
+      },
+    ],
+    [t, frozen, scope.allUsers, group?.UserId, canReadChannel, resetRemove]
+  )
   const totalCount = query.data?.TotalCount ?? 0
   const maxPages = Math.floor(20_000 / pagination.pageSize)
   const pageCount = Math.min(

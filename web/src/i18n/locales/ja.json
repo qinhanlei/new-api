@@ -699,6 +699,7 @@
     "Asset storage": "素材ストレージ",
     "Asset synchronization queued": "素材の同期をキューに追加しました",
     "Asset type": "素材の種類",
+    "Asset URI": "素材URI",
     "Asset URL": "素材 URL",
     "Assets are being prepared for an eligible channel; retry later": "利用可能なチャネル向けに素材を準備中です。後でもう一度お試しください",
     "AssetType must be Image, Video or Audio": "AssetType は Image、Video、Audio のいずれかである必要があります",

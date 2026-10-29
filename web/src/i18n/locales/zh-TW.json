@@ -699,6 +699,7 @@
     "Asset storage": "素材儲存",
     "Asset synchronization queued": "素材已加入同步佇列",
     "Asset type": "素材類型",
+    "Asset URI": "素材連結",
     "Asset URL": "素材 URL",
     "Assets are being prepared for an eligible channel; retry later": "正在為可用管道準備素材，請稍後重試",
     "AssetType must be Image, Video or Audio": "AssetType 必須為 Image、Video 或 Audio",

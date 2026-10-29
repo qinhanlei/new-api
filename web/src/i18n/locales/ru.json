@@ -699,6 +699,7 @@
     "Asset storage": "Хранилище материалов",
     "Asset synchronization queued": "Синхронизация материала добавлена в очередь",
     "Asset type": "Тип материала",
+    "Asset URI": "URI материала",
     "Asset URL": "URL материала",
     "Assets are being prepared for an eligible channel; retry later": "Материалы готовятся для доступного канала; повторите позже",
     "AssetType must be Image, Video or Audio": "AssetType должен быть Image, Video или Audio",

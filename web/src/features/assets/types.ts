@@ -81,6 +81,7 @@ export interface Asset {
   AssetType: AssetType
   Status: string
   URL: string
+  CreateTime?: string
   Error?: { Code: string; Message: string }
   UserId?: number
 }

@@ -699,6 +699,7 @@
     "Asset storage": "Stockage des ressources",
     "Asset synchronization queued": "Synchronisation de la ressource mise en file d’attente",
     "Asset type": "Type de ressource",
+    "Asset URI": "URI du média",
     "Asset URL": "URL de la ressource",
     "Assets are being prepared for an eligible channel; retry later": "Les ressources sont en préparation pour un canal autorisé ; réessayez plus tard",
     "AssetType must be Image, Video or Audio": "AssetType doit être Image, Video ou Audio",

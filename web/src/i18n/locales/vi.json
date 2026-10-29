@@ -699,6 +699,7 @@
     "Asset storage": "Lưu trữ tư liệu",
     "Asset synchronization queued": "Đã thêm nội dung vào hàng đợi đồng bộ",
     "Asset type": "Loại tư liệu",
+    "Asset URI": "URI tư liệu",
     "Asset URL": "URL tư liệu",
     "Assets are being prepared for an eligible channel; retry later": "Đang chuẩn bị tư liệu cho kênh phù hợp; hãy thử lại sau",
     "AssetType must be Image, Video or Audio": "AssetType phải là Image, Video hoặc Audio",
