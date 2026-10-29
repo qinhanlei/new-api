@@ -254,7 +254,12 @@ export function AssetListTable({
         accessorKey: 'AssetType',
         header: t('Asset type'),
         size: 100,
-        cell: ({ row: { original: asset } }) => t(asset.AssetType),
+        cell: ({ row: { original: asset } }) => {
+          if (asset.AssetType) return t(asset.AssetType)
+          return asset.Status === 'Processing'
+            ? t('Identifying...')
+            : t('Unrecognized')
+        },
       },
       ...(scope.allUsers
         ? [

@@ -78,7 +78,7 @@ export interface Asset {
   Name: string
   GroupId: string
   ProjectName: string
-  AssetType: AssetType
+  AssetType: AssetType | ''
   Status: string
   URL: string
   CreateTime?: string

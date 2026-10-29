@@ -187,6 +187,31 @@ test('missing images and non-image assets have placeholders and invalid dates st
   )
 })
 
+test('assets awaiting identification do not show image thumbnails or open previews', async () => {
+  items = [
+    { ...portrait, AssetType: '', Status: 'Processing' },
+    {
+      ...portrait,
+      Id: 'asset-na-failed',
+      Name: 'Unknown',
+      AssetType: '',
+      Status: 'Failed',
+    },
+  ]
+  renderList()
+  expect(await screen.findByText('Identifying...')).toBeVisible()
+  expect(screen.getByText('Unrecognized')).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Preview Portrait' })
+  ).toBeDisabled()
+  expect(screen.getByRole('button', { name: 'Preview Unknown' })).toBeDisabled()
+  expect(screen.queryByRole('img')).not.toBeInTheDocument()
+  items = [{ ...portrait }]
+  await act(() => client.invalidateQueries({ queryKey: ['assets'] }))
+  expect(await screen.findByRole('img', { name: 'Portrait' })).toBeVisible()
+  expect(screen.getByRole('button', { name: 'Preview Portrait' })).toBeEnabled()
+})
+
 test('page selection survives refresh by ID and clears when filtering or changing pages', async () => {
   const user = userEvent.setup()
   items = [portrait, { ...portrait, Id: 'asset-na-two', Name: 'Second' }]

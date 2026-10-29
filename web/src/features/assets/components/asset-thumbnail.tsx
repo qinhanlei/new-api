@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { FileImage, FileMusic, FileVideo, ImageOff } from 'lucide-react'
+import { File, FileImage, FileMusic, FileVideo, ImageOff } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -48,7 +48,10 @@ export function AssetThumbnail(props: {
     setImage({ url, loaded: false, failed: false, retried: Boolean(image.url) })
   }
 
-  let placeholder = <FileImage aria-hidden='true' />
+  let placeholder = <File aria-hidden='true' />
+  if (props.asset.AssetType === 'Image') {
+    placeholder = <FileImage aria-hidden='true' />
+  }
   if (props.asset.AssetType === 'Video') {
     placeholder = <FileVideo aria-hidden='true' />
   }
@@ -70,7 +73,7 @@ export function AssetThumbnail(props: {
       className='relative size-12 shrink-0 overflow-hidden p-0'
       aria-label={t('Preview {{name}}', { name: props.asset.Name })}
       title={image.failed ? t('Image not available') : undefined}
-      disabled={!url}
+      disabled={!url || !props.asset.AssetType}
       onClick={() => props.onPreview(props.asset)}
     >
       {showImage ? (

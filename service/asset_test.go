@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http"
@@ -1608,17 +1609,393 @@ func assetTestMediaFile(t *testing.T, assetType string, size int64) *os.File {
 	file, err := os.CreateTemp(t.TempDir(), "material-*")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, file.Close()) })
-	header := map[string]string{
+	header := []byte(map[string]string{
 		"Image": "\x89PNG\r\n\x1a\n",
-		"Video": "\x00\x00\x00\x18ftypqt  ",
 		"Audio": "ID3\x03\x00\x00\x00\x00\x00\x00",
-	}[assetType]
-	_, err = file.WriteString(header)
+	}[assetType])
+	if assetType == "Video" {
+		header = assetTestMP4("qt  ", "vide")
+		mdat := make([]byte, 8)
+		binary.BigEndian.PutUint32(mdat, uint32(size-int64(len(header))))
+		copy(mdat[4:], "mdat")
+		header = append(header, mdat...)
+	}
+	_, err = file.Write(header)
 	require.NoError(t, err)
 	require.NoError(t, file.Truncate(size))
 	_, err = file.Seek(0, io.SeekStart)
 	require.NoError(t, err)
 	return file
+}
+
+func assetTestMP4Box(kind string, payload ...[]byte) []byte {
+	data := make([]byte, 8)
+	copy(data[4:], kind)
+	for _, part := range payload {
+		data = append(data, part...)
+	}
+	binary.BigEndian.PutUint32(data, uint32(len(data)))
+	return data
+}
+
+func assetTestMP4(brand string, handlers ...string) []byte {
+	var tracks []byte
+	for _, handler := range handlers {
+		data := make([]byte, 25)
+		copy(data[8:12], handler)
+		tracks = append(tracks, assetTestMP4Box("trak", assetTestMP4Box("mdia", assetTestMP4Box("hdlr", data)))...)
+	}
+	return append(assetTestMP4Box("ftyp", []byte(brand), make([]byte, 4), []byte("mp42")), assetTestMP4Box("moov", tracks)...)
+}
+
+func assetTestEBMLElement(id string, payload ...[]byte) []byte {
+	data := []byte(id)
+	size := 0
+	for _, part := range payload {
+		size += len(part)
+	}
+	data = append(data, byte(0x80|size))
+	for _, part := range payload {
+		data = append(data, part...)
+	}
+	return data
+}
+
+func assetTestWebM(trackTypes ...byte) []byte {
+	var tracks []byte
+	for _, kind := range trackTypes {
+		tracks = append(tracks, assetTestEBMLElement("\xae", assetTestEBMLElement("\x83", []byte{kind}))...)
+	}
+	header := assetTestEBMLElement("\x1a\x45\xdf\xa3", assetTestEBMLElement("\x42\x82", []byte("webm")))
+	return append(header, assetTestEBMLElement("\x18\x53\x80\x67", assetTestEBMLElement("\x16\x54\xae\x6b", tracks))...)
+}
+
+func assetTestOggPage(serial, sequence uint32, flags byte, payload string) []byte {
+	data := make([]byte, 28)
+	copy(data, "OggS")
+	data[5] = flags
+	binary.LittleEndian.PutUint32(data[14:18], serial)
+	binary.LittleEndian.PutUint32(data[18:22], sequence)
+	data[26], data[27] = 1, byte(len(payload))
+	return append(data, payload...)
+}
+
+func assetTestRIFFChunk(kind string, payload ...[]byte) []byte {
+	data := make([]byte, 8)
+	copy(data, kind)
+	for _, part := range payload {
+		data = append(data, part...)
+	}
+	binary.LittleEndian.PutUint32(data[4:8], uint32(len(data)-8))
+	if len(data)%2 != 0 {
+		data = append(data, 0)
+	}
+	return data
+}
+
+func assetTestAVI(trackTypes ...string) []byte {
+	var streams []byte
+	for _, kind := range trackTypes {
+		streams = append(streams, assetTestRIFFChunk("LIST", []byte("strl"), assetTestRIFFChunk("strh", []byte(kind), make([]byte, 52)))...)
+	}
+	return assetTestRIFFChunk("RIFF", []byte("AVI "), assetTestRIFFChunk("LIST", []byte("hdrl"), streams), assetTestRIFFChunk("LIST", []byte("movi")))
+}
+
+func TestAssetAutomaticNames(t *testing.T) {
+	assetTestDatabase(t)
+	group := assetTestGroup(t, 1, "names")
+	actor := dto.AssetActor{UserID: 1, ChannelIDs: []int{1}}
+	for _, tc := range []struct {
+		name, explicit, filename, source, want string
+	}{
+		{name: "manual name", explicit: "  My portrait 🎥  ", filename: "original.png", want: "My portrait 🎥"},
+		{name: "file basename", filename: `C:\fakepath\folder/你好.mp4`, want: "你好.mp4"},
+		{name: "URL path without credentials", source: "https://8.8.8.8/assets/%E4%BA%A7%E5%93%81%20%E5%9B%BE.png?token=secret#fragment", want: "产品 图.png"},
+		{name: "decoded separators", source: "https://8.8.8.8/folder%2Fclip%20one.mp4", want: "clip one.mp4"},
+		{name: "URL trailing slash", source: "https://8.8.8.8/cover.png/", want: "cover.png"},
+		{name: "URL blank name", explicit: " \t", source: "https://8.8.8.8/cover.png", want: "cover.png"},
+		{name: "URL manual Unicode limit after trimming", explicit: " " + strings.Repeat("😀", 64) + "\t", source: "https://8.8.8.8/cover.png", want: strings.Repeat("😀", 64)},
+		{name: "control characters", filename: "dir/ a\x00b\n.png ", want: "ab.png"},
+		{name: "automatic Unicode truncation", filename: strings.Repeat("😀", 65) + ".png", want: strings.Repeat("😀", 64)},
+		{name: "manual Unicode limit", explicit: strings.Repeat("😀", 64), want: strings.Repeat("😀", 64)},
+		{name: "missing path", source: "https://8.8.8.8/?filename=secret.png"},
+		{name: "blank name", explicit: " \t", filename: ".."},
+		{name: "only path separators", filename: `/\//`},
+		{name: "URL encoded path separator", source: "https://8.8.8.8/%2F"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var asset *model.Asset
+			var err error
+			if tc.source != "" {
+				request, encodeErr := common.Marshal(map[string]string{"GroupId": group.PublicID, "Name": tc.explicit, "URL": tc.source})
+				require.NoError(t, encodeErr)
+				result, actionErr := ExecuteAssetAction(t.Context(), actor, "CreateAsset", request)
+				require.NoError(t, actionErr)
+				asset, err = model.GetAsset(t.Context(), actor.UserID, result.(map[string]string)["Id"], "default")
+			} else {
+				asset, err = reserveAsset(t.Context(), actor, dto.AssetUpload{GroupID: group.PublicID, AssetType: "Image", Name: tc.explicit, FileName: tc.filename}, "")
+			}
+			require.NoError(t, err)
+			want := tc.want
+			if want == "" {
+				want = asset.PublicID
+			}
+			assert.Equal(t, want, asset.Name)
+			stored, err := model.GetAsset(t.Context(), actor.UserID, asset.PublicID, "default")
+			require.NoError(t, err)
+			assert.Equal(t, want, stored.Name)
+		})
+	}
+	_, err := reserveAsset(t.Context(), actor, dto.AssetUpload{GroupID: group.PublicID, AssetType: "Image", Name: strings.Repeat("😀", 65)}, "")
+	var failure *AssetError
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, "InvalidParameter.Name", failure.Code)
+	request, err := common.Marshal(map[string]string{"GroupId": group.PublicID, "Name": "", "URL": "https://8.8.8.8/", "AssetType": "Document"})
+	require.NoError(t, err)
+	_, err = ExecuteAssetAction(t.Context(), actor, "CreateAsset", request)
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, "InvalidParameter.AssetType", failure.Code)
+	for _, action := range []string{"CreateAssetGroup", "UpdateAssetGroup", "UpdateAsset"} {
+		_, err = ExecuteAssetAction(t.Context(), actor, action, []byte(`{"Name":" "}`))
+		require.ErrorAs(t, err, &failure)
+		assert.Equal(t, "InvalidParameter.Name", failure.Code, action)
+	}
+}
+
+func TestAssetAutomaticImageUpload(t *testing.T) {
+	assetTestDatabase(t)
+	group := assetTestGroup(t, 1, "auto image")
+	content := []byte("\x89PNG\r\n\x1a\nimage-data")
+	puts := 0
+	httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+		puts++
+		assert.Equal(t, http.MethodPut, request.Method)
+		assert.Equal(t, "image/png", request.Header.Get("Content-Type"))
+		body, err := io.ReadAll(request.Body)
+		require.NoError(t, err)
+		assert.Equal(t, content, body)
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+	})
+	_, err := CreateUploadedAsset(t.Context(), dto.AssetActor{UserID: 1, ChannelIDs: []int{1}}, dto.AssetUpload{GroupID: group.PublicID, FileName: "photo.png", ContentType: "application/pdf"}, bytes.NewReader(content))
+	require.NoError(t, err)
+	var stored model.Asset
+	require.NoError(t, model.DB.Where("group_id = ?", group.ID).First(&stored).Error)
+	assert.Equal(t, "photo.png", stored.Name)
+	assert.Equal(t, "Image", stored.AssetType)
+	assert.Equal(t, "image/png", stored.ContentType)
+	assert.Equal(t, model.AssetReady, stored.ObjectState)
+	assert.Equal(t, 1, puts)
+}
+
+func TestAssetMediaDetection(t *testing.T) {
+	assetTestDatabase(t)
+	videoMP4 := assetTestMP4("mp42", "vide")
+	extendedMdat := make([]byte, 24)
+	binary.BigEndian.PutUint32(extendedMdat, 1)
+	copy(extendedMdat[4:], "mdat")
+	binary.BigEndian.PutUint64(extendedMdat[8:], uint64(len(extendedMdat)))
+	copy(extendedMdat[16:], "sounvide")
+	tailMP4 := append(append(bytes.Clone(videoMP4[:20]), extendedMdat...), videoMP4[20:]...)
+	streamingWebM := assetTestWebM(2)
+	streamingWebM[16] = 0xff // unknown-size Segment, bounded by the actual file
+	unknownCluster := append(bytes.Clone(streamingWebM), []byte("\x1f\x43\xb6\x75\xff")...)
+	badBox := assetTestMP4("mp42", "soun")
+	binary.BigEndian.PutUint32(badBox[20:24], 0xffffffff)
+	for index, tc := range []struct {
+		name, explicit, kind, mime, code string
+		data                             []byte
+	}{
+		{name: "PNG", data: []byte("\x89PNG\r\n\x1a\nimage"), kind: "Image", mime: "image/png"},
+		{name: "MP3", data: []byte("ID3\x03\x00\x00\x00\x00\x00\x00"), kind: "Audio", mime: "audio/mpeg"},
+		{name: "FLAC", data: []byte("fLaC\x00\x00\x00\x22"), kind: "Audio", mime: "audio/flac"},
+		{name: "MP4 video", data: assetTestMP4("mp42", "vide"), kind: "Video", mime: "video/mp4"},
+		{name: "MP4 audio", data: assetTestMP4("mp42", "soun"), kind: "Audio", mime: "audio/mp4"},
+		{name: "MP4 mixed tracks", data: assetTestMP4("mp42", "soun", "vide"), kind: "Video", mime: "video/mp4"},
+		{name: "MP4 metadata after extended media box", data: tailMP4, kind: "Video", mime: "video/mp4"},
+		{name: "M4A brand with video", data: assetTestMP4("M4A ", "vide"), kind: "Video", mime: "video/mp4"},
+		{name: "M4A audio", data: assetTestMP4("M4A ", "soun"), kind: "Audio", mime: "audio/mp4"},
+		{name: "QuickTime video", data: assetTestMP4("qt  ", "vide"), kind: "Video", mime: "video/quicktime"},
+		{name: "QuickTime audio unsupported", data: assetTestMP4("qt  ", "soun"), code: "UnsupportedMediaType"},
+		{name: "WebM audio", data: assetTestWebM(2), kind: "Audio", mime: "audio/webm"},
+		{name: "WebM video", data: assetTestWebM(1), kind: "Video", mime: "video/webm"},
+		{name: "WebM mixed tracks", data: assetTestWebM(2, 1), kind: "Video", mime: "video/webm"},
+		{name: "WebM streaming Segment", data: streamingWebM, kind: "Audio", mime: "audio/webm"},
+		{name: "WebM unknown-size Cluster", data: unknownCluster, code: "UnsupportedMediaType"},
+		{name: "WebM unknown track", data: assetTestWebM(1, 17), code: "UnsupportedMediaType"},
+		{name: "Ogg Opus", data: assetTestOggPage(1, 0, 6, "OpusHead"), kind: "Audio", mime: "audio/ogg"},
+		{name: "Ogg Vorbis", data: assetTestOggPage(1, 0, 6, "\x01vorbis\x00"), kind: "Audio", mime: "audio/ogg"},
+		{name: "Ogg FLAC", data: assetTestOggPage(1, 0, 6, "\x7fFLAC\x01\x00\x00"), kind: "Audio", mime: "audio/ogg"},
+		{name: "Ogg Speex", data: assetTestOggPage(1, 0, 6, "Speex   "), kind: "Audio", mime: "audio/ogg"},
+		{name: "Ogg chained audio", data: append(assetTestOggPage(1, 0, 6, "OpusHead"), assetTestOggPage(2, 0, 6, "\x01vorbis\x00")...), kind: "Audio", mime: "audio/ogg"},
+		{name: "Ogg chained video unsupported", data: append(assetTestOggPage(1, 0, 6, "OpusHead"), assetTestOggPage(2, 0, 6, "\x80theora\x00")...), code: "UnsupportedMediaType"},
+		{name: "Ogg Skeleton unsupported", data: assetTestOggPage(1, 0, 6, "fishead\x00"), code: "UnsupportedMediaType"},
+		{name: "Ogg missing end", data: assetTestOggPage(1, 0, 2, "OpusHead"), code: "UnsupportedMediaType"},
+		{name: "AVI video", data: assetTestAVI("vids", "auds"), kind: "Video", mime: "video/avi"},
+		{name: "AVI audio unsupported", data: assetTestAVI("auds"), code: "UnsupportedMediaType"},
+		{name: "MP4 payload is not metadata", data: append(assetTestMP4Box("ftyp", []byte("mp42"), make([]byte, 4)), assetTestMP4Box("mdat", []byte("moovtrakamdiahdlrvidesoun"))...), code: "UnsupportedMediaType"},
+		{name: "MP4 unknown track", data: assetTestMP4("mp42", "vide", "text"), code: "UnsupportedMediaType"},
+		{name: "MP4 box overrun", data: badBox, code: "UnsupportedMediaType"},
+		{name: "unsupported document", data: []byte("%PDF-1.7\nnot an image"), code: "UnsupportedMediaType"},
+		{name: "empty material", code: "FileSizeTooLarge"},
+		{name: "explicit Image compatible", explicit: "Image", data: []byte("\x89PNG\r\n\x1a\nimage"), kind: "Image", mime: "image/png"},
+		{name: "explicit Audio compatible", explicit: "Audio", data: assetTestMP4("M4A ", "soun"), kind: "Audio", mime: "audio/mp4"},
+		{name: "explicit Video audio mismatch", explicit: "Video", data: assetTestMP4("mp42", "soun"), code: "TypeMismatch"},
+		{name: "explicit Image audio mismatch", explicit: "Image", data: []byte("ID3\x03\x00\x00\x00\x00\x00\x00"), code: "TypeMismatch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spoolDirectory := t.TempDir()
+			t.Setenv("TMPDIR", spoolDirectory)
+			puts := 0
+			httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+				puts++
+				assert.Equal(t, tc.mime, request.Header.Get("Content-Type"))
+				body, err := io.ReadAll(request.Body)
+				require.NoError(t, err)
+				assert.Equal(t, tc.data, body, "probing and hashing must preserve the complete source")
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+			})
+			var source io.Reader = bytes.NewReader(tc.data)
+			if index%2 == 0 {
+				source = io.NopCloser(source) // exercise bounded temporary spooling too
+			}
+			asset := model.Asset{AssetType: tc.explicit, ObjectKey: "test", ObjectState: model.AssetPending}
+			err := storeAssetContent(t.Context(), &asset, source)
+			remaining, listErr := os.ReadDir(spoolDirectory)
+			require.NoError(t, listErr)
+			assert.Empty(t, remaining)
+			if tc.code != "" {
+				var failure *AssetError
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, tc.code, failure.Code)
+				assert.Equal(t, tc.explicit, asset.AssetType, "failed detection must not publish a guessed type")
+				assert.Equal(t, model.AssetPending, asset.ObjectState)
+				assert.Zero(t, puts)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.kind, asset.AssetType)
+			assert.Equal(t, tc.mime, asset.ContentType)
+			assert.Equal(t, int64(len(tc.data)), asset.Size)
+			assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256(tc.data)), asset.SHA256)
+			assert.Equal(t, model.AssetReady, asset.ObjectState)
+			assert.Equal(t, 1, puts)
+		})
+	}
+}
+
+func TestAssetAutomaticURLLeaseCompletion(t *testing.T) {
+	assetTestDatabase(t)
+	group := assetTestGroup(t, 1, "auto URL")
+	actor := dto.AssetActor{UserID: 1, ChannelIDs: []int{1}}
+	request, err := common.Marshal(map[string]string{"GroupId": group.PublicID, "URL": "https://8.8.8.8/%E9%9F%B3%E9%A2%91?token=private"})
+	require.NoError(t, err)
+	result, err := ExecuteAssetAction(t.Context(), actor, "CreateAsset", request)
+	require.NoError(t, err)
+	asset, err := model.GetAsset(t.Context(), actor.UserID, result.(map[string]string)["Id"], "default")
+	require.NoError(t, err)
+	assert.Equal(t, "音频", asset.Name)
+	assert.Empty(t, asset.AssetType)
+	claims, err := model.ClaimAssetReplicas(t.Context(), time.Now().Unix(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, claims, "unidentified sources must not reach an upstream channel")
+	first, err := model.ClaimAssetWork(t.Context(), time.Now().Unix(), 10)
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	second, err := model.ClaimAssetWork(t.Context(), first[0].LeaseExpiresAt, 10)
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	content := assetTestMP4("mp42", "soun")
+	gets, puts := 0, 0
+	httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodGet {
+			gets++
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"image/png"}}, Body: io.NopCloser(bytes.NewReader(content)), ContentLength: 1, Request: request}, nil
+		}
+		puts++
+		body, err := io.ReadAll(request.Body)
+		require.NoError(t, err)
+		assert.Equal(t, content, body)
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+	})
+	require.NoError(t, fetchAssetContent(t.Context(), &second[0]))
+	first[0].AssetType, first[0].ObjectState = "Video", model.AssetReady
+	assert.ErrorIs(t, model.FinishAssetSource(t.Context(), &first[0], "", "", 0), model.ErrAssetConflict)
+	stored, err := model.GetAsset(t.Context(), actor.UserID, asset.PublicID, "default")
+	require.NoError(t, err)
+	assert.Empty(t, stored.AssetType)
+	assert.Equal(t, model.AssetPending, stored.ObjectState)
+	require.NoError(t, model.FinishAssetSource(t.Context(), &second[0], "", "", 0))
+	stored, err = model.GetAsset(t.Context(), actor.UserID, asset.PublicID, "default")
+	require.NoError(t, err)
+	assert.Equal(t, "Audio", stored.AssetType)
+	assert.Equal(t, model.AssetReady, stored.ObjectState)
+	assert.Empty(t, stored.SourceURL)
+	claims, err = model.ClaimAssetReplicas(t.Context(), time.Now().Unix(), 10)
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	assert.Equal(t, asset.ID, claims[0].AssetID)
+	assert.Equal(t, 1, gets)
+	assert.Equal(t, 1, puts)
+}
+
+func TestAssetAutomaticSizeLimits(t *testing.T) {
+	assetTestDatabase(t)
+	config, err := model.LoadAssetChannelConfig(t.Context(), 2)
+	require.NoError(t, err)
+	config.SizeLimitsMB = dto.AssetSizeLimits{Image: 1, Audio: 1, Video: 2}
+	require.NoError(t, model.SaveAssetChannelConfig(t.Context(), 2, config))
+	for _, tc := range []struct {
+		name, kind, brand, track string
+		size                     int64
+		allowed                  bool
+	}{
+		{name: "image below limit", kind: "Image", size: 999_999, allowed: true},
+		{name: "image at exclusive limit", kind: "Image", size: 1_000_000},
+		{name: "audio at limit", kind: "Audio", size: 1_000_000, allowed: true},
+		{name: "audio over limit", kind: "Audio", size: 1_000_001},
+		{name: "MP4 audio obeys audio limit", kind: "Audio", brand: "mp42", track: "soun", size: 1_000_001},
+		{name: "M4A video uses actual video limit", kind: "Video", brand: "M4A ", track: "vide", size: 1_000_001, allowed: true},
+		{name: "MP4 video over limit", kind: "Video", brand: "mp42", track: "vide", size: 2_000_001},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := assetTestMediaFile(t, tc.kind, tc.size)
+			if tc.brand != "" {
+				header := assetTestMP4(tc.brand, tc.track)
+				mdat := make([]byte, 8)
+				binary.BigEndian.PutUint32(mdat, uint32(tc.size-int64(len(header))))
+				copy(mdat[4:], "mdat")
+				_, err := file.WriteAt(append(header, mdat...), 0)
+				require.NoError(t, err)
+			}
+			spoolDirectory := t.TempDir()
+			t.Setenv("TMPDIR", spoolDirectory)
+			puts := 0
+			httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+				puts++
+				n, err := io.Copy(io.Discard, request.Body)
+				require.NoError(t, err)
+				assert.Equal(t, tc.size, n)
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+			})
+			asset := model.Asset{ObjectKey: "test"}
+			err := storeAssetContent(t.Context(), &asset, io.NopCloser(file))
+			remaining, listErr := os.ReadDir(spoolDirectory)
+			require.NoError(t, listErr)
+			assert.Empty(t, remaining)
+			if !tc.allowed {
+				var failure *AssetError
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, "FileSizeTooLarge", failure.Code)
+				assert.Empty(t, asset.AssetType)
+				assert.Zero(t, puts)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.kind, asset.AssetType)
+			assert.Equal(t, tc.size, asset.Size)
+			assert.Equal(t, 1, puts)
+		})
+	}
 }
 
 func TestAssetDefaultSizeLimitsUploadAndURL(t *testing.T) {

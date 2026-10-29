@@ -18,25 +18,26 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useId, useState } from 'react'
+import { useId, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { Dialog } from '@/components/dialog'
 import { ErrorState } from '@/components/error-state'
+import { FilePicker } from '@/components/file-picker'
 import { LoadingState } from '@/components/loading-state'
 import { Button } from '@/components/ui/button'
 import {
   Form,
   FormControl,
+  FormDescription,
   FormField,
   FormItem,
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { NativeSelect } from '@/components/ui/native-select'
 import { toIntlLocale } from '@/i18n/languages'
 import { formatNumber } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
@@ -48,24 +49,14 @@ import {
   getAssetConfig,
   uploadAsset,
 } from '../api'
+import { deriveAssetName, inspectAssetFile } from '../lib/asset-source'
 import { assetCreateSchema } from '../lib/schemas'
-import type {
-  AssetGroup,
-  AssetScope,
-  AssetSizeLimits,
-  AssetType,
-} from '../types'
+import type { AssetGroup, AssetScope, AssetSizeLimits } from '../types'
 
 interface AssetFormValues {
   name: string
-  type: AssetType
   source: 'url' | 'file'
   url: string
-}
-const assetAccept: Record<AssetType, string> = {
-  Image: 'image/*',
-  Video: 'video/*',
-  Audio: 'audio/*',
 }
 
 export function AssetCreateDialog({
@@ -80,69 +71,117 @@ export function AssetCreateDialog({
   const { t, i18n } = useTranslation()
   const id = useId()
   const client = useQueryClient()
+  const submitting = useRef(false)
   const [file, setFile] = useState<File | null>(null)
-  const [fileError, setFileError] = useState('')
+  const [selectionError, setSelectionError] = useState('')
   const form = useForm<AssetFormValues>({
     resolver: zodResolver(assetCreateSchema(t)),
-    defaultValues: { name: '', type: 'Image', source: 'url', url: '' },
+    defaultValues: { name: '', source: 'url', url: '' },
   })
-  const source = form.watch('source')
-  const type = form.watch('type')
+  const url = form.watch('url')
+  const automaticName = deriveAssetName(
+    file ? { fileName: file.name } : { url }
+  )
   const config = useQuery({
     queryKey: assetQueryKeys.config,
     queryFn: ({ signal }) => getAssetConfig(signal),
     meta: { errorToast: false },
   })
-  const limit =
-    config.data?.size_limits_mb?.[type.toLowerCase() as keyof AssetSizeLimits]
+  const limits = config.data?.size_limits_mb
+  const limitsReady = Boolean(
+    limits &&
+    [limits.image, limits.video, limits.audio].every(
+      (limit) => Number.isFinite(limit) && limit > 0
+    )
+  )
+  const canSubmit = config.data?.enabled && limitsReady && !config.isError
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const sizeHint =
-    type === 'Image'
+    limitsReady && limits
+      ? t(
+          'Images < {{image}} MB · Video ≤ {{video}} MB · Audio ≤ {{audio}} MB',
+          {
+            image: formatNumber(limits.image, locale),
+            video: formatNumber(limits.video, locale),
+            audio: formatNumber(limits.audio, locale),
+          }
+        )
+      : ''
+
+  function fileAdmissionError(candidate: File): string {
+    if (candidate.size === 0) return t('The file is empty.')
+    const inspection = inspectAssetFile(candidate)
+    if (inspection.unsupported) {
+      return t('Only image, video, and audio files are supported.')
+    }
+    if (!limitsReady || !limits) return ''
+    const type = inspection.type
+    const limit = type
+      ? limits[type.toLowerCase() as keyof AssetSizeLimits]
+      : Math.max(limits.image, limits.video, limits.audio)
+    let maxBytes = Math.max(
+      limits.image * 1000000 - 1,
+      limits.video * 1000000,
+      limits.audio * 1000000
+    )
+    if (type) maxBytes = limit * 1000000
+    if (type === 'Image') maxBytes -= 1
+    if (candidate.size <= maxBytes) return ''
+    return type === 'Image'
       ? t('File size must be less than {{limit}} MB.', {
           limit: formatNumber(limit, locale),
         })
       : t('File size must not exceed {{limit}} MB.', {
           limit: formatNumber(limit, locale),
         })
-  let currentFileError = fileError
-  if (file && file.size === 0) {
-    currentFileError = t('The file is empty.')
-  } else if (file && limit !== undefined) {
-    const maxBytes = limit * 1000000 - (type === 'Image' ? 1 : 0)
-    if (file.size > maxBytes) currentFileError = sizeHint
   }
+
+  const currentFileError = file ? fileAdmissionError(file) : ''
   const mutation = useMutation({
-    mutationFn: (values: AssetFormValues) => {
+    mutationFn: ({
+      values,
+      selectedFile,
+    }: {
+      values: AssetFormValues
+      selectedFile: File | null
+    }) => {
       const fields = {
         GroupId: group.Id,
         ProjectName: group.ProjectName,
-        AssetType: values.type,
-        Name: values.name,
+        Name:
+          values.name ||
+          deriveAssetName(
+            selectedFile ? { fileName: selectedFile.name } : { url: values.url }
+          ),
       }
-      if (values.source === 'url') {
+      if (!selectedFile) {
         return executeAssetAction<{ Id: string }>(
           'CreateAsset',
           { ...fields, URL: values.url },
           scope
         )
       }
-      if (!file) throw new Error(t('Select a file'))
       const body = new FormData()
       Object.entries(fields).forEach(([key, value]) => body.append(key, value))
-      body.append('file', file)
+      body.append('file', selectedFile)
       return uploadAsset(body, scope)
     },
-    onSuccess: () => {
+    onSuccess: (_, { selectedFile }) => {
       void client.invalidateQueries({ queryKey: assetQueryKeys.all })
-      toast.success(t('Asset added'))
+      toast.success(
+        selectedFile ? t('Asset added') : t('Asset submitted for processing')
+      )
       onClose()
     },
     onError: (error) => handleServerError(error),
+    onSettled: () => {
+      submitting.current = false
+    },
   })
   return (
     <Dialog
       open
-      onOpenChange={(open) => !open && !mutation.isPending && onClose()}
+      onOpenChange={(open) => !open && !submitting.current && onClose()}
       title={t('Add asset')}
       description={group.Name}
       contentHeight='auto'
@@ -150,7 +189,7 @@ export function AssetCreateDialog({
         <>
           <Button
             variant='outline'
-            onClick={onClose}
+            onClick={() => !submitting.current && onClose()}
             disabled={mutation.isPending}
           >
             {t('Cancel')}
@@ -160,9 +199,9 @@ export function AssetCreateDialog({
             form={id}
             disabled={
               mutation.isPending ||
-              !config.data?.enabled ||
-              limit === undefined ||
-              config.isError
+              !canSubmit ||
+              Boolean(currentFileError) ||
+              (!file && !url.trim())
             }
           >
             {mutation.isPending ? t('Uploading...') : t('Add asset')}
@@ -175,81 +214,65 @@ export function AssetCreateDialog({
           id={id}
           className='space-y-4'
           onSubmit={form.handleSubmit((values) => {
-            if (
-              !config.data?.enabled ||
-              limit === undefined ||
-              config.isError
-            ) {
-              return
-            }
-            if (values.source === 'file' && !file) {
-              setFileError(t('Select a file'))
-              return
-            }
-            if (values.source === 'file' && currentFileError) return
-            mutation.mutate(values)
+            if (submitting.current || !canSubmit || currentFileError) return
+            submitting.current = true
+            mutation.mutate({ values, selectedFile: file })
           })}
         >
           <FormField
             control={form.control}
-            name='name'
+            name='url'
             render={({ field }) => (
               <FormItem>
-                <FormLabel>{t('Name')}</FormLabel>
+                <FormLabel>{t('Asset URL')}</FormLabel>
                 <FormControl>
-                  <Input {...field} autoFocus maxLength={64} />
+                  <Input
+                    {...field}
+                    autoFocus
+                    type='url'
+                    placeholder='https://'
+                    disabled={mutation.isPending || Boolean(file)}
+                  />
                 </FormControl>
                 <FormMessage />
               </FormItem>
             )}
           />
-          <FormField
-            control={form.control}
-            name='type'
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>{t('Asset type')}</FormLabel>
-                <FormControl>
-                  <NativeSelect
-                    {...field}
-                    className='w-full'
-                    onChange={(event) => {
-                      field.onChange(event)
-                      setFile(null)
-                      setFileError('')
-                    }}
-                  >
-                    <option value='Image'>{t('Image')}</option>
-                    <option value='Video'>{t('Video')}</option>
-                    <option value='Audio'>{t('Audio')}</option>
-                  </NativeSelect>
-                </FormControl>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
-          <FormField
-            control={form.control}
-            name='source'
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>{t('Source')}</FormLabel>
-                <FormControl>
-                  <NativeSelect
-                    {...field}
-                    className='w-full'
-                    onChange={(event) => {
-                      field.onChange(event)
-                      setFile(null)
-                      setFileError('')
-                    }}
-                  >
-                    <option value='url'>{t('Import URL')}</option>
-                    <option value='file'>{t('Upload file')}</option>
-                  </NativeSelect>
-                </FormControl>
-              </FormItem>
-            )}
+          <FilePicker
+            fileName={file?.name ?? ''}
+            label={t('File')}
+            prompt={t('Select or drop a file here')}
+            accept='image/*,video/*,audio/*,.ogg,.mp4,.webm'
+            disabled={mutation.isPending}
+            description={
+              file
+                ? t('{{size}} bytes', { size: formatNumber(file.size, locale) })
+                : t('Images, videos, and audio only')
+            }
+            error={selectionError || currentFileError}
+            onSelect={(files) => {
+              if (submitting.current) return
+              if (files.length !== 1) {
+                setSelectionError(t('Select one file at a time.'))
+                return
+              }
+              const candidate = files[0]
+              const error = fileAdmissionError(candidate)
+              if (error) {
+                setSelectionError(error)
+                return
+              }
+              setSelectionError('')
+              setFile(candidate)
+              form.setValue('source', 'file')
+              form.clearErrors('url')
+            }}
+            onRemove={() => {
+              if (submitting.current) return
+              setFile(null)
+              setSelectionError('')
+              form.setValue('source', 'url')
+            }}
           />
           {config.isPending && (
             <LoadingState inline size='sm' message={t('Loading...')} />
@@ -261,63 +284,29 @@ export function AssetCreateDialog({
               onRetry={() => void config.refetch()}
             />
           )}
-          {limit !== undefined && (
-            <p
-              id={`${id}-size-limit`}
-              className='text-muted-foreground text-sm'
-            >
-              {sizeHint}{' '}
-              {t(
-                '1 MB = 1,000,000 bytes. Other requirements are checked by the upstream.'
-              )}
-            </p>
+          {sizeHint && (
+            <p className='text-muted-foreground text-xs'>{sizeHint}</p>
           )}
-          {source === 'url' ? (
-            <FormField
-              control={form.control}
-              name='url'
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('Asset URL')}</FormLabel>
-                  <FormControl>
-                    <Input {...field} type='url' placeholder='https://' />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          ) : (
-            <div className='space-y-2'>
-              <label htmlFor={`${id}-file`} className='text-sm font-medium'>
-                {t('File')}
-              </label>
-              <Input
-                key={type}
-                id={`${id}-file`}
-                type='file'
-                accept={assetAccept[type]}
-                aria-invalid={Boolean(currentFileError)}
-                aria-describedby={
-                  currentFileError
-                    ? `${id}-size-limit ${id}-file-error`
-                    : `${id}-size-limit`
-                }
-                onChange={(event) => {
-                  setFile(event.target.files?.[0] ?? null)
-                  setFileError('')
-                }}
-              />
-              {currentFileError && (
-                <p
-                  id={`${id}-file-error`}
-                  role='alert'
-                  className='text-destructive text-sm'
-                >
-                  {currentFileError}
-                </p>
-              )}
-            </div>
-          )}
+          <FormField
+            control={form.control}
+            name='name'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('Name')}</FormLabel>
+                <FormControl>
+                  <Input
+                    {...field}
+                    placeholder={automaticName}
+                    disabled={mutation.isPending}
+                  />
+                </FormControl>
+                <FormDescription>
+                  {t('Leave blank to use the URL or file name.')}
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
         </form>
       </Form>
     </Dialog>

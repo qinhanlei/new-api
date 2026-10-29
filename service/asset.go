@@ -10,9 +10,12 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
+	"path"
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
@@ -89,7 +92,7 @@ func ExecuteAssetAction(ctx context.Context, actor dto.AssetActor, action string
 	if err != nil {
 		return nil, err
 	}
-	if request.Name != nil && (utf8.RuneCountInString(*request.Name) > 64 || strings.TrimSpace(*request.Name) == "") {
+	if action != "CreateAsset" && request.Name != nil && (utf8.RuneCountInString(*request.Name) > 64 || strings.TrimSpace(*request.Name) == "") {
 		return nil, assetError(http.StatusBadRequest, "InvalidParameter.Name", "Name must contain 1 to 64 characters")
 	}
 	if request.Description != nil && utf8.RuneCountInString(*request.Description) > 300 {
@@ -290,7 +293,7 @@ func assetCreationChannel(ctx context.Context, actor dto.AssetActor, preferred i
 }
 
 func reserveAsset(ctx context.Context, actor dto.AssetActor, input dto.AssetUpload, sourceURL string) (*model.Asset, error) {
-	if input.AssetType != "Image" && input.AssetType != "Video" && input.AssetType != "Audio" {
+	if input.AssetType != "" && input.AssetType != "Image" && input.AssetType != "Video" && input.AssetType != "Audio" {
 		return nil, assetError(http.StatusBadRequest, "InvalidParameter.AssetType", "AssetType must be Image, Video or Audio")
 	}
 	project, err := normalizeAssetProject(input.ProjectName)
@@ -315,7 +318,27 @@ func reserveAsset(ctx context.Context, actor dto.AssetActor, input dto.AssetUplo
 		return nil, err
 	}
 	id := model.NewAssetID()
-	name := input.Name
+	name := strings.TrimSpace(input.Name)
+	if name == "" {
+		name = input.FileName
+		if name == "" && sourceURL != "" {
+			if source, err := url.Parse(sourceURL); err == nil {
+				name, _ = url.PathUnescape(path.Base(strings.TrimRight(source.EscapedPath(), "/")))
+			}
+		}
+		name = path.Base(strings.ReplaceAll(name, `\`, "/"))
+		name = strings.TrimSpace(strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) {
+				return -1
+			}
+			return r
+		}, name))
+		if name == "." || name == ".." || name == "/" {
+			name = ""
+		}
+		characters := []rune(name)
+		name = string(characters[:min(len(characters), 64)])
+	}
 	if name == "" {
 		name = id
 	}

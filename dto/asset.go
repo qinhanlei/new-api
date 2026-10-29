@@ -95,6 +95,7 @@ type AssetUpload struct {
 	GroupID     string
 	ProjectName string
 	Name        string
+	FileName    string
 	AssetType   string
 	Size        int64
 	ContentType string

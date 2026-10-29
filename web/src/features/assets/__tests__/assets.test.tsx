@@ -24,7 +24,14 @@ import {
   createRouter,
   RouterProvider,
 } from '@tanstack/react-router'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { toast } from 'sonner'
 import { beforeEach, afterEach, expect, test, vi } from 'vitest'
@@ -39,6 +46,7 @@ import { AssetGroupDialog } from '../components/asset-group-dialog'
 import { AssetReplicasDialog } from '../components/asset-replicas-dialog'
 import { AssetValidationDialog } from '../components/asset-validation-dialog'
 import { Assets } from '../index'
+import { deriveAssetName } from '../lib/asset-source'
 import { assetValidationH5Link } from '../lib/validation'
 import type { Asset, AssetGroup } from '../types'
 
@@ -408,6 +416,65 @@ test.each([
   }
 )
 
+test.each([
+  [
+    {
+      url: 'https://example.com/folder/%E5%9B%BE%20%E7%89%87.png?token=secret#preview',
+    },
+    '图 片.png',
+  ],
+  [{ url: 'https://example.com/folder/clip.mp4/' }, 'clip.mp4'],
+  [{ url: 'https://example.com/folder/clip.mp4%2F' }, 'clip.mp4'],
+  [{ url: 'https://example.com/folder/a%2Fb%5Cc%0A.png' }, 'c.png'],
+  [{ url: 'https://example.com/a%252Fb.png' }, 'a%2Fb.png'],
+  [{ url: 'https://example.com/?name=ignored.png' }, ''],
+  [{ url: 'https://example.com/folder/%2E' }, ''],
+  [{ url: 'https://example.com/%2F' }, ''],
+  [{ fileName: 'folder\\ image\u0000.png ' }, 'image.png'],
+  [{ fileName: `${'😀'.repeat(65)}.png` }, '😀'.repeat(64)],
+])(
+  'automatic asset names follow the source basename rules (%j)',
+  (source, expected) => {
+    expect(deriveAssetName(source)).toBe(expected)
+  }
+)
+
+test('URL import derives a name when left blank and lets the server identify the media', async () => {
+  const user = userEvent.setup()
+  const success = vi.spyOn(toast, 'success')
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: { Id: 'asset-one' } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetCreateDialog
+        group={group}
+        scope={{ userId: 23 }}
+        onClose={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await user.type(
+    screen.getByLabelText('Asset URL'),
+    'https://example.com/%E4%BA%A7%E5%93%81%20%E5%9B%BE.png?token=private#preview'
+  )
+  await user.click(screen.getByRole('button', { name: 'Add asset' }))
+  await waitFor(() => expect(post).toHaveBeenCalledOnce())
+  expect(post).toHaveBeenCalledWith(
+    '/api/assets/actions',
+    {
+      GroupId: group.Id,
+      ProjectName: group.ProjectName,
+      Name: '产品 图.png',
+      URL: 'https://example.com/%E4%BA%A7%E5%93%81%20%E5%9B%BE.png?token=private#preview',
+    },
+    expect.objectContaining({
+      params: expect.objectContaining({ user_id: 23 }),
+    })
+  )
+  expect(success).toHaveBeenCalledWith('Asset submitted for processing')
+})
+
 test('URL import preserves form input after a rejected response and retries the official action', async () => {
   const user = userEvent.setup()
   const close = vi.fn()
@@ -443,7 +510,6 @@ test('URL import preserves form input after a rejected response and retries the 
     {
       GroupId: 'group-one',
       ProjectName: 'default',
-      AssetType: 'Image',
       Name: 'Dancing avatar',
       URL: 'https://example.com/avatar.png',
     },
@@ -458,7 +524,7 @@ test('URL import preserves form input after a rejected response and retries the 
   )
 })
 
-test('file upload requires a file and sends multipart with the selected media type', async () => {
+test('file upload derives its name and leaves media identification to the server', async () => {
   const user = userEvent.setup()
   const post = vi
     .spyOn(api, 'post')
@@ -468,11 +534,8 @@ test('file upload requires a file and sends multipart with the selected media ty
       <AssetCreateDialog group={group} scope={{}} onClose={vi.fn()} />
     </QueryClientProvider>
   )
-  await user.type(screen.getByLabelText('Name'), 'Voice')
-  await user.selectOptions(screen.getByLabelText('Asset type'), 'Audio')
-  await user.selectOptions(screen.getByLabelText('Source'), 'file')
-  await user.click(screen.getByRole('button', { name: 'Add asset' }))
-  expect(await screen.findByRole('alert')).toHaveTextContent('Select a file')
+  expect(screen.getByRole('button', { name: 'Add asset' })).toBeDisabled()
+  expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
   expect(post).not.toHaveBeenCalled()
   const file = new File(['sound'], 'voice.wav', { type: 'audio/wav' })
   await user.upload(screen.getByLabelText('File'), file)
@@ -482,7 +545,9 @@ test('file upload requires a file and sends multipart with the selected media ty
   expect(url).toBe('/api/assets/upload')
   expect(body).toBeInstanceOf(FormData)
   expect((body as FormData).get('file')).toBe(file)
-  expect((body as FormData).get('AssetType')).toBe('Audio')
+  expect((body as FormData).has('AssetType')).toBe(false)
+  expect((body as FormData).get('Name')).toBe('voice.wav')
+  expect((body as FormData).has('URL')).toBe(false)
   expect((body as FormData).get('GroupId')).toBe('group-one')
 })
 
@@ -516,14 +581,13 @@ test.each([
       </QueryClientProvider>
     )
     await user.type(screen.getByLabelText('Name'), 'Media')
-    await user.selectOptions(screen.getByLabelText('Asset type'), type)
     const hint =
       type === 'Image'
         ? 'File size must be less than 1 MB.'
         : 'File size must not exceed 1 MB.'
-    expect(await screen.findByText(hint, { exact: false })).toBeVisible()
-    await user.selectOptions(screen.getByLabelText('Source'), 'file')
-    expect(screen.getByText(hint, { exact: false })).toBeVisible()
+    expect(
+      await screen.findByText('Images < 1 MB · Video ≤ 1 MB · Audio ≤ 1 MB')
+    ).toBeVisible()
     await user.upload(
       screen.getByLabelText('File'),
       new File([new Uint8Array(size)], 'media', { type: mime })
@@ -545,7 +609,7 @@ test.each([
   }
 )
 
-test('switching away from file upload clears the previously selected file', async () => {
+test('removing a file restores the URL draft without replacing a manual name', async () => {
   const user = userEvent.setup()
   const post = vi
     .spyOn(api, 'post')
@@ -555,16 +619,278 @@ test('switching away from file upload clears the previously selected file', asyn
       <AssetCreateDialog group={group} scope={{}} onClose={vi.fn()} />
     </QueryClientProvider>
   )
+  const urlInput = screen.getByLabelText('Asset URL')
+  await waitFor(() => expect(urlInput).toHaveFocus())
+  await user.type(urlInput, 'https://example.com/original.png')
+  expect(screen.getByLabelText('Name')).toHaveAttribute(
+    'placeholder',
+    'original.png'
+  )
   await user.type(screen.getByLabelText('Name'), 'Product')
-  await user.selectOptions(screen.getByLabelText('Source'), 'file')
   await user.upload(
     screen.getByLabelText('File'),
     new File(['image'], 'product.png', { type: 'image/png' })
   )
-  await user.selectOptions(screen.getByLabelText('Source'), 'url')
-  await user.selectOptions(screen.getByLabelText('Source'), 'file')
+  expect(urlInput).toBeDisabled()
+  expect(urlInput).toHaveValue('https://example.com/original.png')
+  expect(screen.getByLabelText('Name')).toHaveValue('Product')
+  fireEvent.change(screen.getByLabelText('File'), { target: { files: [] } })
+  expect(screen.getByText('product.png')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Remove file' }))
+  expect(urlInput).toBeEnabled()
+  expect(screen.getByLabelText('Name')).toHaveValue('Product')
+  await user.clear(screen.getByLabelText('Name'))
+  expect(screen.getByLabelText('Name')).toHaveAttribute(
+    'placeholder',
+    'original.png'
+  )
   await user.click(screen.getByRole('button', { name: 'Add asset' }))
-  expect(await screen.findByRole('alert')).toHaveTextContent('Select a file')
+  await waitFor(() => expect(post).toHaveBeenCalledOnce())
+  expect(post).toHaveBeenCalledWith(
+    '/api/assets/actions',
+    expect.objectContaining({
+      Name: 'original.png',
+      URL: 'https://example.com/original.png',
+    }),
+    expect.anything()
+  )
+})
+
+test('invalid drops preserve the selected file, and the same file can be selected again', async () => {
+  const user = userEvent.setup()
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({ data: { success: true, data: { Id: 'asset-one' } } })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetCreateDialog group={group} scope={{}} onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  const input = screen.getByLabelText('File')
+  const dropZone = input.closest('[data-slot="file-picker"]') as HTMLElement
+  const file = new File(['image'], 'product.png', { type: 'image/png' })
+  await user.upload(input, file)
+  fireEvent.drop(dropZone, { dataTransfer: { files: [file, file] } })
+  expect(screen.getByRole('alert')).toHaveTextContent(
+    'Select one file at a time.'
+  )
+  expect(screen.getByText('product.png')).toBeVisible()
+  fireEvent.drop(dropZone, {
+    dataTransfer: {
+      files: [new File(['pdf'], 'book.pdf', { type: 'application/pdf' })],
+    },
+  })
+  expect(screen.getByRole('alert')).toHaveTextContent(
+    'Only image, video, and audio files are supported.'
+  )
+  expect(screen.getByText('product.png')).toBeVisible()
+  await user.upload(input, file)
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Add asset' }))
+  await waitFor(() => expect(post).toHaveBeenCalledOnce())
+  expect((post.mock.calls[0][1] as FormData).get('file')).toBe(file)
+})
+
+test.each([
+  { name: 'opaque', mime: '', size: 2000000, allowed: true },
+  {
+    name: 'container.mp4',
+    mime: 'application/octet-stream',
+    size: 2000000,
+    allowed: true,
+  },
+  { name: 'container.mp4', mime: 'audio/mp4', size: 2000000, allowed: true },
+  { name: 'container.m4a', mime: '', size: 2000000, allowed: true },
+  {
+    name: 'container.m4a',
+    mime: 'application/octet-stream',
+    size: 2000000,
+    allowed: true,
+  },
+  { name: 'container.m4b', mime: '', size: 2000000, allowed: true },
+  {
+    name: 'container.m4v',
+    mime: 'application/octet-stream',
+    size: 2000000,
+    allowed: true,
+    video: 1,
+    audio: 3,
+  },
+  { name: 'container.m4a', mime: 'audio/x-m4a', size: 2000000, allowed: true },
+  { name: 'container.m4b', mime: 'audio/m4b', size: 2000000, allowed: true },
+  { name: 'container.m4v', mime: 'audio/x-m4v', size: 2000000, allowed: true },
+  {
+    name: 'container.m4v',
+    mime: 'video/x-m4v',
+    size: 2000000,
+    allowed: true,
+    video: 1,
+    audio: 3,
+  },
+  {
+    name: 'opaque',
+    mime: 'application/octet-stream',
+    size: 3000001,
+    allowed: false,
+  },
+  { name: 'image.PNG', mime: '', size: 1000000, allowed: false },
+])(
+  'unknown file types use the largest configured limit ($name, $mime, $size bytes)',
+  async ({ name, mime, size, allowed, video = 3, audio = 1 }) => {
+    const user = userEvent.setup({ applyAccept: false })
+    vi.mocked(api.get).mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          enabled: true,
+          size_limits_mb: { image: 1, video, audio },
+        },
+      },
+    })
+    const post = vi
+      .spyOn(api, 'post')
+      .mockResolvedValue({ data: { success: true, data: { Id: 'asset-one' } } })
+    render(
+      <QueryClientProvider client={client}>
+        <AssetCreateDialog group={group} scope={{}} onClose={vi.fn()} />
+      </QueryClientProvider>
+    )
+    await screen.findByText(
+      `Images < 1 MB · Video ≤ ${video} MB · Audio ≤ ${audio} MB`
+    )
+    await user.upload(
+      screen.getByLabelText('File'),
+      new File([new Uint8Array(size)], name, { type: mime })
+    )
+    if (allowed) {
+      await user.click(screen.getByRole('button', { name: 'Add asset' }))
+      await waitFor(() => expect(post).toHaveBeenCalledOnce())
+      expect((post.mock.calls[0][1] as FormData).has('AssetType')).toBe(false)
+      expect((post.mock.calls[0][1] as FormData).get('Name')).toBe(name)
+    } else {
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        name === 'image.PNG'
+          ? 'File size must be less than 1 MB.'
+          : 'File size must not exceed 3 MB.'
+      )
+      expect(screen.getByRole('button', { name: 'Add asset' })).toBeDisabled()
+      expect(post).not.toHaveBeenCalled()
+    }
+  }
+)
+
+test('manual names validate Unicode code points without silently truncating input', async () => {
+  const user = userEvent.setup()
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({ data: { success: true, data: { Id: 'asset-one' } } })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetCreateDialog group={group} scope={{}} onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await user.type(
+    screen.getByLabelText('Asset URL'),
+    'https://example.com/download'
+  )
+  fireEvent.change(screen.getByLabelText('Name'), {
+    target: { value: '😀'.repeat(65) },
+  })
+  await user.click(screen.getByRole('button', { name: 'Add asset' }))
+  expect(
+    await screen.findByText('Name must not exceed 64 characters')
+  ).toBeVisible()
+  expect(screen.getByLabelText('Name')).toHaveValue('😀'.repeat(65))
+  expect(post).not.toHaveBeenCalled()
+  fireEvent.change(screen.getByLabelText('Name'), {
+    target: { value: ` \u0085${'😀'.repeat(64)}\u0085 ` },
+  })
+  await user.click(screen.getByRole('button', { name: 'Add asset' }))
+  await waitFor(() => expect(post).toHaveBeenCalledOnce())
+  expect(post).toHaveBeenCalledWith(
+    '/api/assets/actions',
+    expect.objectContaining({ Name: '😀'.repeat(64) }),
+    expect.anything()
+  )
+})
+
+test('pending uploads lock the draft and dismissal, prevent duplicate requests, and keep files after failure', async () => {
+  const user = userEvent.setup()
+  const close = vi.fn()
+  let rejectUpload!: (reason: Error) => void
+  const post = vi
+    .spyOn(api, 'post')
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectUpload = reject
+        })
+    )
+    .mockResolvedValueOnce({
+      data: { success: true, data: { Id: 'asset-one' } },
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetCreateDialog group={group} scope={{}} onClose={close} />
+    </QueryClientProvider>
+  )
+  const input = screen.getByLabelText('File')
+  const file = new File(['image'], 'product.png', { type: 'image/png' })
+  await user.type(
+    screen.getByLabelText('Asset URL'),
+    'https://example.com/original'
+  )
+  await user.type(screen.getByLabelText('Name'), 'Handwritten')
+  await user.upload(input, file)
+  const form = screen.getByLabelText('Name').closest('form') as HTMLFormElement
+  fireEvent.submit(form)
+  fireEvent.submit(form)
+  await waitFor(() => expect(post).toHaveBeenCalledOnce())
+  expect(screen.getByRole('button', { name: 'Uploading...' })).toBeDisabled()
+  for (const label of ['Asset URL', 'Name', 'File']) {
+    expect(screen.getByLabelText(label)).toBeDisabled()
+  }
+  for (const name of ['Choose another file', 'Remove file', 'Cancel']) {
+    expect(screen.getByRole('button', { name })).toBeDisabled()
+  }
+  fireEvent.drop(input.closest('[data-slot="file-picker"]') as HTMLElement, {
+    dataTransfer: {
+      files: [new File(['audio'], 'another.wav', { type: 'audio/wav' })],
+    },
+  })
+  await user.keyboard('{Escape}')
+  expect(close).not.toHaveBeenCalled()
+  await act(async () => rejectUpload(new Error('Upload interrupted')))
+  expect(screen.getByText('product.png')).toBeVisible()
+  expect(screen.getByLabelText('Name')).toHaveValue('Handwritten')
+  expect(screen.getByLabelText('Asset URL')).toHaveValue(
+    'https://example.com/original'
+  )
+  await user.click(await screen.findByRole('button', { name: 'Add asset' }))
+  await waitFor(() => expect(close).toHaveBeenCalledOnce())
+  expect((post.mock.calls[1][1] as FormData).get('file')).toBe(file)
+  expect((post.mock.calls[1][1] as FormData).get('Name')).toBe('Handwritten')
+})
+
+test('incomplete size configuration blocks URL submissions', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: { enabled: true, size_limits_mb: { image: 30, video: 200 } },
+    },
+  })
+  const post = vi.spyOn(api, 'post')
+  render(
+    <QueryClientProvider client={client}>
+      <AssetCreateDialog group={group} scope={{}} onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await user.type(
+    screen.getByLabelText('Asset URL'),
+    'https://example.com/download'
+  )
+  expect(screen.getByRole('button', { name: 'Add asset' })).toBeDisabled()
   expect(post).not.toHaveBeenCalled()
 })
 
@@ -578,13 +904,15 @@ test('failed limit loading blocks submission and retry preserves the asset draft
     </QueryClientProvider>
   )
   await user.type(screen.getByLabelText('Name'), 'Media')
+  await user.type(
+    screen.getByLabelText('Asset URL'),
+    'https://example.com/media'
+  )
   expect(await screen.findByText('Limits unavailable')).toBeVisible()
   expect(screen.getByRole('button', { name: 'Add asset' })).toBeDisabled()
   await user.click(screen.getByRole('button', { name: 'Retry' }))
   expect(
-    await screen.findByText('File size must be less than 30 MB.', {
-      exact: false,
-    })
+    await screen.findByText('Images < 30 MB · Video ≤ 200 MB · Audio ≤ 15 MB')
   ).toBeVisible()
   expect(screen.getByLabelText('Name')).toHaveValue('Media')
   expect(screen.getByRole('button', { name: 'Add asset' })).toBeEnabled()

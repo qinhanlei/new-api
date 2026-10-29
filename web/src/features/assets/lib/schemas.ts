@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import type { TFunction } from 'i18next'
 import { z } from 'zod'
 
+import { trimAssetName } from './asset-source'
 import {
   assetStorageProviders,
   normalizeAssetStorageEndpoint,
@@ -39,10 +40,11 @@ export function assetCreateSchema(t: TFunction) {
     .object({
       name: z
         .string()
-        .trim()
-        .min(1, t('Required'))
-        .max(64, t('Name must not exceed 64 characters')),
-      type: z.enum(['Image', 'Video', 'Audio']),
+        .transform(trimAssetName)
+        .refine(
+          (name) => [...name].length <= 64,
+          t('Name must not exceed 64 characters')
+        ),
       source: z.enum(['url', 'file']),
       url: z.string().trim(),
     })

@@ -242,6 +242,7 @@ func ClaimAssetWork(ctx context.Context, now int64, limit int) ([]Asset, error) 
 func FinishAssetSource(ctx context.Context, asset *Asset, code, message string, retryAt int64) error {
 	values := map[string]any{"lease_token": "", "lease_expires_at": 0, "updated_at": time.Now().Unix(), "error_code": code, "error_message": message, "next_attempt_at": retryAt, "attempts": asset.Attempts + 1}
 	if code == "" {
+		values["asset_type"] = asset.AssetType
 		values["object_state"] = asset.ObjectState
 		values["content_type"] = asset.ContentType
 		values["size"] = asset.Size

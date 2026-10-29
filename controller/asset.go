@@ -301,7 +301,7 @@ func UploadAsset(c *gin.Context) {
 	defer file.Close()
 	input := dto.AssetUpload{
 		GroupID: c.PostForm("GroupId"), ProjectName: c.PostForm("ProjectName"), Name: c.PostForm("Name"),
-		AssetType: c.PostForm("AssetType"), Size: header.Size, ContentType: header.Header.Get("Content-Type"),
+		AssetType: c.PostForm("AssetType"), FileName: header.Filename, Size: header.Size, ContentType: header.Header.Get("Content-Type"),
 	}
 	result, err := service.CreateUploadedAsset(c.Request.Context(), actor, input, file)
 	if err != nil {

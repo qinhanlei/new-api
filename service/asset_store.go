@@ -208,55 +208,49 @@ func storeAssetContent(ctx context.Context, asset *model.Asset, reader io.Reader
 		body = file
 		destination = io.MultiWriter(file, sum)
 	}
-	limited := io.LimitReader(reader, limits.ByteLimit(asset.AssetType)+1)
+	// Probe a small prefix before choosing the byte limit. Container signatures
+	// alone cannot distinguish audio from video, so those are bounded by both
+	// limits until their track metadata has been inspected.
 	data := make([]byte, 512)
-	n, err := io.ReadFull(limited, data)
+	n, err := io.ReadFull(reader, data)
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return assetError(http.StatusBadGateway, "DownloadFailed", "Unable to read the material source")
 	}
 	data = data[:n]
+	if n == 0 {
+		return assetError(http.StatusBadRequest, "FileSizeTooLarge", "Material is empty or exceeds the size limit")
+	}
+	detected, container := sniffAssetMedia(data)
+	assetType := assetMediaType(detected)
+	limit := limits.ByteLimit(assetType)
+	if container != "" {
+		limit = max(limits.ByteLimit("Audio"), limits.ByteLimit("Video"))
+	} else if assetType == "" {
+		return assetError(http.StatusBadRequest, "UnsupportedMediaType", "Material format is not supported or its type cannot be determined")
+	}
+	if asset.AssetType != "" {
+		limit = min(limit, limits.ByteLimit(asset.AssetType))
+	}
+	limited := io.LimitReader(reader, max(0, limit+1-int64(n)))
 	size, err := io.Copy(destination, io.MultiReader(bytes.NewReader(data), limited))
 	if err != nil {
 		return assetError(http.StatusBadGateway, "DownloadFailed", "Unable to read the material source")
 	}
-	if size == 0 {
+	if size > limit {
 		return assetError(http.StatusBadRequest, "FileSizeTooLarge", "Material is empty or exceeds the size limit")
 	}
-	if err = validateAssetSize(size, asset.AssetType, limits); err != nil {
-		return err
-	}
-	detected := http.DetectContentType(data)
-	// net/http recognizes only a subset of common media signatures. Inspect
-	// container/frame markers for the remaining formats; never trust a caller's
-	// filename or Content-Type to turn arbitrary bytes into renderable media.
-	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
-		switch string(data[8:12]) {
-		case "M4A ", "M4B ":
-			detected = "audio/mp4"
-		case "qt  ":
-			detected = "video/quicktime"
-		case "heic", "heix", "hevc", "hevx", "mif1", "msf1":
-			detected = "image/heif"
-		case "avif", "avis":
-			detected = "image/avif"
+	if container != "" {
+		detected, err = detectAssetContainer(body, start, size, container)
+		if err != nil {
+			return assetError(http.StatusBadRequest, "UnsupportedMediaType", "Material format is not supported or its type cannot be determined")
 		}
+		assetType = assetMediaType(detected)
 	}
-	if len(data) >= 7 && data[0] == 0xff {
-		if data[1]&0xf6 == 0xf0 {
-			detected = "audio/aac"
-		} else if data[1]&0xe0 == 0xe0 && data[1]&0x06 != 0 && data[1]&0x18 != 8 {
-			detected = "audio/mpeg"
-		}
-	}
-	if bytes.HasPrefix(data, []byte("fLaC")) {
-		detected = "audio/flac"
-	}
-	if detected == "application/ogg" && asset.AssetType == "Audio" {
-		detected = "audio/ogg"
-	}
-	expected := strings.ToLower(asset.AssetType) + "/"
-	if !strings.HasPrefix(detected, expected) {
+	if asset.AssetType != "" && asset.AssetType != assetType {
 		return assetError(http.StatusBadRequest, "TypeMismatch", "Material content does not match AssetType")
+	}
+	if err = validateAssetSize(size, assetType, limits); err != nil {
+		return err
 	}
 	config, err := model.LoadAssetStorageConfig(ctx)
 	if err != nil {
@@ -270,6 +264,7 @@ func storeAssetContent(ctx context.Context, asset *model.Asset, reader io.Reader
 		return assetError(http.StatusBadGateway, "StorageWriteFailed", "Unable to save the original material")
 	}
 	asset.Size = size
+	asset.AssetType = assetType
 	asset.ContentType = detected
 	asset.SHA256 = hex.EncodeToString(sum.Sum(nil))
 	asset.ObjectState = model.AssetReady
