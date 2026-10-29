@@ -198,6 +198,50 @@ func ManageAssetAction(c *gin.Context) {
 	c.JSON(assetActionStatus(action, result), gin.H{"success": true, "message": "", "data": result})
 }
 
+func BatchDeleteAssets(c *gin.Context) {
+	actor, ok := assetManagementActor(c, "DeleteAsset")
+	if !ok {
+		return
+	}
+	var request dto.AssetBatchDeleteRequest
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10))
+	if err != nil || common.Unmarshal(body, &request) != nil {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+		return
+	}
+	results, err := service.BatchDeleteAssets(c.Request.Context(), actor, request)
+	if err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
+	items := make([]dto.AssetBatchDeleteItem, 0, len(results))
+	ids := make([]string, 0, len(results))
+	counts := map[string]int{"deleted": 0, "not_found": 0, "failed": 0}
+	for _, result := range results {
+		item := dto.AssetBatchDeleteItem{ID: result.ID, Status: "deleted"}
+		if result.Error != nil {
+			failure := assetHTTPError(result.Error)
+			item.Status = "failed"
+			if failure.HTTPStatus == http.StatusNotFound {
+				item.Status = "not_found"
+			}
+			item.Error = &dto.AssetFailure{Code: failure.Code, Message: failure.Message}
+		}
+		counts[item.Status]++
+		ids = append(ids, item.ID)
+		items = append(items, item)
+	}
+	project := request.ProjectName
+	if project == "" {
+		project = "default"
+	}
+	recordManageAuditFor(c, actor.UserID, "asset.manage", map[string]any{
+		"action": "BatchDeleteAssets", "project_name": project, "ids": ids,
+		"deleted_count": counts["deleted"], "not_found_count": counts["not_found"], "failed_count": counts["failed"],
+	})
+	common.ApiSuccess(c, gin.H{"Items": items})
+}
+
 func ListAssetValidationSessions(c *gin.Context) {
 	actor, ok := assetManagementActor(c, "ListVisualValidateSessions")
 	if !ok {

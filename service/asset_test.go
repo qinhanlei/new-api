@@ -197,6 +197,93 @@ func TestAssetActionsPaginationAndOwnership(t *testing.T) {
 	assert.Equal(t, "AIGC", defaultGroup.GroupType)
 }
 
+func TestAssetBatchDeletePreservesPartialResultsAndCleanup(t *testing.T) {
+	assetTestDatabase(t)
+	actor := dto.AssetActor{UserID: 1}
+	group := assetTestGroup(t, 1, "batch")
+	first, last := assetTestAsset(t, group), assetTestAsset(t, group)
+	otherOwner := assetTestAsset(t, assetTestGroup(t, 2, "private"))
+	otherProjectGroup := assetTestGroup(t, 1, "another project")
+	otherProjectGroup.ProjectName = "other"
+	require.NoError(t, model.DB.Model(&otherProjectGroup).Update("project_name", "other").Error)
+	otherProject := assetTestAsset(t, otherProjectGroup)
+	frozenGroup := assetTestGroup(t, 1, "portrait")
+	frozen := assetTestAsset(t, frozenGroup)
+	require.NoError(t, model.DB.Model(&frozenGroup).Updates(map[string]any{
+		"group_type": model.AssetGroupLivenessFace, "lifecycle": model.AssetGroupDeletePending,
+	}).Error)
+	hold := model.AssetUse{AssetID: first.ID, TaskID: "batch-in-flight", ChannelID: 1, CreatedAt: time.Now().Unix()}
+	require.NoError(t, model.DB.Create(&hold).Error)
+	missing := model.NewAssetID()
+	ids := []string{first.PublicID, missing, otherOwner.PublicID, otherProject.PublicID, frozen.PublicID, last.PublicID, first.PublicID}
+	results, err := BatchDeleteAssets(t.Context(), actor, dto.AssetBatchDeleteRequest{IDs: ids})
+	require.NoError(t, err)
+	require.Len(t, results, 6)
+	for i, result := range results {
+		assert.Equal(t, ids[i], result.ID)
+		switch i {
+		case 0, 5:
+			assert.NoError(t, result.Error)
+		case 4:
+			assert.ErrorIs(t, result.Error, model.ErrAssetGroupUnavailable)
+		default:
+			assert.ErrorIs(t, result.Error, gorm.ErrRecordNotFound)
+		}
+	}
+	for _, asset := range []model.Asset{first, last, otherOwner, otherProject, frozen} {
+		stored, err := model.GetAssetByID(t.Context(), asset.ID)
+		require.NoError(t, err)
+		assert.Equal(t, asset.ObjectState, stored.ObjectState)
+		assert.Equal(t, asset.ObjectKey, stored.ObjectKey)
+		if asset.ID == first.ID || asset.ID == last.ID {
+			assert.Positive(t, stored.DeletedAt)
+			_, err = model.GetAsset(t.Context(), 1, asset.PublicID, "default")
+			assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+		} else {
+			assert.Zero(t, stored.DeletedAt)
+		}
+	}
+	require.NoError(t, model.DB.Where("asset_id = ? AND task_id = ?", first.ID, "batch-in-flight").First(&hold).Error)
+	results, err = BatchDeleteAssets(t.Context(), actor, dto.AssetBatchDeleteRequest{IDs: []string{first.PublicID}})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.ErrorIs(t, results[0].Error, gorm.ErrRecordNotFound)
+}
+
+func TestAssetBatchDeleteValidatesBeforeChangingAssets(t *testing.T) {
+	assetTestDatabase(t)
+	asset := assetTestAsset(t, assetTestGroup(t, 1, "validation"))
+	tooMany := make([]string, 101)
+	for i := range tooMany {
+		tooMany[i] = asset.PublicID
+	}
+	for _, tc := range []struct {
+		name    string
+		actor   dto.AssetActor
+		request dto.AssetBatchDeleteRequest
+		status  int
+	}{
+		{name: "empty", actor: dto.AssetActor{UserID: 1}, status: http.StatusBadRequest},
+		{name: "limit before deduplication", actor: dto.AssetActor{UserID: 1}, request: dto.AssetBatchDeleteRequest{IDs: tooMany}, status: http.StatusBadRequest},
+		{name: "empty ID after valid asset", actor: dto.AssetActor{UserID: 1}, request: dto.AssetBatchDeleteRequest{IDs: []string{asset.PublicID, ""}}, status: http.StatusBadRequest},
+		{name: "URI instead of ID", actor: dto.AssetActor{UserID: 1}, request: dto.AssetBatchDeleteRequest{IDs: []string{asset.PublicID, "asset://" + asset.PublicID}}, status: http.StatusBadRequest},
+		{name: "invalid project", actor: dto.AssetActor{UserID: 1}, request: dto.AssetBatchDeleteRequest{ProjectName: "bad\nproject", IDs: []string{asset.PublicID}}, status: http.StatusBadRequest},
+		{name: "unauthenticated", request: dto.AssetBatchDeleteRequest{IDs: []string{asset.PublicID}}, status: http.StatusUnauthorized},
+		{name: "all owners", actor: dto.AssetActor{UserID: 1, AllUsers: true}, request: dto.AssetBatchDeleteRequest{IDs: []string{asset.PublicID}}, status: http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			results, err := BatchDeleteAssets(t.Context(), tc.actor, tc.request)
+			var failure *AssetError
+			require.ErrorAs(t, err, &failure)
+			assert.Equal(t, tc.status, failure.HTTPStatus)
+			assert.Nil(t, results)
+			stored, err := model.GetAssetByID(t.Context(), asset.ID)
+			require.NoError(t, err)
+			assert.Zero(t, stored.DeletedAt)
+		})
+	}
+}
+
 func TestAssetReadinessLeasesAndDeletionHolds(t *testing.T) {
 	assetTestDatabase(t)
 	ctx := t.Context()

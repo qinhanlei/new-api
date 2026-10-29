@@ -571,26 +571,97 @@ func TestAssetManagementRejectsCrossUserAndReadOnlyTokens(t *testing.T) {
 		query  string
 		role   int
 		scopes []string
+		status int
 	}{
-		{name: "other owner", query: "&user_id=2", role: common.RoleCommonUser, scopes: []string{"asset:write"}},
-		{name: "read only token", role: common.RoleCommonUser, scopes: []string{"asset:read"}},
-		{name: "admin missing owner scope", query: "&user_id=2", role: common.RoleAdminUser, scopes: []string{"asset:write"}},
-		{name: "all owners cannot write", query: "&all_users=true", role: common.RoleRootUser, scopes: []string{"asset:write", "user:write"}},
+		{name: "other owner", query: "&user_id=2", role: common.RoleCommonUser, scopes: []string{"asset:write"}, status: http.StatusForbidden},
+		{name: "read only token", role: common.RoleCommonUser, scopes: []string{"asset:read"}, status: http.StatusForbidden},
+		{name: "admin missing owner scope", query: "&user_id=2", role: common.RoleAdminUser, scopes: []string{"asset:write"}, status: http.StatusForbidden},
+		{name: "all owners cannot write", query: "&all_users=true", role: common.RoleRootUser, scopes: []string{"asset:write", "user:write"}, status: http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			for _, endpoint := range []struct {
+				path, body string
+				handler    gin.HandlerFunc
+			}{
+				{"/api/assets/actions?Action=DeleteAsset&Version=2024-01-01", `{"Id":"asset-na-other"}`, ManageAssetAction},
+				{"/api/assets/batch-delete?", `{"Ids":["asset-na-other"]}`, BatchDeleteAssets},
+			} {
+				response := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(response)
+				c.Request = httptest.NewRequest(http.MethodPost, endpoint.path+tc.query, strings.NewReader(endpoint.body))
+				c.Set("id", 1)
+				c.Set("role", tc.role)
+				c.Set("use_access_token", true)
+				c.Set("access_token_id", 1)
+				c.Set("access_token_scopes", tc.scopes)
+				endpoint.handler(c)
+				assert.Equal(t, tc.status, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), `"success":false`)
+			}
+		})
+	}
+}
+
+func TestAssetBatchDeleteRejectsMalformedRequests(t *testing.T) {
+	for _, body := range []string{`null`, `[]`, `{"Ids":"asset-na-one"}`, `{"Ids":[]}{}`, strings.Repeat(" ", 64<<10) + `{}`} {
+		t.Run(fmt.Sprintf("bytes-%d", len(body)), func(t *testing.T) {
 			response := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(response)
-			c.Request = httptest.NewRequest(http.MethodPost, "/api/assets/actions?Action=DeleteAsset&Version=2024-01-01"+tc.query, strings.NewReader(`{"Id":"asset-na-other"}`))
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/assets/batch-delete", strings.NewReader(body))
 			c.Set("id", 1)
-			c.Set("role", tc.role)
-			c.Set("use_access_token", true)
-			c.Set("access_token_id", 1)
-			c.Set("access_token_scopes", tc.scopes)
-			ManageAssetAction(c)
-			assert.True(t, response.Code == http.StatusForbidden || response.Code == http.StatusBadRequest, response.Body.String())
+			c.Set("role", common.RoleCommonUser)
+			BatchDeleteAssets(c)
+			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 			assert.Contains(t, response.Body.String(), `"success":false`)
 		})
 	}
+}
+
+func TestAssetBatchDeleteReturnsSafeResultsAndAuditCounts(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	group := model.AssetGroup{PublicID: model.NewAssetGroupID(), UserID: user.Id, ProjectName: "default", Name: "batch", GroupType: model.AssetGroupAIGC}
+	frozenGroup := model.AssetGroup{PublicID: model.NewAssetGroupID(), UserID: user.Id, ProjectName: "default", Name: "frozen", GroupType: model.AssetGroupLivenessFace, InitialChannelID: 1, Lifecycle: model.AssetGroupDeletePending}
+	require.NoError(t, model.DB.Create(&group).Error)
+	require.NoError(t, model.DB.Create(&frozenGroup).Error)
+	asset := model.Asset{PublicID: model.NewAssetID(), UserID: user.Id, ProjectName: "default", GroupID: group.ID}
+	frozen := model.Asset{PublicID: model.NewAssetID(), UserID: user.Id, ProjectName: "default", GroupID: frozenGroup.ID}
+	broken := model.Asset{PublicID: model.NewAssetID(), UserID: user.Id, ProjectName: "default", GroupID: group.ID}
+	require.NoError(t, model.DB.Create(&asset).Error)
+	require.NoError(t, model.DB.Create(&frozen).Error)
+	require.NoError(t, model.DB.Create(&broken).Error)
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("asset_batch_failure", func(tx *gorm.DB) {
+		if target, ok := tx.Statement.Model.(*model.Asset); ok && target.ID == broken.ID {
+			tx.AddError(errors.New("private database connection details"))
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove("asset_batch_failure")) })
+	missing := model.NewAssetID()
+	body, err := common.Marshal(dto.AssetBatchDeleteRequest{IDs: []string{asset.PublicID, missing, frozen.PublicID, broken.PublicID, asset.PublicID}})
+	require.NoError(t, err)
+	response := securityEnrollmentRequest(http.MethodPost, "/api/assets/batch-delete", string(body), "", identity, BatchDeleteAssets)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var result struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Items []dto.AssetBatchDeleteItem `json:"Items"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	assert.True(t, result.Success)
+	assert.Equal(t, []dto.AssetBatchDeleteItem{
+		{ID: asset.PublicID, Status: "deleted"},
+		{ID: missing, Status: "not_found", Error: &dto.AssetFailure{Code: "ResourceNotFound", Message: "The material resource was not found"}},
+		{ID: frozen.PublicID, Status: "failed", Error: &dto.AssetFailure{Code: "AssetGroupUnavailable", Message: "The material group is being deleted"}},
+		{ID: broken.PublicID, Status: "failed", Error: &dto.AssetFailure{Code: "InternalError", Message: "The asset operation could not be completed."}},
+	}, result.Data.Items)
+	var audit model.AuditLog
+	require.NoError(t, model.LOG_DB.Where("action = ?", "asset.manage").First(&audit).Error)
+	require.NotNil(t, audit.Other.Op)
+	params, err := common.Marshal(audit.Other.Op.Params)
+	require.NoError(t, err)
+	assert.JSONEq(t, fmt.Sprintf(`{"action":"BatchDeleteAssets","project_name":"default","ids":[%q,%q,%q,%q],"deleted_count":1,"not_found_count":1,"failed_count":2}`, asset.PublicID, missing, frozen.PublicID, broken.PublicID), string(params))
+	assert.NotContains(t, response.Body.String(), "private database")
 }
 
 func TestVisualValidationResultRequiresWritePermission(t *testing.T) {
@@ -811,7 +882,19 @@ func TestAssetAdministratorCanCleanUpUnavailableOwners(t *testing.T) {
 	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
 	group := model.AssetGroup{PublicID: "group-na-disabled", UserID: 99, ProjectName: "default", Name: "Former user", GroupType: "AIGC"}
 	require.NoError(t, model.DB.Create(&group).Error)
-	response := securityEnrollmentRequest(http.MethodPost, "/api/assets/actions?Action=DeleteAssetGroup&Version=2024-01-01&user_id=99", `{"Id":"group-na-disabled"}`, "", identity, func(c *gin.Context) {
+	asset := model.Asset{PublicID: model.NewAssetID(), UserID: 99, ProjectName: "default", GroupID: group.ID}
+	require.NoError(t, model.DB.Create(&asset).Error)
+	body, err := common.Marshal(dto.AssetBatchDeleteRequest{IDs: []string{asset.PublicID}})
+	require.NoError(t, err)
+	response := securityEnrollmentRequest(http.MethodPost, "/api/assets/batch-delete?user_id=99", string(body), "", identity, func(c *gin.Context) {
+		c.Set("role", common.RoleAdminUser)
+		BatchDeleteAssets(c)
+	})
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.JSONEq(t, fmt.Sprintf(`{"success":true,"message":"","data":{"Items":[{"Id":%q,"Status":"deleted"}]}}`, asset.PublicID), response.Body.String())
+	require.NoError(t, model.DB.First(&asset, asset.ID).Error)
+	assert.Positive(t, asset.DeletedAt)
+	response = securityEnrollmentRequest(http.MethodPost, "/api/assets/actions?Action=DeleteAssetGroup&Version=2024-01-01&user_id=99", `{"Id":"group-na-disabled"}`, "", identity, func(c *gin.Context) {
 		c.Set("role", common.RoleAdminUser)
 		ManageAssetAction(c)
 	})

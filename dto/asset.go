@@ -105,6 +105,17 @@ type AssetFailure struct {
 	Message string `json:"Message"`
 }
 
+type AssetBatchDeleteRequest struct {
+	ProjectName string   `json:"ProjectName"`
+	IDs         []string `json:"Ids"`
+}
+
+type AssetBatchDeleteItem struct {
+	ID     string        `json:"Id"`
+	Status string        `json:"Status"`
+	Error  *AssetFailure `json:"Error,omitempty"`
+}
+
 type AssetGroupView struct {
 	UserID      int           `json:"UserId,omitempty"`
 	ID          string        `json:"Id"`

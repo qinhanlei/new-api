@@ -202,6 +202,49 @@ func ExecuteAssetAction(ctx context.Context, actor dto.AssetActor, action string
 	return result, err
 }
 
+type AssetDeletion struct {
+	ID    string
+	Error error
+}
+
+// BatchDeleteAssets validates the entire batch before changing anything. Each
+// asset keeps the single-delete transaction and its ownership/lifecycle checks.
+func BatchDeleteAssets(ctx context.Context, actor dto.AssetActor, request dto.AssetBatchDeleteRequest) ([]AssetDeletion, error) {
+	if actor.UserID <= 0 {
+		return nil, assetError(http.StatusUnauthorized, "Unauthorized", "Authentication is required")
+	}
+	if actor.AllUsers {
+		return nil, assetError(http.StatusForbidden, "AccessDenied", "Cross-user access is only available for administrative lists")
+	}
+	project, err := normalizeAssetProject(request.ProjectName)
+	if err != nil {
+		return nil, err
+	}
+	if len(request.IDs) == 0 || len(request.IDs) > 100 {
+		return nil, assetError(http.StatusBadRequest, "InvalidParameter.Ids", "Select between 1 and 100 assets")
+	}
+	ids := make([]string, 0, len(request.IDs))
+	for _, id := range request.IDs {
+		suffix, ok := strings.CutPrefix(id, model.AssetIDPrefix)
+		if !ok || suffix == "" || len(id) > 64 || strings.ContainsFunc(suffix, func(r rune) bool {
+			return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_')
+		}) {
+			return nil, assetError(http.StatusBadRequest, "InvalidParameter.Ids", "Invalid asset ID")
+		}
+		if !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	results := make([]AssetDeletion, 0, len(ids))
+	for _, id := range ids {
+		// Deletes share the storage lock, so parallel execution adds contention
+		// without improving progress. Partial success must remain observable.
+		err := model.DeleteAsset(ctx, actor.UserID, id, project)
+		results = append(results, AssetDeletion{ID: id, Error: err})
+	}
+	return results, nil
+}
+
 func assetCreationChannel(ctx context.Context, actor dto.AssetActor, preferred int) (int, error) {
 	storage, err := model.LoadAssetStorageConfig(ctx)
 	if err != nil {

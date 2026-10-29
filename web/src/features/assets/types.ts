@@ -91,6 +91,12 @@ export interface AssetList<T> {
   TotalCount: number
 }
 
+export interface AssetBatchDeleteItem {
+  Id: string
+  Status: 'deleted' | 'not_found' | 'failed'
+  Error?: { Code: string; Message: string }
+}
+
 export interface AssetReplica {
   channel_id: number
   channel_name: string

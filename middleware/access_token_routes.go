@@ -44,6 +44,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/assets/config":                          accessTokenScopeRule("asset:read"),
 	"GET /api/assets/validation/sessions":             accessTokenScopeRule("asset:read"),
 	"POST /api/assets/actions":                        accessTokenAnyRule,
+	"POST /api/assets/batch-delete":                   accessTokenScopeRule("asset:write"),
 	"POST /api/assets/upload":                         accessTokenScopeRule("asset:write"),
 	"GET /api/assets/:id/replicas":                    accessTokenScopeRule("asset:read"),
 	"POST /api/assets/:id/replicas/:channel_id/retry": accessTokenScopeRule("asset:write"),

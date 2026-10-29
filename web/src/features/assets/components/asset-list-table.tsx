@@ -17,9 +17,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import type { CellContext, ColumnDef } from '@tanstack/react-table'
+import type {
+  CellContext,
+  ColumnDef,
+  HeaderContext,
+  RowSelectionState,
+} from '@tanstack/react-table'
 import { Trash2 } from 'lucide-react'
-import { useMemo, useState, type ReactNode } from 'react'
+import { useMemo, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -27,6 +32,7 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { CopyButton } from '@/components/copy-button'
 import {
   DataTablePage,
+  DataTableBulkActions,
   DataTableToolbar,
   TruncatedCell,
   useDataTable,
@@ -35,6 +41,7 @@ import {
 import { Dialog } from '@/components/dialog'
 import { ErrorState } from '@/components/error-state'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { toIntlLocale } from '@/i18n/languages'
 import {
   ADMIN_PERMISSION_ACTIONS,
@@ -48,6 +55,10 @@ import { useAuthStore } from '@/stores/auth-store'
 
 import { assetQueryKeys, executeAssetAction } from '../api'
 import type { Asset, AssetGroup, AssetList, AssetScope } from '../types'
+import {
+  AssetBatchDeleteDialog,
+  type AssetBatchDeleteTarget,
+} from './asset-batch-delete-dialog'
 import { AssetReplicasDialog } from './asset-replicas-dialog'
 import { AssetStatus } from './asset-status'
 import { AssetThumbnail } from './asset-thumbnail'
@@ -77,10 +88,20 @@ export function AssetListTable({
     )
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: 20 })
   const [name, setName] = useState('')
-  const [deleting, setDeleting] = useState<Asset | null>(null)
+  const [deleting, setDeleting] = useState<{
+    asset: Asset
+    scope: AssetScope
+  } | null>(null)
+  const [batchDeleting, setBatchDeleting] =
+    useState<AssetBatchDeleteTarget | null>(null)
+  const batchDeleteTrigger = useRef<HTMLButtonElement>(null)
+  const listRegion = useRef<HTMLDivElement>(null)
   const [replicas, setReplicas] = useState<Asset | null>(null)
   const [preview, setPreview] = useState<Asset | null>(null)
   const frozen = Boolean(group?.Status && group.Status !== 'active')
+  const canDelete = Boolean(group) && !scope.allUsers && !frozen
+  const ownerId = scope.userId
+  const allUsers = scope.allUsers
   const query = useQuery({
     queryKey: [
       ...assetQueryKeys.all,
@@ -113,12 +134,38 @@ export function AssetListTable({
     refetchInterval: 10_000,
     meta: { errorToast: false },
   })
+  const selectionContext = JSON.stringify([
+    group?.Id,
+    group?.ProjectName,
+    ownerId,
+    allUsers,
+    name,
+    pagination,
+    canDelete,
+  ])
+  const [selection, setSelection] = useState<{
+    context: string
+    items: Asset[] | undefined
+    rows: RowSelectionState
+  }>({ context: selectionContext, items: query.data?.Items, rows: {} })
+  if (
+    selection.context !== selectionContext ||
+    selection.items !== query.data?.Items
+  ) {
+    const rows: RowSelectionState = {}
+    if (selection.context === selectionContext) {
+      for (const asset of query.data?.Items ?? []) {
+        if (selection.rows[asset.Id]) rows[asset.Id] = true
+      }
+    }
+    setSelection({ context: selectionContext, items: query.data?.Items, rows })
+  }
   const remove = useMutation({
-    mutationFn: (asset: Asset) =>
+    mutationFn: (target: { asset: Asset; scope: AssetScope }) =>
       executeAssetAction(
         'DeleteAsset',
-        { ProjectName: asset.ProjectName, Id: asset.Id },
-        scope
+        { ProjectName: target.asset.ProjectName, Id: target.asset.Id },
+        target.scope
       ),
     onSuccess: () => {
       setDeleting(null)
@@ -133,6 +180,38 @@ export function AssetListTable({
   const resetRemove = remove.reset
   const columns = useMemo<ColumnDef<Asset>[]>(
     () => [
+      ...(canDelete
+        ? [
+            {
+              id: 'select',
+              header: ({ table }: HeaderContext<Asset, unknown>) => (
+                <Checkbox
+                  checked={table.getIsAllPageRowsSelected()}
+                  indeterminate={table.getIsSomePageRowsSelected()}
+                  onCheckedChange={(checked) =>
+                    table.toggleAllPageRowsSelected(Boolean(checked))
+                  }
+                  aria-label={t('Select all')}
+                />
+              ),
+              cell: ({ row }: CellContext<Asset, unknown>) => (
+                <Checkbox
+                  checked={row.getIsSelected()}
+                  onCheckedChange={(checked) =>
+                    row.toggleSelected(Boolean(checked))
+                  }
+                  aria-label={t('Select row {{number}}', {
+                    number: row.index + 1,
+                  })}
+                />
+              ),
+              size: 40,
+              minSize: 40,
+              maxSize: 40,
+              enableHiding: false,
+            },
+          ]
+        : []),
       {
         id: 'preview',
         header: t('Preview'),
@@ -239,7 +318,7 @@ export function AssetListTable({
               disabled={scope.allUsers || frozen}
               onClick={() => {
                 resetRemove()
-                setDeleting(asset)
+                setDeleting({ asset, scope: { userId: ownerId, allUsers } })
               }}
             >
               <Trash2 className='size-4' />
@@ -248,7 +327,17 @@ export function AssetListTable({
         ),
       },
     ],
-    [t, frozen, scope.allUsers, group?.UserId, canReadChannel, resetRemove]
+    [
+      t,
+      frozen,
+      scope.allUsers,
+      group?.UserId,
+      canReadChannel,
+      resetRemove,
+      canDelete,
+      ownerId,
+      allUsers,
+    ]
   )
   const totalCount = query.data?.TotalCount ?? 0
   const maxPages = Math.floor(20_000 / pagination.pageSize)
@@ -294,7 +383,13 @@ export function AssetListTable({
     manualPagination: true,
     manualSorting: true,
     enableSorting: false,
-    enableRowSelection: false,
+    enableRowSelection: canDelete,
+    rowSelection: selection.rows,
+    onRowSelectionChange: (updater) =>
+      setSelection((previous) => ({
+        ...previous,
+        rows: typeof updater === 'function' ? updater(previous.rows) : updater,
+      })),
     getRowId: (asset) => asset.Id,
   })
   const searchToolbarProps = {
@@ -320,7 +415,13 @@ export function AssetListTable({
     )
   }
   return (
-    <>
+    <div
+      ref={listRegion}
+      role='region'
+      aria-label={t('Asset library')}
+      tabIndex={-1}
+      className='focus-visible:ring-ring h-full min-h-0 rounded-xl focus-visible:ring-2 focus-visible:outline-none'
+    >
       <DataTablePage
         table={table}
         columns={columns}
@@ -328,8 +429,35 @@ export function AssetListTable({
         isFetching={query.isFetching}
         toolbarProps={searchToolbarProps}
         emptyTitle={t('No assets')}
+        mobileProps={{ enableRowSelection: canDelete }}
         afterTable={
           <>
+            {canDelete && (
+              <DataTableBulkActions
+                table={table}
+                entityName={t('Asset')}
+                placement='inline'
+              >
+                <Button
+                  ref={batchDeleteTrigger}
+                  variant='destructive'
+                  disabled={remove.isPending || Boolean(batchDeleting)}
+                  onClick={() =>
+                    setBatchDeleting({
+                      assets: table.getSelectedRowModel().rows.map((row) => ({
+                        Id: row.original.Id,
+                        Name: row.original.Name,
+                      })),
+                      project: group.ProjectName,
+                      scope: { ...scope },
+                    })
+                  }
+                >
+                  <Trash2 className='size-4' />
+                  {t('Delete selected assets')}
+                </Button>
+              </DataTableBulkActions>
+            )}
             {totalCount > maxPages * pagination.pageSize && (
               <p className='text-muted-foreground text-sm'>
                 {t(
@@ -356,7 +484,7 @@ export function AssetListTable({
         onOpenChange={(open) => !open && !remove.isPending && setDeleting(null)}
         title={t('Delete asset')}
         desc={t('Delete {{name}}? This asset URI will no longer work.', {
-          name: deleting?.Name,
+          name: deleting?.asset.Name,
         })}
         confirmText={t('Delete')}
         destructive
@@ -370,6 +498,28 @@ export function AssetListTable({
           </p>
         )}
       </ConfirmDialog>
+      {batchDeleting && (
+        <AssetBatchDeleteDialog
+          target={batchDeleting}
+          disabled={!canDelete}
+          finalFocus={(completed) =>
+            completed
+              ? listRegion.current
+              : (batchDeleteTrigger.current ?? listRegion.current)
+          }
+          onClose={() => setBatchDeleting(null)}
+          onDeleted={(ids) =>
+            setSelection((previous) => ({
+              ...previous,
+              rows: Object.fromEntries(
+                Object.entries(previous.rows).filter(
+                  ([id]) => !ids.includes(id)
+                )
+              ),
+            }))
+          }
+        />
+      )}
       {replicas && canReadChannel && (
         <AssetReplicasDialog
           asset={replicas}
@@ -413,6 +563,6 @@ export function AssetListTable({
           )}
         </Dialog>
       )}
-    </>
+    </div>
   )
 }

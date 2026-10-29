@@ -16,11 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { t } from 'i18next'
+
 import { api } from '@/lib/api'
 import { authRequestOptions } from '@/lib/secure-verification'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
 import type {
+  AssetBatchDeleteItem,
   AssetChannelConfig,
   AssetChannelUpdate,
   AssetReplica,
@@ -35,6 +38,37 @@ interface AssetResponse<T> {
   success: boolean
   data: T
   message?: string
+}
+
+export async function deleteAssetsBatch(
+  project: string,
+  ids: string[],
+  scope: AssetScope
+) {
+  const { data } = await api.post<
+    AssetResponse<{ Items: AssetBatchDeleteItem[] }>
+  >(
+    '/api/assets/batch-delete',
+    { ProjectName: project, Ids: ids },
+    {
+      ...authRequestOptions,
+      params: { user_id: scope.userId, all_users: scope.allUsers || undefined },
+    }
+  )
+  const result = requireServerSuccess(data).data
+  if (
+    !Array.isArray(result?.Items) ||
+    result.Items.length !== ids.length ||
+    new Set(result.Items.map((item) => item.Id)).size !== ids.length ||
+    result.Items.some(
+      (item) =>
+        !ids.includes(item.Id) ||
+        !['deleted', 'not_found', 'failed'].includes(item.Status)
+    )
+  ) {
+    throw new Error(t('The batch deletion result could not be verified.'))
+  }
+  return result.Items
 }
 
 export const assetQueryKeys = {
