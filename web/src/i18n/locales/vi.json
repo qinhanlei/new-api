@@ -3217,7 +3217,7 @@
     "Human verification has not completed": "Xác minh người thật chưa hoàn tất",
     "Human verification is busy; retry shortly": "Dịch vụ xác minh đang bận; hãy thử lại sau",
     "Human verification requires a current session or scoped API credential": "Xác minh cần phiên đăng nhập hợp lệ hoặc thông tin API có phạm vi quyền",
-    "Human verification requires an HTTPS server address without a path or query": "Xác minh cần địa chỉ máy chủ HTTPS không có đường dẫn hay tham số truy vấn",
+    "Human verification requires an HTTP or HTTPS server address without a path or query": "Xác minh cần địa chỉ máy chủ HTTP hoặc HTTPS không có đường dẫn hay tham số truy vấn",
     "Human-readable name shown to users during Passkey prompts.": "Tên dễ đọc hiển thị cho người dùng trong quá trình nhắc nhở Passkey.",
     "I confirm enabling high-risk retry": "Tôi xác nhận bật thử lại rủi ro cao",
     "I have read and agree to the": "Tôi đã đọc và đồng ý với",

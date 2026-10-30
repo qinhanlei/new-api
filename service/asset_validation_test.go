@@ -335,13 +335,56 @@ func TestAssetValidationRateAndLeaseFences(t *testing.T) {
 	assert.ErrorIs(t, model.SaveAssetValidationAttempt(t.Context(), &stale), model.ErrAssetConflict)
 }
 
-func TestAssetValidationRequiresHTTPSAddress(t *testing.T) {
-	actor, input := assetValidationFixture(t)
-	calls := assetValidationUpstream(t, func(string, map[string]any) (int, any) { return 0, nil })
-	system_setting.ServerAddress = "http://gateway.example"
-	_, err := CreateAssetValidationSession(t.Context(), actor, input)
-	require.Error(t, err)
-	assert.Empty(t, *calls)
+func TestAssetValidationServerAddress(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		address string
+		origin  string
+	}{
+		{"HTTP IP and port", "http://192.0.2.10:13000", "http://192.0.2.10:13000"},
+		{"HTTP trailing slash", "http://gateway.example:13000/", "http://gateway.example:13000"},
+		{"HTTPS", "https://gateway.example", "https://gateway.example"},
+		{"HTTPS port", "https://gateway.example:8443/", "https://gateway.example:8443"},
+		{"empty", "", ""},
+		{"missing scheme", "192.0.2.10:13000", ""},
+		{"unsupported scheme", "ftp://gateway.example", ""},
+		{"missing host", "http:///callback", ""},
+		{"credentials", "http://user:password@gateway.example", ""},
+		{"path", "http://gateway.example/callback", ""},
+		{"query", "http://gateway.example?redirect=other", ""},
+		{"fragment", "http://gateway.example#callback", ""},
+		{"invalid URL", "http://gateway.example:invalid", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actor, input := assetValidationFixture(t)
+			callback := ""
+			calls := assetValidationUpstream(t, func(action string, payload map[string]any) (int, any) {
+				if action == "CreateVisualValidateSession" {
+					callback = payload["CallbackURL"].(string)
+				}
+				return 0, nil
+			})
+			system_setting.ServerAddress = tc.address
+			created, err := CreateAssetValidationSession(t.Context(), actor, input)
+			if tc.origin == "" {
+				var failure *AssetError
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, "ValidationConfigurationRequired", failure.Code)
+				assert.Empty(t, *calls)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "pending", created.Status)
+			assert.Equal(t, 1, (*calls)["CreateVisualValidateSession"])
+			assert.Equal(t, callback, created.CallbackURL)
+			assert.True(t, strings.HasPrefix(callback, tc.origin+"/api/assets/validation/callback/"))
+			callbackURL, err := url.Parse(callback)
+			require.NoError(t, err)
+			state := strings.TrimPrefix(callbackURL.Path, assetValidationCallbackPath)
+			assert.NoError(t, ValidateAssetValidationCallback(t.Context(), state, "upstream-portrait-token"))
+			assert.Error(t, ValidateAssetValidationCallback(t.Context(), state, "forged-token"))
+		})
+	}
 }
 
 func TestAssetValidationUsesApplicationSecret(t *testing.T) {

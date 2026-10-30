@@ -3217,7 +3217,7 @@
     "Human verification has not completed": "本人確認はまだ完了していません",
     "Human verification is busy; retry shortly": "本人確認が混み合っています。しばらくしてから再試行してください",
     "Human verification requires a current session or scoped API credential": "本人確認には有効なログインセッションまたはスコープ付き API 認証情報が必要です",
-    "Human verification requires an HTTPS server address without a path or query": "本人確認にはパスやクエリを含まない HTTPS サーバーアドレスが必要です",
+    "Human verification requires an HTTP or HTTPS server address without a path or query": "本人確認にはパスやクエリを含まない HTTP または HTTPS サーバーアドレスが必要です",
     "Human-readable name shown to users during Passkey prompts.": "パスキーのプロンプト中にユーザーに表示される、人間が読める名前。",
     "I confirm enabling high-risk retry": "高リスクリトライの有効化を確認します",
     "I have read and agree to the": "私は以下を読み、同意します",

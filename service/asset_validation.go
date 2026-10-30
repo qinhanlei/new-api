@@ -181,8 +181,8 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 		return empty, err
 	}
 	callbackBase, err := url.Parse(strings.TrimRight(system_setting.ServerAddress, "/"))
-	if err != nil || callbackBase.Scheme != "https" || callbackBase.Host == "" || callbackBase.User != nil || callbackBase.RawQuery != "" || callbackBase.Fragment != "" || (callbackBase.Path != "" && callbackBase.Path != "/") {
-		return empty, assetError(http.StatusServiceUnavailable, "ValidationConfigurationRequired", "Human verification requires an HTTPS server address without a path or query")
+	if err != nil || (callbackBase.Scheme != "http" && callbackBase.Scheme != "https") || callbackBase.Host == "" || callbackBase.User != nil || callbackBase.RawQuery != "" || callbackBase.Fragment != "" || (callbackBase.Path != "" && callbackBase.Path != "/") {
+		return empty, assetError(http.StatusServiceUnavailable, "ValidationConfigurationRequired", "Human verification requires an HTTP or HTTPS server address without a path or query")
 	}
 	currentActor, err := AssetActorForUser(ctx, actor.UserID, actor.TokenID)
 	if err != nil {

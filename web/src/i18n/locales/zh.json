@@ -3217,7 +3217,7 @@
     "Human verification has not completed": "真人认证尚未完成",
     "Human verification is busy; retry shortly": "真人认证繁忙，请稍后重试",
     "Human verification requires a current session or scoped API credential": "真人认证需要有效的登录会话或带权限范围的 API 凭证",
-    "Human verification requires an HTTPS server address without a path or query": "真人认证需要不含路径和查询参数的 HTTPS 服务器地址",
+    "Human verification requires an HTTP or HTTPS server address without a path or query": "真人认证需要不含路径和查询参数的 HTTP 或 HTTPS 服务器地址",
     "Human-readable name shown to users during Passkey prompts.": "在 Passkey 提示期间向用户显示的人类可读名称。",
     "I confirm enabling high-risk retry": "我确认开启高危重试",
     "I have read and agree to the": "我已阅读并同意",

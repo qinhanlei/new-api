@@ -3217,7 +3217,7 @@
     "Human verification has not completed": "Human verification has not completed",
     "Human verification is busy; retry shortly": "Human verification is busy; retry shortly",
     "Human verification requires a current session or scoped API credential": "Human verification requires a current session or scoped API credential",
-    "Human verification requires an HTTPS server address without a path or query": "Human verification requires an HTTPS server address without a path or query",
+    "Human verification requires an HTTP or HTTPS server address without a path or query": "Human verification requires an HTTP or HTTPS server address without a path or query",
     "Human-readable name shown to users during Passkey prompts.": "Human-readable name shown to users during Passkey prompts.",
     "I confirm enabling high-risk retry": "I Confirm Enabling High-risk Retry",
     "I have read and agree to the": "I have read and agree to the",

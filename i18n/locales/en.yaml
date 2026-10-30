@@ -203,7 +203,7 @@ asset.validation_channel_forbidden: "The verification channel is unavailable to 
 asset.validation_identity_required: "Human verification requires a current session or scoped API credential"
 asset.validation_name_invalid: "Enter a name of up to 64 characters and a description of up to 300 characters"
 asset.validation_idempotency_invalid: "IdempotencyKey must contain 8 to 128 characters without spaces"
-asset.validation_server_address: "Human verification requires an HTTPS server address without a path or query"
+asset.validation_server_address: "Human verification requires an HTTP or HTTPS server address without a path or query"
 asset.validation_aksk_required: "No AK/SK material channel is available for human verification"
 asset.validation_result_unknown: "The upstream verification response could not be confirmed"
 asset.validation_local_token_required: "Use the verification session returned by this gateway"

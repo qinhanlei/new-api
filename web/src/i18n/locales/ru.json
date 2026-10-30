@@ -3217,7 +3217,7 @@
     "Human verification has not completed": "Проверка личности ещё не завершена",
     "Human verification is busy; retry shortly": "Сервис проверки занят; повторите позже",
     "Human verification requires a current session or scoped API credential": "Для проверки нужен действующий сеанс или API-учётные данные с ограниченными правами",
-    "Human verification requires an HTTPS server address without a path or query": "Для проверки нужен HTTPS-адрес сервера без пути и параметров запроса",
+    "Human verification requires an HTTP or HTTPS server address without a path or query": "Для проверки нужен HTTP- или HTTPS-адрес сервера без пути и параметров запроса",
     "Human-readable name shown to users during Passkey prompts.": "Понятное для человека имя, отображаемое пользователям во время запросов Passkey.",
     "I confirm enabling high-risk retry": "Я подтверждаю включение высокорискового повтора",
     "I have read and agree to the": "Я прочитал и согласен с",
