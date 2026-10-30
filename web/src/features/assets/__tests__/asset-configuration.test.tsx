@@ -701,6 +701,13 @@ test('editing a listed channel loads only its settings and saving returns to the
   await user.click(
     await screen.findByRole('switch', { name: 'Enable asset library' })
   )
+  expect(
+    screen.getByRole('switch', { name: 'Use AK/SK authentication' })
+  ).not.toBeChecked()
+  expect(
+    screen.queryByRole('combobox', { name: 'Authentication' })
+  ).not.toBeInTheDocument()
+  expect(screen.queryByLabelText('Access key')).not.toBeInTheDocument()
   expect(screen.queryByLabelText('Secret key')).not.toBeInTheDocument()
   expect(api.get).not.toHaveBeenCalledWith(
     '/api/channel/8/assets',
@@ -731,6 +738,100 @@ test('editing a listed channel loads only its settings and saving returns to the
     await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
   ).toBeVisible()
   expect(screen.queryByLabelText('Asset API endpoint')).not.toBeInTheDocument()
+})
+
+test('enabling AK/SK requires credentials and preserves them across keyboard toggles before saving', async () => {
+  const user = userEvent.setup()
+  channelConfigs[7] = { ...channelConfigs[7], enabled: true }
+  const put = vi.spyOn(api, 'put').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        ...channelConfigs[7],
+        auth_type: 'aksk',
+        access_key: 'draft-access',
+        has_secret: true,
+        revision: 1,
+      },
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
+  )
+  const auth = await screen.findByRole('switch', {
+    name: 'Use AK/SK authentication',
+  })
+  expect(auth).toHaveAccessibleDescription(
+    'Enable when the upstream requires AK/SK for material management, including human verification.'
+  )
+  await user.click(auth)
+  expect(auth).toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  const access = screen.getByLabelText('Access key')
+  const secret = screen.getByLabelText('Secret key')
+  await waitFor(() => expect(access).toHaveAttribute('aria-invalid', 'true'))
+  expect(secret).toHaveAttribute('aria-invalid', 'true')
+  expect(put).not.toHaveBeenCalled()
+  await user.type(access, 'draft-access')
+  await user.type(secret, 'draft-secret')
+  act(() => auth.focus())
+  await user.keyboard(' ')
+  expect(auth).not.toBeChecked()
+  expect(screen.queryByLabelText('Access key')).not.toBeInTheDocument()
+  expect(screen.queryByLabelText('Secret key')).not.toBeInTheDocument()
+  await user.keyboard(' ')
+  expect(auth).toBeChecked()
+  expect(screen.getByLabelText('Access key')).toHaveValue('draft-access')
+  expect(screen.getByLabelText('Secret key')).toHaveValue('draft-secret')
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(put).toHaveBeenCalledOnce())
+  expect(put).toHaveBeenCalledWith(
+    '/api/channel/7/assets',
+    expect.objectContaining({
+      auth_type: 'aksk',
+      access_key: 'draft-access',
+      secret_key: 'draft-secret',
+    }),
+    { skipBusinessError: true, skipErrorHandler: true }
+  )
+})
+
+test('switching a saved AK/SK channel to Bearer omits the draft secret when saving', async () => {
+  const user = userEvent.setup()
+  const put = vi.spyOn(api, 'put').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...channelConfigs[8], auth_type: 'bearer', revision: 4 },
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await user.click(
+    await screen.findByRole('button', { name: 'Edit Second channel (#8)' })
+  )
+  const auth = await screen.findByRole('switch', {
+    name: 'Use AK/SK authentication',
+  })
+  expect(auth).toBeChecked()
+  expect(screen.getByLabelText('Access key')).toHaveValue('second-access')
+  expect(screen.getByLabelText('Secret key')).toHaveValue('')
+  await user.type(screen.getByLabelText('Secret key'), 'unused-draft-secret')
+  await user.click(auth)
+  expect(screen.queryByLabelText('Secret key')).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(put).toHaveBeenCalledOnce())
+  expect(put.mock.calls[0][1]).toEqual(
+    expect.objectContaining({ auth_type: 'bearer' })
+  )
+  expect(put.mock.calls[0][1]).not.toHaveProperty('secret_key')
 })
 
 test('returning from a dirty channel confirms discard and clears credentials before editing another', async () => {
@@ -1208,6 +1309,12 @@ test('saving prevents leaving the editor and returns to the list with credential
   expect(screen.getByRole('button', { name: 'Back to list' })).toBeDisabled()
   expect(screen.getByRole('button', { name: 'Saving...' })).toBeDisabled()
   expect(screen.getByLabelText('Upstream project name')).toBeDisabled()
+  const auth = screen.getByRole('switch', {
+    name: 'Use AK/SK authentication',
+  })
+  expect(auth).toHaveAttribute('aria-disabled', 'true')
+  await user.click(auth)
+  expect(auth).toBeChecked()
   await user.click(screen.getByRole('button', { name: 'Back to list' }))
   await user.keyboard('{Escape}')
   expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()

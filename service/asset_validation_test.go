@@ -50,7 +50,20 @@ func assetValidationFixture(t *testing.T) (dto.AssetActor, dto.AssetValidationCr
 		dto.AssetValidationCreate{Name: "Portrait owner", ProjectName: "default", ChannelID: 1, IdempotencyKey: "fixture-request-1"}
 }
 
-func assetValidationUpstream(t *testing.T, override func(string, map[string]any) (int, any)) *map[string]int {
+func assetValidationBearerChannel(t *testing.T, id int, endpoint, key string) {
+	t.Helper()
+	channel, err := model.GetChannelById(id, true)
+	require.NoError(t, err)
+	channel.Key = key
+	require.NoError(t, model.DB.Model(channel).Update("key", key).Error)
+	config, err := model.LoadAssetChannelConfig(t.Context(), id)
+	require.NoError(t, err)
+	config.AuthType, config.AccessKey, config.SecretKey = "bearer", "", ""
+	config.Endpoint, config.ChannelScope = endpoint, model.AssetChannelScope(channel)
+	require.NoError(t, model.SaveAssetChannelConfig(t.Context(), id, config))
+}
+
+func assetValidationUpstream(t *testing.T, bearerKey string, override func(string, map[string]any) (int, any)) *map[string]int {
 	t.Helper()
 	calls := map[string]int{}
 	httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
@@ -59,7 +72,11 @@ func assetValidationUpstream(t *testing.T, override func(string, map[string]any)
 		var payload map[string]any
 		require.NoError(t, common.DecodeJson(request.Body, &payload))
 		assert.Equal(t, "actual-project", payload["ProjectName"])
-		assert.Contains(t, request.Header.Get("Authorization"), "HMAC-SHA256")
+		if bearerKey == "" {
+			assert.Contains(t, request.Header.Get("Authorization"), "HMAC-SHA256")
+		} else {
+			assert.Equal(t, "Bearer "+bearerKey, request.Header.Get("Authorization"))
+		}
 		status, response := override(action, payload)
 		if response == nil {
 			status = http.StatusOK
@@ -91,73 +108,82 @@ func allowAssetValidationPoll(t *testing.T, id string) {
 }
 
 func TestAssetValidationLifecycle(t *testing.T) {
-	actor, input := assetValidationFixture(t)
-	callback := ""
-	calls := assetValidationUpstream(t, func(action string, payload map[string]any) (int, any) {
-		if action == "CreateVisualValidateSession" {
-			callback = payload["CallbackURL"].(string)
-		}
-		return 0, nil
-	})
-	created, err := CreateAssetValidationSession(t.Context(), actor, input)
-	require.NoError(t, err)
-	assert.Equal(t, "pending", created.Status)
-	assert.True(t, strings.HasPrefix(created.BytedToken, "validation-na-"))
-	assert.NotEqual(t, "upstream-portrait-token", created.BytedToken)
-	assert.Equal(t, callback, created.CallbackURL)
-	row, err := model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
-	require.NoError(t, err)
-	encoded, err := common.Marshal(row)
-	require.NoError(t, err)
-	assert.NotContains(t, string(encoded), "upstream-portrait-token")
-	assert.NotContains(t, string(encoded), callback)
-	duplicate, err := CreateAssetValidationSession(t.Context(), actor, input)
-	require.NoError(t, err)
-	assert.Equal(t, created, duplicate)
-	assert.Equal(t, 1, (*calls)["CreateVisualValidateSession"])
-	input.Name = "Different request"
-	_, err = CreateAssetValidationSession(t.Context(), actor, input)
-	assert.ErrorIs(t, err, model.ErrAssetConflict)
-	list, err := ListAssetValidationSessions(t.Context(), actor, "default")
-	require.NoError(t, err)
-	require.Len(t, list, 1)
-	encoded, err = common.Marshal(list)
-	require.NoError(t, err)
-	for _, sensitive := range []string{"H5Link", "BytedToken", "CallbackURL", "upstream-portrait-token", callback} {
-		assert.NotContains(t, string(encoded), sensitive)
+	for _, authType := range []string{"aksk", "bearer"} {
+		t.Run(authType, func(t *testing.T) {
+			actor, input := assetValidationFixture(t)
+			bearerKey := ""
+			if authType == "bearer" {
+				bearerKey = "channel-key"
+				assetValidationBearerChannel(t, 1, "https://upstream.example", bearerKey)
+			}
+			callback := ""
+			calls := assetValidationUpstream(t, bearerKey, func(action string, payload map[string]any) (int, any) {
+				if action == "CreateVisualValidateSession" {
+					callback = payload["CallbackURL"].(string)
+				}
+				return 0, nil
+			})
+			created, err := CreateAssetValidationSession(t.Context(), actor, input)
+			require.NoError(t, err)
+			assert.Equal(t, "pending", created.Status)
+			assert.True(t, strings.HasPrefix(created.BytedToken, "validation-na-"))
+			assert.NotEqual(t, "upstream-portrait-token", created.BytedToken)
+			assert.Equal(t, callback, created.CallbackURL)
+			row, err := model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
+			require.NoError(t, err)
+			encoded, err := common.Marshal(row)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), "upstream-portrait-token")
+			assert.NotContains(t, string(encoded), callback)
+			duplicate, err := CreateAssetValidationSession(t.Context(), actor, input)
+			require.NoError(t, err)
+			assert.Equal(t, created, duplicate)
+			assert.Equal(t, 1, (*calls)["CreateVisualValidateSession"])
+			input.Name = "Different request"
+			_, err = CreateAssetValidationSession(t.Context(), actor, input)
+			assert.ErrorIs(t, err, model.ErrAssetConflict)
+			list, err := ListAssetValidationSessions(t.Context(), actor, "default")
+			require.NoError(t, err)
+			require.Len(t, list, 1)
+			encoded, err = common.Marshal(list)
+			require.NoError(t, err)
+			for _, sensitive := range []string{"H5Link", "BytedToken", "CallbackURL", "upstream-portrait-token", callback} {
+				assert.NotContains(t, string(encoded), sensitive)
+			}
+			callbackURL, err := url.Parse(callback)
+			require.NoError(t, err)
+			state := strings.TrimPrefix(callbackURL.Path, assetValidationCallbackPath)
+			assert.NoError(t, ValidateAssetValidationCallback(t.Context(), state, "upstream-portrait-token"))
+			assert.Error(t, ValidateAssetValidationCallback(t.Context(), state, "forged-token"))
+			assert.Error(t, ValidateAssetValidationCallback(t.Context(), strings.Repeat("x", 43), "upstream-portrait-token"))
+			var count int64
+			require.NoError(t, model.DB.Model(&model.AssetGroup{}).Count(&count).Error)
+			assert.Zero(t, count, "callbacks cannot create a local group")
+			allowAssetValidationPoll(t, created.BytedToken)
+			ready, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+			require.NoError(t, err)
+			assert.Equal(t, "created", ready.Status)
+			assert.True(t, strings.HasPrefix(ready.GroupID, model.AssetGroupIDPrefix))
+			assert.Empty(t, ready.H5Link)
+			group, err := model.GetAssetGroup(t.Context(), 1, ready.GroupID, "default")
+			require.NoError(t, err)
+			assert.Equal(t, "LivenessFace", group.GroupType)
+			assert.Equal(t, 1, group.InitialChannelID)
+			replica, err := model.GetAssetGroupReplica(t.Context(), group.ID, 1)
+			require.NoError(t, err)
+			assert.Equal(t, "upstream-human-group", replica.UpstreamID)
+			assert.Equal(t, model.AssetReady, replica.State)
+			repeat, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+			require.NoError(t, err)
+			assert.Equal(t, ready, repeat)
+			assert.Equal(t, 1, (*calls)["GetVisualValidateResult"])
+			assert.Equal(t, 1, (*calls)["GetAssetGroup"])
+			row, err = model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
+			require.NoError(t, err)
+			assert.Empty(t, row.SecretCipher)
+			assert.NoError(t, ValidateAssetValidationCallback(t.Context(), state, "upstream-portrait-token"), "a phone callback remains a neutral return page after desktop polling completes")
+		})
 	}
-	callbackURL, err := url.Parse(callback)
-	require.NoError(t, err)
-	state := strings.TrimPrefix(callbackURL.Path, assetValidationCallbackPath)
-	assert.NoError(t, ValidateAssetValidationCallback(t.Context(), state, "upstream-portrait-token"))
-	assert.Error(t, ValidateAssetValidationCallback(t.Context(), state, "forged-token"))
-	assert.Error(t, ValidateAssetValidationCallback(t.Context(), strings.Repeat("x", 43), "upstream-portrait-token"))
-	var count int64
-	require.NoError(t, model.DB.Model(&model.AssetGroup{}).Count(&count).Error)
-	assert.Zero(t, count, "callbacks cannot create a local group")
-	allowAssetValidationPoll(t, created.BytedToken)
-	ready, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
-	require.NoError(t, err)
-	assert.Equal(t, "created", ready.Status)
-	assert.True(t, strings.HasPrefix(ready.GroupID, model.AssetGroupIDPrefix))
-	assert.Empty(t, ready.H5Link)
-	group, err := model.GetAssetGroup(t.Context(), 1, ready.GroupID, "default")
-	require.NoError(t, err)
-	assert.Equal(t, "LivenessFace", group.GroupType)
-	assert.Equal(t, 1, group.InitialChannelID)
-	replica, err := model.GetAssetGroupReplica(t.Context(), group.ID, 1)
-	require.NoError(t, err)
-	assert.Equal(t, "upstream-human-group", replica.UpstreamID)
-	assert.Equal(t, model.AssetReady, replica.State)
-	repeat, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
-	require.NoError(t, err)
-	assert.Equal(t, ready, repeat)
-	assert.Equal(t, 1, (*calls)["GetVisualValidateResult"])
-	assert.Equal(t, 1, (*calls)["GetAssetGroup"])
-	row, err = model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
-	require.NoError(t, err)
-	assert.Empty(t, row.SecretCipher)
-	assert.NoError(t, ValidateAssetValidationCallback(t.Context(), state, "upstream-portrait-token"), "a phone callback remains a neutral return page after desktop polling completes")
 }
 
 func TestAssetValidationRejectsUnauthorizedCompletion(t *testing.T) {
@@ -178,7 +204,7 @@ func TestAssetValidationRejectsUnauthorizedCompletion(t *testing.T) {
 				actor.TokenID, actor.AuthSessionID, actor.UserAuthVersion, actor.SessionVersion = 0, "validation-browser", 1, 1
 				require.NoError(t, model.DB.Create(&model.UserSession{SID: actor.AuthSessionID, UserID: 1, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, ExpiresAt: time.Now().Add(time.Hour).Unix()}).Error)
 			}
-			calls := assetValidationUpstream(t, func(action string, _ map[string]any) (int, any) {
+			calls := assetValidationUpstream(t, "", func(action string, _ map[string]any) (int, any) {
 				// Revoke while the final upstream request is in flight, not just before
 				// entering the service, to protect the final binding boundary.
 				if action == "GetAssetGroup" {
@@ -225,7 +251,7 @@ func TestAssetValidationRejectsUnauthorizedCompletion(t *testing.T) {
 func TestAssetValidationPersistsResultBeforeBinding(t *testing.T) {
 	actor, input := assetValidationFixture(t)
 	failGroup := true
-	calls := assetValidationUpstream(t, func(action string, _ map[string]any) (int, any) {
+	calls := assetValidationUpstream(t, "", func(action string, _ map[string]any) (int, any) {
 		if action == "GetAssetGroup" && failGroup {
 			return http.StatusServiceUnavailable, map[string]any{"error": "temporarily unavailable"}
 		}
@@ -280,7 +306,7 @@ func TestAssetValidationDoesNotReplayUncertainCreate(t *testing.T) {
 
 func TestAssetValidationExpiryAndIsolation(t *testing.T) {
 	actor, input := assetValidationFixture(t)
-	calls := assetValidationUpstream(t, func(string, map[string]any) (int, any) { return 0, nil })
+	calls := assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
 	created, err := CreateAssetValidationSession(t.Context(), actor, input)
 	require.NoError(t, err)
 	other := actor
@@ -306,13 +332,21 @@ func TestAssetValidationExpiryAndIsolation(t *testing.T) {
 
 func TestAssetValidationRateAndLeaseFences(t *testing.T) {
 	actor, input := assetValidationFixture(t)
-	calls := assetValidationUpstream(t, func(string, map[string]any) (int, any) { return 0, nil })
+	calls := assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
+	// A window persisted by the AK/SK-only release must still limit new requests.
+	legacyWindow := model.AssetValidationRateWindow{ScopeHash: "05f02e64ca5ead190c8f7ed676a136552fbd47d1766b339f9d298301a4efdbdd", NextCallAt: time.Now().Add(time.Minute).UnixMilli()}
+	require.NoError(t, model.DB.Create(&legacyWindow).Error)
+	_, err := CreateAssetValidationSession(t.Context(), actor, input)
+	var failure *AssetError
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, http.StatusTooManyRequests, failure.HTTPStatus)
+	assert.Empty(t, *calls)
+	require.NoError(t, model.DB.Model(&legacyWindow).Update("next_call_at", 0).Error)
 	created, err := CreateAssetValidationSession(t.Context(), actor, input)
 	require.NoError(t, err)
 	require.NoError(t, model.DB.Model(&model.AssetValidationRateWindow{}).Where("1 = 1").Update("next_call_at", time.Now().Add(time.Minute).UnixMilli()).Error)
 	input.IdempotencyKey, input.ChannelID = "fixture-request-2", 2
 	_, err = CreateAssetValidationSession(t.Context(), actor, input)
-	var failure *AssetError
 	require.ErrorAs(t, err, &failure)
 	assert.Equal(t, http.StatusTooManyRequests, failure.HTTPStatus, "channels sharing an AK share the throttle")
 	row, err := model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
@@ -333,6 +367,113 @@ func TestAssetValidationRateAndLeaseFences(t *testing.T) {
 	require.True(t, claimed)
 	assert.ErrorIs(t, model.SaveAssetValidationGroupID(t.Context(), &stale, "stale-group"), model.ErrAssetConflict)
 	assert.ErrorIs(t, model.SaveAssetValidationAttempt(t.Context(), &stale), model.ErrAssetConflict)
+}
+
+func TestAssetValidationBearerRateScope(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		endpoint  string
+		key       string
+		throttled bool
+	}{
+		{"same endpoint and key", "https://upstream.example/materials", "channel-key", true},
+		{"equivalent endpoint", "https://UPSTREAM.EXAMPLE:443/materials/", "channel-key", true},
+		{"different key", "https://upstream.example/materials", "other-channel-key", false},
+		{"different host", "https://other-upstream.example/materials", "channel-key", false},
+		{"different path", "https://upstream.example/other-materials", "channel-key", false},
+		{"different port", "https://upstream.example:8443/materials", "channel-key", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actor, input := assetValidationFixture(t)
+			assetValidationBearerChannel(t, 1, "https://upstream.example/materials", "channel-key")
+			assetValidationBearerChannel(t, 2, tc.endpoint, tc.key)
+			assetValidationUpstream(t, "channel-key", func(string, map[string]any) (int, any) { return 0, nil })
+			first, err := CreateAssetValidationSession(t.Context(), actor, input)
+			require.NoError(t, err)
+			require.Equal(t, "pending", first.Status)
+			require.NoError(t, model.DB.Model(&model.AssetValidationRateWindow{}).Where("1 = 1").Update("next_call_at", time.Now().Add(time.Minute).UnixMilli()).Error)
+			calls := assetValidationUpstream(t, tc.key, func(string, map[string]any) (int, any) { return 0, nil })
+			input.IdempotencyKey, input.ChannelID = "fixture-request-2", 2
+			second, err := CreateAssetValidationSession(t.Context(), actor, input)
+			if tc.throttled {
+				var failure *AssetError
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, http.StatusTooManyRequests, failure.HTTPStatus)
+				assert.Empty(t, *calls)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "pending", second.Status)
+			assert.Equal(t, 1, (*calls)["CreateVisualValidateSession"])
+		})
+	}
+}
+
+func TestAssetValidationRejectsInvalidChannelAuthentication(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		authType  string
+		accessKey string
+		secretKey string
+	}{
+		{"unsupported mode", "unsupported", "validation-ak", "validation-signing-secret"},
+		{"empty mode", "", "validation-ak", "validation-signing-secret"},
+		{"missing AK", "aksk", "", "validation-signing-secret"},
+		{"missing SK", "aksk", "validation-ak", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actor, input := assetValidationFixture(t)
+			config, err := model.LoadAssetChannelConfig(t.Context(), 1)
+			require.NoError(t, err)
+			config.AuthType, config.AccessKey, config.SecretKey = tc.authType, tc.accessKey, tc.secretKey
+			require.NoError(t, model.SaveAssetChannelConfig(t.Context(), 1, config))
+			calls := assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
+			_, err = CreateAssetValidationSession(t.Context(), actor, input)
+			var failure *AssetError
+			require.ErrorAs(t, err, &failure)
+			assert.Equal(t, "NoAvailableChannel", failure.Code)
+			assert.Equal(t, "No material channel is available for human verification", failure.Message)
+			assert.Empty(t, *calls)
+		})
+	}
+}
+
+func TestAssetValidationBearerRejectsCredentialChanges(t *testing.T) {
+	for _, change := range []string{"channel key", "authentication mode", "unsupported mode"} {
+		t.Run(change, func(t *testing.T) {
+			actor, input := assetValidationFixture(t)
+			assetValidationBearerChannel(t, 1, "https://upstream.example", "channel-key")
+			calls := assetValidationUpstream(t, "channel-key", func(string, map[string]any) (int, any) { return 0, nil })
+			created, err := CreateAssetValidationSession(t.Context(), actor, input)
+			require.NoError(t, err)
+			row, err := model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
+			require.NoError(t, err)
+			if change == "channel key" {
+				channel, err := model.GetChannelById(1, true)
+				require.NoError(t, err)
+				channel.Key = "rotated-channel-key"
+				assert.ErrorIs(t, channel.Update(), model.ErrAssetInUse)
+				// Simulate an out-of-band credential change to exercise revalidation.
+				require.NoError(t, model.DB.Model(channel).Update("key", channel.Key).Error)
+			} else {
+				config, err := model.LoadAssetChannelConfig(t.Context(), 1)
+				require.NoError(t, err)
+				config.AuthType, config.AccessKey, config.SecretKey = "aksk", "validation-ak", "validation-signing-secret"
+				if change == "unsupported mode" {
+					config.AuthType = "unsupported"
+				}
+				assert.ErrorIs(t, model.SaveAssetChannelConfig(t.Context(), 1, config), model.ErrAssetInUse)
+				encoded, err := common.Marshal(config)
+				require.NoError(t, err)
+				require.NoError(t, model.DB.Model(&model.Option{}).Where(&model.Option{Key: model.AssetChannelOptionKey(1)}).Update("value", string(encoded)).Error)
+			}
+			assert.ErrorIs(t, model.ValidateAssetValidationSession(t.Context(), row), model.ErrAssetConflict)
+			_, err = GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+			assert.Error(t, err)
+			assert.Zero(t, (*calls)["GetVisualValidateResult"])
+			assert.Zero(t, (*calls)["GetAssetGroup"])
+		})
+	}
 }
 
 func TestAssetValidationServerAddress(t *testing.T) {
@@ -358,7 +499,7 @@ func TestAssetValidationServerAddress(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			actor, input := assetValidationFixture(t)
 			callback := ""
-			calls := assetValidationUpstream(t, func(action string, payload map[string]any) (int, any) {
+			calls := assetValidationUpstream(t, "", func(action string, payload map[string]any) (int, any) {
 				if action == "CreateVisualValidateSession" {
 					callback = payload["CallbackURL"].(string)
 				}
@@ -404,7 +545,7 @@ func TestAssetValidationUsesApplicationSecret(t *testing.T) {
 			t.Setenv("SESSION_SECRET", tc.sessionEnv)
 			// Use the effective key supplied by the application's initialization.
 			common.CryptoSecret = tc.applicationKey
-			assetValidationUpstream(t, func(string, map[string]any) (int, any) { return 0, nil })
+			assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
 			created, err := CreateAssetValidationSession(t.Context(), actor, input)
 			require.NoError(t, err)
 			require.Equal(t, "pending", created.Status)
@@ -442,7 +583,7 @@ func TestAssetValidationRetainsCreateResultAfterClientDisconnect(t *testing.T) {
 	actor, input := assetValidationFixture(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	assetValidationUpstream(t, func(action string, _ map[string]any) (int, any) {
+	assetValidationUpstream(t, "", func(action string, _ map[string]any) (int, any) {
 		if action == "CreateVisualValidateSession" {
 			cancel()
 		}
@@ -461,7 +602,7 @@ func TestAssetValidationRejectsMismatchedUpstreamGroup(t *testing.T) {
 	for _, field := range []string{"Id", "GroupType", "ProjectName"} {
 		t.Run(field, func(t *testing.T) {
 			actor, input := assetValidationFixture(t)
-			assetValidationUpstream(t, func(action string, _ map[string]any) (int, any) {
+			assetValidationUpstream(t, "", func(action string, _ map[string]any) (int, any) {
 				if action != "GetAssetGroup" {
 					return 0, nil
 				}
@@ -487,7 +628,7 @@ func TestAssetValidationRejectsMismatchedUpstreamGroup(t *testing.T) {
 func TestAssetValidationRedactsPendingErrors(t *testing.T) {
 	actor, input := assetValidationFixture(t)
 	state := ""
-	assetValidationUpstream(t, func(action string, payload map[string]any) (int, any) {
+	assetValidationUpstream(t, "", func(action string, payload map[string]any) (int, any) {
 		if action == "CreateVisualValidateSession" {
 			callback, err := url.Parse(payload["CallbackURL"].(string))
 			require.NoError(t, err)

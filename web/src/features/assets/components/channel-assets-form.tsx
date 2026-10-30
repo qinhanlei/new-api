@@ -38,7 +38,6 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { NativeSelect } from '@/components/ui/native-select'
 import { Switch } from '@/components/ui/switch'
 import { assetQueryKeys, saveAssetChannel } from '@/features/assets/api'
 import { assetChannelSchema } from '@/features/assets/lib/schemas'
@@ -304,22 +303,26 @@ export function ChannelAssetsForm(props: {
                 control={form.control}
                 name='auth_type'
                 render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('Authentication')}</FormLabel>
+                  <SettingsSwitchItem>
+                    <SettingsSwitchContent>
+                      <FormLabel>{t('Use AK/SK authentication')}</FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Enable when the upstream requires AK/SK for material management, including human verification.'
+                        )}
+                      </FormDescription>
+                    </SettingsSwitchContent>
                     <FormControl>
-                      <NativeSelect
-                        {...field}
-                        className='w-full'
+                      <Switch
+                        checked={field.value === 'aksk'}
+                        onCheckedChange={(checked) =>
+                          field.onChange(checked ? 'aksk' : 'bearer')
+                        }
                         disabled={busy}
-                      >
-                        <option value='bearer'>
-                          {t('Channel key (Bearer)')}
-                        </option>
-                        <option value='aksk'>AK/SK</option>
-                      </NativeSelect>
+                      />
                     </FormControl>
                     <FormMessage />
-                  </FormItem>
+                  </SettingsSwitchItem>
                 )}
               />
               {authType === 'bearer' ? (

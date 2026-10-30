@@ -205,7 +205,7 @@ asset.validation_identity_required: "真人认证需要有效的登录会话或�
 asset.validation_name_invalid: "名称最多 64 个字符，描述最多 300 个字符"
 asset.validation_idempotency_invalid: "IdempotencyKey 必须为 8 至 128 个字符且不含空白"
 asset.validation_server_address: "真人认证需要不含路径或查询参数的 HTTP 或 HTTPS 站点地址"
-asset.validation_aksk_required: "没有可用于真人认证的 AK/SK 素材渠道"
+asset.validation_aksk_required: "没有可用于真人认证的素材渠道"
 asset.validation_result_unknown: "无法确认上游认证结果"
 asset.validation_local_token_required: "请使用本站返回的认证会话标识"
 asset.validation_pending: "真人认证尚未完成"

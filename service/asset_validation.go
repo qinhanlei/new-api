@@ -201,7 +201,8 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 		if err != nil {
 			return empty, err
 		}
-		if config.AuthType != "aksk" || config.AccessKey == "" || config.SecretKey == "" {
+		validAuth := config.AuthType == "bearer" || (config.AuthType == "aksk" && config.AccessKey != "" && config.SecretKey != "")
+		if !validAuth {
 			continue
 		}
 		channel, err = model.GetChannelById(id, true)
@@ -211,7 +212,19 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 		break
 	}
 	if channel == nil {
-		return empty, assetError(http.StatusForbidden, "NoAvailableChannel", "No AK/SK material channel is available for human verification")
+		return empty, assetError(http.StatusForbidden, "NoAvailableChannel", "No material channel is available for human verification")
+	}
+	// Keep the AK scope compatible with sessions and rate windows already stored.
+	rateIdentity := "ark-validation\x00" + config.AccessKey
+	if config.AuthType == "bearer" {
+		endpoint, parseErr := url.Parse(config.Endpoint)
+		if parseErr != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
+			return empty, assetError(http.StatusBadGateway, "UpstreamConfigurationInvalid", "The material endpoint is invalid")
+		}
+		endpoint.Host = strings.TrimSuffix(strings.ToLower(endpoint.Host), ":443")
+		// Equivalent endpoint spellings share a gate; different providers and
+		// paths may issue identical keys and must not block each other.
+		rateIdentity = "ark-validation-bearer\x00" + strings.TrimRight(endpoint.String(), "/") + "\x00" + channel.Key
 	}
 	stateBytes := make([]byte, 32)
 	if _, err = rand.Read(stateBytes); err != nil {
@@ -224,7 +237,7 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 		ProjectName: input.ProjectName, Name: input.Name, Description: input.Description, TokenID: actor.TokenID, AccessTokenID: actor.AccessTokenID,
 		AuthSessionID: actor.AuthSessionID, UserAuthVersion: actor.UserAuthVersion, SessionVersion: actor.SessionVersion,
 		ChannelID: channel.Id, ChannelScope: model.AssetChannelScope(channel), ChannelConfig: model.AssetValidationConfigHash(config), UpstreamProject: config.ProjectName,
-		RateScope: assetValidationHash("ark-validation\x00" + config.AccessKey), StateHash: assetValidationHash(state),
+		RateScope: assetValidationHash(rateIdentity), StateHash: assetValidationHash(state),
 		IdempotencyHash: idempotencyHash, RequestHash: requestHash, ExpiresAt: time.Now().Add(30 * time.Minute).Unix()}
 	created, err := model.ReserveAssetValidationSession(ctx, session, func(tx *gorm.DB) error {
 		return authorizeAssetValidationChannelWithDB(ctx, tx, session)

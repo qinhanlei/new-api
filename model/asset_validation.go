@@ -69,7 +69,8 @@ func (AssetValidationSession) TableName(namer schema.Namer) string {
 	return namer.TableName("ArkAssetValidationSession")
 }
 
-// Requests sharing an AK share this database gate across nodes and channels.
+// Requests sharing an AK or an endpoint and Bearer key share this database gate
+// across nodes and channels.
 // A conservative 400 ms interval also stays below the provider's 3 QPS limit.
 type AssetValidationRateWindow struct {
 	ScopeHash  string `gorm:"size:64;primaryKey"`
@@ -189,7 +190,8 @@ func validateAssetValidationChannel(tx *gorm.DB, session *AssetValidationSession
 	if err = lockForUpdate(tx).First(&channel, session.ChannelID).Error; err != nil {
 		return err
 	}
-	if !config.Enabled || config.AuthType != "aksk" || config.AccessKey == "" || config.SecretKey == "" || channel.Status != common.ChannelStatusEnabled ||
+	validAuth := config.AuthType == "bearer" || (config.AuthType == "aksk" && config.AccessKey != "" && config.SecretKey != "")
+	if !config.Enabled || !validAuth || channel.Status != common.ChannelStatusEnabled ||
 		channel.ChannelInfo.IsMultiKey || len(channel.GetKeys()) != 1 || AssetChannelScope(&channel) != session.ChannelScope ||
 		AssetValidationConfigHash(config) != session.ChannelConfig || config.ProjectName != session.UpstreamProject {
 		return ErrAssetConflict
