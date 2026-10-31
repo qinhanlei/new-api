@@ -29,6 +29,7 @@ var localeFS embed.FS
 var (
 	bundle     *i18n.Bundle
 	localizers = make(map[string]*i18n.Localizer)
+	sourceKeys = make(map[string]string)
 	mu         sync.RWMutex
 	initOnce   sync.Once
 )
@@ -43,10 +44,17 @@ func Init() error {
 		// Load embedded translation files
 		files := []string{"locales/zh-CN.yaml", "locales/zh-TW.yaml", "locales/en.yaml"}
 		for _, file := range files {
-			_, err := bundle.LoadMessageFileFS(localeFS, file)
+			messages, err := bundle.LoadMessageFileFS(localeFS, file)
 			if err != nil {
 				initErr = err
 				return
+			}
+			if file == "locales/en.yaml" {
+				for _, message := range messages.Messages {
+					if strings.HasPrefix(message.ID, "asset.") {
+						sourceKeys[message.Other] = message.ID
+					}
+				}
 			}
 		}
 
@@ -90,6 +98,15 @@ func GetLocalizer(lang string) *i18n.Localizer {
 // T translates a message key in the language the reader of the request stated
 func T(c *gin.Context, key string, args ...map[string]any) string {
 	return Translate(StatedLang(c), key, args...)
+}
+
+// TSource translates shared resource errors that the web console receives as
+// English source keys. Unknown upstream messages keep their original text.
+func TSource(c *gin.Context, source string) string {
+	if key, ok := sourceKeys[source]; ok {
+		return T(c, key)
+	}
+	return source
 }
 
 // Translate translates a message key for the specified language. An empty

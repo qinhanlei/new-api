@@ -113,6 +113,17 @@ func TestBackendMessageLanguage(t *testing.T) {
 	}
 }
 
+func TestAssetErrorsTranslateSharedEnglishSources(t *testing.T) {
+	require.NoError(t, Init())
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/doubao/", nil)
+	c.Request.Header.Set("Accept-Language", "zh-CN")
+	assert.Equal(t, Translate(LangZhCN, MsgAssetStorageDisabled), TSource(c, "Material storage is not enabled"))
+	assert.Equal(t, "upstream-specific message", TSource(c, "upstream-specific message"))
+	c.Request.Header.Set("Accept-Language", "en")
+	assert.Equal(t, "Material storage is not enabled", TSource(c, "Material storage is not enabled"))
+}
+
 // A key missing from a locale, or a template that does not parse, reaches
 // clients as the raw key.
 func TestLocalesRenderEveryKey(t *testing.T) {

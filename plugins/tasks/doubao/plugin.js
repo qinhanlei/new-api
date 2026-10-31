@@ -311,7 +311,7 @@ export const meta = {
   upstreams: ["vendor", "new_api"],
   // Seedream streams its images when asked to (stream: true).
   submitResponseTypes: ["json", "sse"],
-  requiredCapabilities: ["duration-auto@1"],
+  requiredCapabilities: ["duration-auto@1", "asset-references@1"],
   usageSchema: seedanceUsageSchema(DEFAULT_VIDEO_PROFILE),
   usageExamples: seedanceUsageExamples(DEFAULT_VIDEO_PROFILE),
   usageProfiles: capabilityUsageProfiles(VIDEO_MODELS, seedanceUsageSchema, seedanceUsageExamples).concat(
@@ -340,6 +340,77 @@ function trimmed(value) {
 // every gateway release serves; Ark itself serves the unprefixed paths.
 function apiRoot(ctx) {
   return ctx.baseUrl + (ctx.upstream && ctx.upstream.kind === "new_api" ? "/doubao" : "");
+}
+
+// Preparation has no channel and performs no I/O. Only media URL fields are
+// references; an asset URI mentioned in a prompt remains ordinary text.
+export function extractAssetReferences(ctx) {
+  const body = ctx.body || {};
+  let req = body.kind === "json" ? body.value : null;
+  if (body.kind === "multipart" || body.kind === "form") {
+    const fields = body.fields || {};
+    req = {};
+    if (fields.metadata && fields.metadata.length === 1) {
+      try {
+        req.metadata = JSON.parse(fields.metadata[0]);
+      } catch (e) {
+        return [];
+      }
+    }
+  }
+  if (!req || typeof req !== "object" || Array.isArray(req)) return [];
+  const urls = [];
+  const metadata = req.vendorBody || req.metadata || {};
+  const content = !ctx.normalized && ctx.protocol === "native" ? req.content : metadata.content;
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      if (!item || typeof item !== "object") continue;
+      for (const name of ["image_url", "video_url", "audio_url"]) {
+        if (item[name] && typeof item[name].url === "string") urls.push(item[name].url);
+      }
+    }
+  }
+  if (Array.isArray(req.images)) urls.push(...req.images);
+  if (!ctx.normalized && ctx.protocol === "openai_responses") {
+    urls.push(req.image, req.input_reference);
+    urls.push(...responsesInput(req).images);
+  }
+  if (Object.prototype.hasOwnProperty.call(IMAGE_MODELS, ctx.model) || ctx.protocol === "openai_image") {
+    urls.push(...(Array.isArray(req.image) ? req.image : [req.image]));
+  }
+  const references = [];
+  let upstreamReference = false;
+  for (const value of urls) {
+    if (typeof value !== "string") continue;
+    if (value.startsWith("asset://asset-na-")) references.push(value.slice("asset://".length));
+    else if (value.startsWith("asset://")) upstreamReference = true;
+  }
+  if (references.length && upstreamReference) throw new Error("Gateway assets cannot be mixed with upstream asset IDs");
+  if (references.length && (Object.prototype.hasOwnProperty.call(IMAGE_MODELS, ctx.model) || ctx.protocol === "openai_image"))
+    throw new Error("Gateway assets are only supported for video generation");
+  return Array.from(new Set(references));
+}
+
+function resolveAssetContent(content, assets) {
+  return content.map(function (item) {
+    if (!item || typeof item !== "object") return item;
+    let result = item;
+    for (const entry of [
+      ["image_url", "Image"],
+      ["video_url", "Video"],
+      ["audio_url", "Audio"],
+    ]) {
+      const value = item[entry[0]];
+      if (!value || typeof value.url !== "string" || !value.url.startsWith("asset://asset-na-")) continue;
+      const id = value.url.slice("asset://".length);
+      const resolved = (assets || []).find((asset) => asset.id === id);
+      if (!resolved || !resolved.upstreamId) throw new Error("Gateway asset was not resolved for this channel");
+      if (resolved.type !== entry[1]) throw new Error("Gateway asset type does not match its content field");
+      if (result === item) result = Object.assign({}, item);
+      result[entry[0]] = Object.assign({}, value, { url: "asset://" + resolved.upstreamId });
+    }
+    return result;
+  });
 }
 
 function objectValue(value, name) {
@@ -795,7 +866,10 @@ export const native = {
     return task.data && typeof task.data === "object" && !Array.isArray(task.data) ? task.data : {};
   },
   error: function (ctx, error) {
-    return { error: { code: ERROR_CODES[error.httpStatus] || "InternalServiceError", message: error.message } };
+    // Preserve the host's library error codes so callers can act on asset state.
+    const assetErrors = ["InvalidAssetReference", "AssetNotReady", "AssetFailed", "AssetStorageDisabled", "AssetUnavailable", "ResourceNotFound", "AccessDenied"];
+    const code = assetErrors.includes(error.code) ? error.code : ERROR_CODES[error.httpStatus] || "InternalServiceError";
+    return { error: { code: code, message: error.message } };
   },
 };
 
@@ -819,6 +893,7 @@ export function buildSubmitRequest(ctx) {
   if (req.vendorBody) {
     const sent = Object.assign({}, req.vendorBody, { model: ctx.upstreamModel || req.vendorBody.model });
     sent.content = rewriteDraftTaskContent(sent.content, ctx.originTasks);
+    sent.content = resolveAssetContent(sent.content, ctx.assets);
     return {
       url: apiRoot(ctx) + "/api/v3/contents/generations/tasks",
       method: "POST",
@@ -839,6 +914,7 @@ export function buildSubmitRequest(ctx) {
   const hasReference = body.content.length > 0;
   if (trimmed(req.prompt) || !hasReference) body.content.push({ type: "text", text: req.prompt || "" });
   if (Array.isArray(body.content)) body.content = rewriteDraftTaskContent(body.content, ctx.originTasks);
+  body.content = resolveAssetContent(body.content, ctx.assets);
   // -1 lets the model pick the length; extractUsage reserves the longest one.
   const seconds = Number.parseInt(req.seconds || "", 10);
   if (seconds > 0 || seconds === -1) body.duration = seconds;

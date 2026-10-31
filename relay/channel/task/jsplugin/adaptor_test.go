@@ -2831,21 +2831,28 @@ func TestTaskAdaptorChainsSunoBatchFetchThroughNewAPIUpstream(t *testing.T) {
 
 // When distribution binds another candidate of a shared native route, that
 // plugin decodes the request again, reading the parameters under its own
-// names, and must resolve the same model.
+// names, and must resolve the same model and asset references.
 func TestTaskAdaptorReDecodesReboundNativeRouteCandidate(t *testing.T) {
-	sourceFor := func(key, model, param string) string {
+	sourceFor := func(key, model, param, assetID string) string {
 		return fmt.Sprintf(`
 export const meta = {apiVersion:1,key:%q,name:%q,version:"1.0.0",author:{name:"Test"},models:["claimed-model","drifted-model"],fetchMode:"per_task",
+	requiredCapabilities:["asset-references@1"],
 	routes:[{method:"POST",path:"/probe/v1/jobs/:%s",type:"submit",action:"route-action",decode:"createJob",render:"jobCreated"}]};
 export const native = {
-	createJob(ctx){return {kind:"submit",model:%q,action:"by-"+%q,requestBody:{by:%q,param:ctx.params[%q]}};},
+	createJob(ctx){
+		const body = {by:%q,param:ctx.params[%q]};
+		const assetID = %q;
+		if(assetID) body.asset = "asset://" + assetID;
+		return {kind:"submit",model:%q,action:"by-"+%q,requestBody:body};
+	},
 	jobCreated(ctx,task){return task;},
 };
+export function extractAssetReferences(ctx){return ctx.body.value.asset ? [ctx.body.value.asset.slice("asset://".length)] : []}
 export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit",method:"POST",body:ctx.requestBody}}
 export function parseSubmitResponse(){return {taskId:"one"}}
 export function buildQueryRequest(){return {url:"https://provider.example"}}
 export function parseTaskResult(){return {status:"SUCCESS"}}
-`, key, key, param, model, key, key, param)
+`, key, key, param, key, param, assetID, model, key)
 	}
 	// The second decode matches its model as the first did: a channel alias
 	// or a case variant names the same task as the prepared name.
@@ -2862,20 +2869,24 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 		Models: "claimed-alias", ModelMapping: common.GetPointer(`{"claimed-alias":"claimed-model"}`)}).Error)
 	model.InitChannelCache()
 	for _, testCase := range []struct {
-		name, betaModel, prepared string
-		wantError                 bool
+		name, betaModel, prepared, assetID string
+		preparedAssets                     []string
+		wantError                          string
 	}{
 		{name: "same model", betaModel: "claimed-model", prepared: "claimed-model"},
-		{name: "model drift", betaModel: "drifted-model", prepared: "claimed-model", wantError: true},
+		{name: "model drift", betaModel: "drifted-model", prepared: "claimed-model", wantError: "plugin_request_invalid"},
 		{name: "same channel alias", betaModel: "claimed-alias", prepared: "claimed-alias"},
 		{name: "case variant", betaModel: "CLAIMED-MODEL", prepared: "claimed-model"},
-		{name: "declared name for a prepared alias", betaModel: "claimed-model", prepared: "claimed-alias", wantError: true},
+		{name: "declared name for a prepared alias", betaModel: "claimed-model", prepared: "claimed-alias", wantError: "plugin_request_invalid"},
+		{name: "added asset reference", betaModel: "claimed-model", prepared: "claimed-model", assetID: "asset-na-added", wantError: "InvalidAssetReference"},
+		{name: "removed asset reference", betaModel: "claimed-model", prepared: "claimed-model", preparedAssets: []string{"asset-na-original"}, wantError: "InvalidAssetReference"},
+		{name: "changed asset reference", betaModel: "claimed-model", prepared: "claimed-model", preparedAssets: []string{"asset-na-original"}, assetID: "asset-na-changed", wantError: "InvalidAssetReference"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			registry := pluginruntime.NewRegistry()
-			_, err := registry.Register(sourceFor("route-alpha", "claimed-model", "kind"), pluginruntime.Options{})
+			_, err := registry.Register(sourceFor("route-alpha", "claimed-model", "kind", ""), pluginruntime.Options{})
 			require.NoError(t, err)
-			beta, err := registry.Register(sourceFor("route-beta", testCase.betaModel, "variant"), pluginruntime.Options{})
+			beta, err := registry.Register(sourceFor("route-beta", testCase.betaModel, "variant", testCase.assetID), pluginruntime.Options{})
 			require.NoError(t, err)
 			generation := registry.Generation()
 			candidates := generation.LookupDeclaredRoutes("POST", "/probe/v1/jobs/:x")
@@ -2884,24 +2895,29 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = httptest.NewRequest(http.MethodPost, "/probe/v1/jobs/video", nil)
 			c.Params = gin.Params{{Key: "s3", Value: "video"}}
+			preparedBody := map[string]any{"by": "route-alpha", "param": "video"}
+			if len(testCase.preparedAssets) > 0 {
+				preparedBody["asset"] = "asset://" + testCase.preparedAssets[0]
+			}
 			c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Generation: generation, Plugin: beta, Route: candidates[1].Route, Candidates: candidates})
 			c.Set(pluginruntime.ContextKeyRouteRequest, pluginruntime.RouteRequestContext{
-				Params: map[string]string{"kind": "video"}, Body: map[string]any{"kind": "json", "value": map[string]any{}},
-				RequestBody: map[string]any{"by": "route-alpha", "param": "video"},
+				Params: map[string]string{"kind": "video"}, Body: map[string]any{"kind": "json", "value": preparedBody},
+				RequestBody: preparedBody,
 			})
-			c.Set("task_request", map[string]any{"by": "route-alpha", "param": "video"})
+			c.Set("task_request", preparedBody)
 			c.Set("task_action", "by-route-alpha")
 			c.Set("resolved_task_model", testCase.prepared)
+			c.Set(pluginruntime.ContextKeyAssetReferences, testCase.preparedAssets)
 			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}, OriginModelName: testCase.prepared}
 			adaptor := New(beta)
 			adaptor.Init(info)
 
 			taskErr := adaptor.ValidateRequestAndSetAction(c, info)
 
-			if testCase.wantError {
+			if testCase.wantError != "" {
 				require.NotNil(t, taskErr)
 				assert.Equal(t, http.StatusBadRequest, taskErr.StatusCode)
-				assert.Contains(t, taskErr.Message, "pinned model")
+				assert.Equal(t, testCase.wantError, taskErr.Code)
 				return
 			}
 			require.Nil(t, taskErr)

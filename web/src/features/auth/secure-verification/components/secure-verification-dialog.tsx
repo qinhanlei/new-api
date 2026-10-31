@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { KeyRound, Loader2, ShieldCheck } from 'lucide-react'
-import { useId } from 'react'
+import { useId, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Dialog } from '@/components/dialog'
@@ -95,6 +95,133 @@ export function SecureVerificationDialog(props: SecureVerificationDialogProps) {
     }
   }
 
+  let methodContent: ReactNode = null
+  switch (input?.method) {
+    case 'password':
+      methodContent = (
+        <div className='space-y-2'>
+          <Label htmlFor={inputId}>{t('Password')}</Label>
+          <Input
+            id={inputId}
+            type='password'
+            autoComplete='current-password'
+            autoFocus
+            disabled={verifying}
+            value={input.password}
+            onChange={(event) =>
+              props.onInputChange({
+                method: 'password',
+                password: event.target.value,
+              })
+            }
+          />
+        </div>
+      )
+      break
+    case '2fa':
+      methodContent = (
+        <div className='space-y-2'>
+          <Label htmlFor={inputId}>
+            {acceptsBackupCode
+              ? t('Authenticator code or backup code')
+              : t('Authenticator code')}
+          </Label>
+          <Input
+            id={inputId}
+            autoComplete='one-time-code'
+            maxLength={acceptsBackupCode ? 9 : 6}
+            autoFocus
+            disabled={verifying}
+            value={input.code}
+            onChange={(event) =>
+              props.onInputChange({
+                method: '2fa',
+                code: event.target.value,
+              })
+            }
+          />
+          <p className='text-muted-foreground text-sm'>
+            {acceptsBackupCode
+              ? t(
+                  'Enter the 6-digit authenticator code or an unused backup code.'
+                )
+              : t('Enter the 6-digit authenticator code.')}
+          </p>
+        </div>
+      )
+      break
+    case 'passkey':
+      methodContent = (
+        <div className='space-y-3'>
+          <PasskeyDomainSelector
+            domains={props.passkeyDomains}
+            value={input.rpID}
+            onChange={(rpID) =>
+              props.onInputChange({ method: 'passkey', rpID })
+            }
+            disabled={verifying}
+          />
+          <p className='text-muted-foreground flex items-center gap-2 text-sm'>
+            <KeyRound className='size-5' />
+            {t(
+              'We will prompt your device to confirm using biometrics or your hardware key.'
+            )}
+          </p>
+        </div>
+      )
+      break
+    case 'oauth':
+      methodContent = (
+        <div className='space-y-2'>
+          <p className='text-muted-foreground text-sm'>
+            {t('Continue with an account already linked to your profile.')}
+          </p>
+          <div className='flex flex-wrap gap-2'>
+            {ready?.requirements.oauth_providers.map((provider) => (
+              <Button
+                key={provider.slug}
+                type='button'
+                disabled={verifying}
+                onClick={() =>
+                  void props.onVerify({
+                    method: 'oauth',
+                    provider: provider.slug,
+                  })
+                }
+              >
+                {verifying && input.provider === provider.slug && (
+                  <Loader2 className='size-4 animate-spin' />
+                )}
+                {t('Continue with {{name}}', { name: provider.name })}
+              </Button>
+            ))}
+          </div>
+        </div>
+      )
+      break
+  }
+
+  if (ready && input && ready.requirements.methods.length > 1) {
+    methodContent = (
+      <Tabs value={input.method} onValueChange={selectMethod}>
+        <TabsList>
+          {ready.requirements.methods.map((option) => (
+            <TabsTrigger
+              key={option.method}
+              value={option.method}
+              disabled={!option.available || verifying}
+            >
+              {t(methodLabels[option.method])}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+        <TabsContent key={input.method} value={input.method}>
+          {methodContent}
+        </TabsContent>
+      </Tabs>
+    )
+  }
+
   return (
     <Dialog
       open
@@ -169,109 +296,7 @@ export function SecureVerificationDialog(props: SecureVerificationDialogProps) {
               )}
             </div>
           ) : (
-            <Tabs value={input.method} onValueChange={selectMethod}>
-              <TabsList>
-                {ready.requirements.methods.map((option) => (
-                  <TabsTrigger
-                    key={option.method}
-                    value={option.method}
-                    disabled={!option.available || verifying}
-                  >
-                    {t(methodLabels[option.method])}
-                  </TabsTrigger>
-                ))}
-              </TabsList>
-              <TabsContent value='password' className='space-y-2'>
-                <Label htmlFor={inputId}>{t('Password')}</Label>
-                <Input
-                  id={inputId}
-                  type='password'
-                  autoComplete='current-password'
-                  autoFocus
-                  disabled={verifying}
-                  value={input.method === 'password' ? input.password : ''}
-                  onChange={(event) =>
-                    props.onInputChange({
-                      method: 'password',
-                      password: event.target.value,
-                    })
-                  }
-                />
-              </TabsContent>
-              <TabsContent value='2fa' className='space-y-2'>
-                <Label htmlFor={inputId}>
-                  {acceptsBackupCode
-                    ? t('Authenticator code or backup code')
-                    : t('Authenticator code')}
-                </Label>
-                <Input
-                  id={inputId}
-                  autoComplete='one-time-code'
-                  maxLength={acceptsBackupCode ? 9 : 6}
-                  autoFocus
-                  disabled={verifying}
-                  value={input.method === '2fa' ? input.code : ''}
-                  onChange={(event) =>
-                    props.onInputChange({
-                      method: '2fa',
-                      code: event.target.value,
-                    })
-                  }
-                />
-                <p className='text-muted-foreground text-sm'>
-                  {acceptsBackupCode
-                    ? t(
-                        'Enter the 6-digit authenticator code or an unused backup code.'
-                      )
-                    : t('Enter the 6-digit authenticator code.')}
-                </p>
-              </TabsContent>
-              <TabsContent value='passkey' className='space-y-3'>
-                <PasskeyDomainSelector
-                  domains={props.passkeyDomains}
-                  value={input.method === 'passkey' ? input.rpID : undefined}
-                  onChange={(rpID) =>
-                    props.onInputChange({ method: 'passkey', rpID })
-                  }
-                  disabled={verifying}
-                />
-                <p className='text-muted-foreground flex items-center gap-2 text-sm'>
-                  <KeyRound className='size-5' />
-                  {t(
-                    'We will prompt your device to confirm using biometrics or your hardware key.'
-                  )}
-                </p>
-              </TabsContent>
-              <TabsContent value='oauth' className='space-y-2'>
-                <p className='text-muted-foreground text-sm'>
-                  {t(
-                    'Continue with an account already linked to your profile.'
-                  )}
-                </p>
-                <div className='flex flex-wrap gap-2'>
-                  {ready.requirements.oauth_providers.map((provider) => (
-                    <Button
-                      key={provider.slug}
-                      type='button'
-                      disabled={verifying}
-                      onClick={() =>
-                        void props.onVerify({
-                          method: 'oauth',
-                          provider: provider.slug,
-                        })
-                      }
-                    >
-                      {verifying &&
-                        input.method === 'oauth' &&
-                        input.provider === provider.slug && (
-                          <Loader2 className='size-4 animate-spin' />
-                        )}
-                      {t('Continue with {{name}}', { name: provider.name })}
-                    </Button>
-                  ))}
-                </div>
-              </TabsContent>
-            </Tabs>
+            methodContent
           )}
         </form>
       )}

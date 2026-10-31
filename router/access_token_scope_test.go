@@ -33,6 +33,7 @@ var accessTokenExemptRoutes = []string{
 	"GET /api/home_page_content",
 	"GET /api/ratio_config",
 	"GET /api/user/groups",
+	"GET /api/assets/validation/callback/:state",
 
 	// Anonymous account entry points.
 	"GET /api/verification",

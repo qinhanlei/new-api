@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/plugins"
@@ -17,6 +18,137 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAssetActionsKeepArkErrorsAndDoNotShadowVideoRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(middleware.RequestId())
+	SetAssetRouter(engine)
+	source, err := plugins.Source("doubao")
+	require.NoError(t, err)
+	registry := jsplugin.NewRegistry()
+	_, err = registry.RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	builder := newPluginGenerationBuilder(engine.Routes(), nil, testPluginRouteHandlers(
+		func(c *gin.Context, _ *jsplugin.RoutingGeneration, binding jsplugin.RouteBinding) {
+			c.String(http.StatusAccepted, binding.Plugin.Meta.Key)
+		},
+	))
+	require.NoError(t, registry.SetGenerationPreparer(builder.prepare))
+	require.Empty(t, registry.RoutingErrors())
+	engine.NoRoute((&pluginRouteDispatcher{registry: registry}).dispatch)
+
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/doubao/?Action=CreateAsset&Version=2024-01-01", strings.NewReader(`{}`)))
+	require.Equal(t, http.StatusUnauthorized, response.Code)
+	var payload struct {
+		Metadata struct {
+			RequestID string `json:"RequestId"`
+			Action    string `json:"Action"`
+			Version   string `json:"Version"`
+			Error     struct {
+				Code string `json:"Code"`
+			} `json:"Error"`
+		} `json:"ResponseMetadata"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	assert.NotEmpty(t, payload.Metadata.RequestID)
+	assert.Equal(t, "CreateAsset", payload.Metadata.Action)
+	assert.Equal(t, "2024-01-01", payload.Metadata.Version)
+	assert.Equal(t, "AuthenticationError", payload.Metadata.Error.Code)
+
+	for _, path := range []string{"/api/v3/contents/generations/tasks", "/doubao/api/v3/contents/generations/tasks"} {
+		response = httptest.NewRecorder()
+		engine.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`)))
+		assert.Equal(t, http.StatusAccepted, response.Code, path)
+		assert.Equal(t, "doubao", response.Body.String(), path)
+	}
+}
+
+func TestAssetPollingDoesNotConsumeMutationRateLimit(t *testing.T) {
+	previousEnabled, previousLimit, previousRedis := common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.RedisEnabled
+	common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.RedisEnabled = true, 1, false
+	t.Cleanup(func() {
+		common.CriticalRateLimitEnable = previousEnabled
+		common.CriticalRateLimitNum = previousLimit
+		common.RedisEnabled = previousRedis
+	})
+	engine := gin.New()
+	engine.POST("/actions", func(c *gin.Context) { c.Set("id", 981761) }, assetMutationRateLimit(), func(c *gin.Context) { c.Status(http.StatusOK) })
+	for _, tc := range []struct {
+		action string
+		status int
+	}{
+		{"ListAssets", http.StatusOK}, {"GetAsset", http.StatusOK},
+		{"CreateAsset", http.StatusOK}, {"CreateAsset", http.StatusTooManyRequests},
+		{"ListAssets", http.StatusOK},
+	} {
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/actions?Action="+tc.action, nil))
+		assert.Equal(t, tc.status, response.Code, tc.action)
+	}
+}
+
+func TestAssetManagementEndpointKeepsOtherHostRouteProtections(t *testing.T) {
+	for _, testCase := range []struct {
+		name, hostMethod, hostPath, pluginKey, pluginPath string
+		blocked                                           bool
+		wantStatus                                        int
+	}{
+		{name: "another method still reserves the namespace", hostMethod: http.MethodGet, hostPath: "/doubao/", pluginKey: "doubao", pluginPath: "/probe/jobs", blocked: true},
+		{name: "another path still reserves the namespace", hostMethod: http.MethodPost, hostPath: "/doubao/other", pluginKey: "doubao", pluginPath: "/probe/jobs", blocked: true},
+		{name: "management path stays with the host", hostMethod: http.MethodPost, hostPath: "/doubao/", pluginKey: "asset-route-probe", pluginPath: "/doubao/", wantStatus: http.StatusUnauthorized},
+		{name: "management redirect stays with the host", hostMethod: http.MethodPost, hostPath: "/doubao/", pluginKey: "asset-route-probe", pluginPath: "/doubao", wantStatus: http.StatusTemporaryRedirect},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			engine := gin.New()
+			SetAssetRouter(engine)
+			if testCase.blocked {
+				engine.Handle(testCase.hostMethod, testCase.hostPath, func(c *gin.Context) { c.Status(http.StatusNoContent) })
+			}
+			registry := jsplugin.NewRegistry()
+			source := routerPluginSource(testCase.pluginKey, "1.0.0", fmt.Sprintf(`[{method:"POST",path:%q,type:"submit"}]`, testCase.pluginPath))
+			plugin, err := registry.RegisterFactory(source, jsplugin.Options{})
+			require.NoError(t, err)
+			builder := newPluginGenerationBuilder(engine.Routes(), nil, testPluginRouteHandlers(
+				func(c *gin.Context, _ *jsplugin.RoutingGeneration, _ jsplugin.RouteBinding) {
+					c.String(http.StatusAccepted, "plugin")
+				},
+			))
+			require.NoError(t, registry.SetGenerationPreparer(builder.prepare))
+			engine.NoRoute((&pluginRouteDispatcher{registry: registry}).dispatch)
+			if testCase.blocked {
+				assert.Contains(t, registry.RoutingErrors()[testCase.pluginKey], `plugin key "doubao" is a host path segment`)
+				_, active := registry.Get(testCase.pluginKey)
+				assert.False(t, active)
+				return
+			}
+			require.Empty(t, registry.RoutingErrors())
+			assert.Equal(t, []jsplugin.SkippedRoute{{PluginKey: testCase.pluginKey, Route: plugin.Meta.Routes[0], Reason: "host_route"}}, registry.Generation().SkippedRoutes())
+			response := performPluginRequest(engine, http.MethodPost, testCase.pluginPath)
+			assert.Equal(t, testCase.wantStatus, response.Code)
+			assert.NotEqual(t, "plugin", response.Body.String())
+			response = performPluginRequest(engine, http.MethodPost, "/"+testCase.pluginKey+testCase.pluginPath)
+			assert.Equal(t, http.StatusAccepted, response.Code)
+			assert.Equal(t, "plugin", response.Body.String())
+		})
+	}
+}
+
+func TestAssetEnvelopePreservesPanicRecovery(t *testing.T) {
+	engine := gin.New()
+	engine.Use(gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, _ any) {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	}))
+	engine.POST("/doubao/", assetActionEnvelope(), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"partial": true})
+		panic("test panic")
+	})
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/doubao/", nil))
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
+	assert.JSONEq(t, `{"error":"internal error"}`, response.Body.String())
+}
 
 func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
 	setupRelayRouterTestDB(t)

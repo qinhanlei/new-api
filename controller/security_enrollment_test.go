@@ -15,20 +15,26 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
@@ -113,6 +119,789 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
 	identity, err := service.ParseAccessToken(bundle.AccessToken)
 	require.NoError(t, err)
 	return user, identity
+}
+
+func TestAssetSecretDisclosureRequiresBoundSingleUseProof(t *testing.T) {
+	previousPasswordLogin := common.PasswordLoginEnabled
+	common.PasswordLoginEnabled = true
+	t.Cleanup(func() { common.PasswordLoginEnabled = previousPasswordLogin })
+	for _, endpoint := range []struct {
+		name, route, path, option, scope, context, grant, audit string
+		read, reveal                                            gin.HandlerFunc
+	}{
+		{"storage", "/api/option/asset_storage", "/api/option/asset_storage", system_setting.AssetStorageOption,
+			service.VerificationScopeAssetStorageSecretRead, `{}`, "option:write", "asset.storage.secret_view", GetAssetStorage, GetAssetStorageSecret},
+		{"channel", "/api/channel/:id/assets", "/api/channel/7/assets", model.AssetChannelOptionKey(7),
+			service.VerificationScopeChannelAssetsSecretRead, `{"channel_id":7}`, "channel:secret_view", "channel.assets.secret_view", GetChannelAssets, GetChannelAssetsSecret},
+	} {
+		t.Run(endpoint.name, func(t *testing.T) {
+			user, identity := setupSecurityEnrollmentTest(t)
+			require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
+			require.NoError(t, model.PublishUserAuthCache(user.Id))
+			stored := model.Option{Key: endpoint.option, Value: `{"revision":3,"secret_key":"saved-asset-secret","cursor_secret":"private-cursor-secret"}`}
+			require.NoError(t, model.DB.Create(&stored).Error)
+			token, _, err := service.IssueAccessToken(identity)
+			require.NoError(t, err)
+			operation := service.VerificationOperation{Scope: endpoint.scope, Context: []byte(endpoint.context)}
+			engine := gin.New()
+			engine.Use(middleware.RootAuth(), middleware.DisableCache())
+			if endpoint.name == "channel" {
+				middleware.DeclareAccessTokenPermissionRoute(http.MethodGet, endpoint.route, authz.ChannelRead)
+				middleware.DeclareAccessTokenPermissionRoute(http.MethodPost, endpoint.route+"/secret", authz.ChannelSecretView)
+				engine.POST(endpoint.route+"/secret", middleware.RequirePermission(authz.ChannelSecretView), endpoint.reveal)
+			} else {
+				engine.POST(endpoint.route+"/secret", endpoint.reveal)
+			}
+			engine.GET(endpoint.route, endpoint.read)
+			request := func(method, path, credential, proof string) *httptest.ResponseRecorder {
+				r := httptest.NewRequest(method, path, nil)
+				if credential != "" {
+					r.Header.Set("Authorization", "Bearer "+credential)
+				}
+				r.Header.Set("X-Security-Proof", proof)
+				response := httptest.NewRecorder()
+				engine.ServeHTTP(response, r)
+				return response
+			}
+
+			response := request(http.MethodGet, endpoint.path, token, "")
+			require.Equal(t, http.StatusOK, response.Code)
+			assert.Contains(t, response.Body.String(), `"has_secret":true`)
+			assert.NotContains(t, response.Body.String(), "secret_key")
+			assert.NotContains(t, response.Body.String(), "private-cursor-secret")
+
+			expired := issueSecurityEnrollmentProof(t, identity, operation, "password")
+			require.NoError(t, model.DB.Model(&model.AuthFlow{}).Where("purpose = ?", model.AuthFlowPurposeSecurityProof).Update("expires_at", time.Now().Add(-time.Minute)).Error)
+			proof, err := service.VerifySecurityInput(identity, service.VerificationInput{Scope: endpoint.scope, Context: operation.Context, Method: "password", Password: "enrollment-password"})
+			require.NoError(t, err)
+			otherAction := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: service.VerificationScopePasskeyRegister}, "password")
+			otherSession, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "other-asset-secret-session")
+			require.NoError(t, err)
+			readOnly, readToken := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "option:read", "channel:read")
+			readIdentity := service.AuthIdentity{UserID: user.Id, SessionID: model.AccessTokenSessionID(readToken.Id), UserAuthVersion: user.AuthVersion, SessionVersion: model.AccessTokenSessionVersion}
+			_, err = service.GetVerificationRequirements(readIdentity, endpoint.scope)
+			assert.ErrorIs(t, err, service.ErrVerificationForbidden)
+
+			for _, test := range []struct {
+				name, credential, proof, code string
+				role, status                  int
+			}{
+				{"anonymous", "", "", "AUTH_UNAUTHORIZED", common.RoleRootUser, http.StatusUnauthorized},
+				{"ordinary user", token, proof.ProofToken, "AUTH_INSUFFICIENT_PRIVILEGE", common.RoleCommonUser, http.StatusForbidden},
+				{"administrator", token, proof.ProofToken, "AUTH_INSUFFICIENT_PRIVILEGE", common.RoleAdminUser, http.StatusForbidden},
+				{"read-only PAT", readOnly, proof.ProofToken, "ACCESS_TOKEN_SCOPE_DENIED", common.RoleRootUser, http.StatusForbidden},
+				{"missing proof", token, "", "SECURITY_PROOF_REQUIRED", common.RoleRootUser, http.StatusForbidden},
+				{"expired proof", token, expired, "SECURITY_PROOF_EXPIRED", common.RoleRootUser, http.StatusForbidden},
+				{"wrong scope", token, otherAction, "SECURITY_PROOF_SCOPE_MISMATCH", common.RoleRootUser, http.StatusForbidden},
+				{"wrong session", otherSession.AccessToken, proof.ProofToken, "SECURITY_PROOF_INVALID", common.RoleRootUser, http.StatusForbidden},
+				{"verified session", token, proof.ProofToken, "", common.RoleRootUser, http.StatusOK},
+				{"replayed proof", token, proof.ProofToken, "SECURITY_PROOF_CONSUMED", common.RoleRootUser, http.StatusForbidden},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					require.NoError(t, model.DB.Model(user).Update("role", test.role).Error)
+					require.NoError(t, model.PublishUserAuthCache(user.Id))
+					if test.role != common.RoleRootUser {
+						_, err := service.GetVerificationRequirements(identity, endpoint.scope)
+						assert.ErrorIs(t, err, service.ErrVerificationForbidden)
+					}
+					response := request(http.MethodPost, endpoint.path+"/secret", test.credential, test.proof)
+					require.Equal(t, test.status, response.Code, response.Body.String())
+					var body securityEnrollmentResponse
+					require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+					if test.status == http.StatusOK {
+						assert.JSONEq(t, `{"secret_key":"saved-asset-secret"}`, string(body.Data))
+						assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+					} else {
+						assert.Equal(t, test.code, body.Code)
+						assert.NotContains(t, response.Body.String(), "saved-asset-secret")
+					}
+				})
+			}
+			if endpoint.name == "channel" {
+				otherChannel := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: endpoint.scope, Context: []byte(`{"channel_id":8}`)}, "password")
+				response := request(http.MethodPost, endpoint.path+"/secret", token, otherChannel)
+				assert.Equal(t, http.StatusForbidden, response.Code)
+				assert.Contains(t, response.Body.String(), "SECURITY_PROOF_CONTEXT_MISMATCH")
+				assert.NotContains(t, response.Body.String(), "saved-asset-secret")
+			}
+
+			pat, patRecord := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), endpoint.grant)
+			patIdentity := service.AuthIdentity{UserID: user.Id, SessionID: model.AccessTokenSessionID(patRecord.Id), UserAuthVersion: user.AuthVersion, SessionVersion: model.AccessTokenSessionVersion}
+			patProof, err := service.VerifySecurityInput(patIdentity, service.VerificationInput{Scope: endpoint.scope, Context: operation.Context, Method: "password", Password: "enrollment-password"})
+			require.NoError(t, err)
+			response = request(http.MethodPost, endpoint.path+"/secret", pat, patProof.ProofToken)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), "saved-asset-secret")
+			assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+			var logs []model.AuditLog
+			require.NoError(t, model.LOG_DB.Where("action = ?", endpoint.audit).Find(&logs).Error)
+			require.Len(t, logs, 2)
+			require.NoError(t, model.LOG_DB.Find(&logs).Error)
+			encoded, err := common.Marshal(logs)
+			require.NoError(t, err)
+			for _, secret := range []string{"saved-asset-secret", "private-cursor-secret", "enrollment-password", proof.ProofToken, patProof.ProofToken} {
+				assert.NotContains(t, string(encoded), secret)
+			}
+			var unchanged model.Option
+			require.NoError(t, model.DB.Where(&model.Option{Key: endpoint.option}).First(&unchanged).Error)
+			assert.Equal(t, stored.Value, unchanged.Value, "disclosure must not change configuration")
+
+			require.NoError(t, model.DB.Where(&model.Option{Key: endpoint.option}).Delete(&model.Option{}).Error)
+			missing := issueSecurityEnrollmentProof(t, identity, operation, "password")
+			response = request(http.MethodPost, endpoint.path+"/secret", token, missing)
+			assert.Equal(t, http.StatusNotFound, response.Code)
+			assert.NotContains(t, response.Body.String(), "saved-asset-secret")
+			response = request(http.MethodPost, endpoint.path+"/secret", token, missing)
+			assert.Contains(t, response.Body.String(), "SECURITY_PROOF_CONSUMED")
+		})
+	}
+}
+
+func TestAssetSecretDisclosureVerificationPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name, method                               string
+		twoFA, passkey, disabled, passwordDisabled bool
+	}{
+		{name: "password", method: "password"},
+		{name: "disabled password", method: "password", passwordDisabled: true},
+		{name: "twofa", method: "2fa", twoFA: true},
+		{name: "locked twofa", method: "2fa", twoFA: true, disabled: true},
+		{name: "passkey", method: "passkey", passkey: true},
+		{name: "disabled passkey", method: "passkey", passkey: true, disabled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			user, identity := setupSecurityEnrollmentTest(t)
+			require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
+			previous := common.PasswordLoginEnabled
+			common.PasswordLoginEnabled = !test.passwordDisabled
+			t.Cleanup(func() { common.PasswordLoginEnabled = previous })
+			if test.twoFA {
+				twoFA := &model.TwoFA{UserId: user.Id, Secret: "JBSWY3DPEHPK3PXP", IsEnabled: true}
+				if test.disabled {
+					until := time.Now().Add(time.Minute)
+					twoFA.LockedUntil = &until
+				}
+				require.NoError(t, model.DB.Create(twoFA).Error)
+			}
+			if test.passkey {
+				require.NoError(t, model.DB.Create(&model.PasskeyCredential{UserID: user.Id, CredentialID: "asset-secret-passkey", PublicKey: "public-key"}).Error)
+				system_setting.GetPasskeySettings().Enabled = !test.disabled
+			}
+			for _, operation := range []service.VerificationOperation{
+				{Scope: service.VerificationScopeAssetStorageSecretRead},
+				{Scope: service.VerificationScopeChannelAssetsSecretRead, Context: []byte(`{"channel_id":7}`)},
+			} {
+				requirements, err := service.GetVerificationRequirements(identity, operation.Scope)
+				require.NoError(t, err)
+				require.Len(t, requirements.Methods, 1)
+				assert.Equal(t, test.method, requirements.Methods[0].Method)
+				assert.Equal(t, !test.disabled && !test.passwordDisabled, requirements.Methods[0].Available)
+				input := service.VerificationInput{Scope: operation.Scope, Context: operation.Context, Method: "password", Password: "enrollment-password"}
+				if test.method == "password" && !test.passwordDisabled {
+					input.Password = "wrong-password"
+					_, err := service.VerifySecurityInput(identity, input)
+					assert.ErrorIs(t, err, service.ErrVerificationFailed)
+				} else {
+					expected := service.ErrProofMethod
+					if test.passwordDisabled {
+						expected = service.ErrVerificationUnavailable
+					}
+					_, err := service.VerifySecurityInput(identity, input)
+					assert.ErrorIs(t, err, expected, "password must not bypass the enrolled factor or disabled password policy")
+					proof := issueSecurityEnrollmentProof(t, identity, operation, "password")
+					_, err = service.ConsumeOperationProof(proof, identity, operation)
+					assert.ErrorIs(t, err, expected, "an existing password proof must also respect current policy")
+				}
+			}
+		})
+	}
+}
+
+func TestAssetChannelConfigurationAuthorizationWithoutSecurityProof(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "ListAssetGroups", r.URL.Query().Get("Action"))
+		_, _ = io.WriteString(w, `{"Result":{"Items":[]}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	if service.GetHttpClient() == nil {
+		service.InitHttpClient()
+	}
+	client := service.GetHttpClient()
+	previousTransport := client.Transport
+	client.Transport = upstream.Client().Transport
+	t.Cleanup(func() { client.Transport = previousTransport })
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.CasbinRule{}, &model.AuthzRole{}))
+	wasMaster := common.IsMasterNode
+	common.IsMasterNode = true
+	t.Cleanup(func() { common.IsMasterNode = wasMaster })
+	require.NoError(t, authz.Init(model.DB))
+	channel := model.Channel{Type: constant.ChannelTypeVolcEngine, Key: "channel-test-key", Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	token, _, err := service.IssueAccessToken(identity)
+	require.NoError(t, err)
+	writeScope := service.AccessTokenScopeOf(authz.ChannelSensitiveWrite)
+	writeToken, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), writeScope)
+	readToken, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "channel:read")
+	expiredToken, _ := createScopedAccessToken(t, user.Id, time.Now().Add(-time.Hour).Unix(), writeScope)
+	revokedToken, revoked := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), writeScope)
+	_, err = model.DeleteUserAccessToken(user.Id, revoked.Id)
+	require.NoError(t, err)
+	bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "asset-channel-test")
+	require.NoError(t, err)
+	revokedIdentity, err := service.ParseAccessToken(bundle.AccessToken)
+	require.NoError(t, err)
+	_, err = model.RevokeUserSession(user.Id, revokedIdentity.SessionID, "test")
+	require.NoError(t, err)
+	cookieBundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "asset-channel-cookie-test")
+	require.NoError(t, err)
+
+	engine := gin.New()
+	middleware.DeclareAccessTokenPermissionRoute(http.MethodPut, "/api/channel/:id/assets", authz.ChannelSensitiveWrite)
+	engine.PUT("/api/channel/:id/assets", middleware.AdminAuth(), middleware.RequirePermission(authz.ChannelSensitiveWrite), UpdateChannelAssets)
+	secret := "asset-channel-test-secret"
+	input := dto.AssetChannelUpdate{
+		AssetChannelFields: dto.AssetChannelFields{Enabled: true, Endpoint: upstream.URL, AuthType: "aksk", AccessKey: "asset-access-key"},
+		SecretKey:          &secret,
+	}
+	for _, tc := range []struct {
+		name       string
+		role       int
+		token      string
+		cookie     string
+		permission bool
+		status     int
+	}{
+		{name: "anonymous", role: common.RoleRootUser, status: http.StatusUnauthorized},
+		{name: "refresh cookie only", role: common.RoleRootUser, cookie: cookieBundle.RefreshToken, status: http.StatusUnauthorized},
+		{name: "ordinary user", role: common.RoleCommonUser, token: token, permission: true, status: http.StatusForbidden},
+		{name: "admin without permission", role: common.RoleAdminUser, token: token, status: http.StatusForbidden},
+		{name: "PAT cannot widen account permissions", role: common.RoleAdminUser, token: writeToken, status: http.StatusForbidden},
+		{name: "read-only PAT", role: common.RoleRootUser, token: readToken, status: http.StatusForbidden},
+		{name: "expired PAT", role: common.RoleAdminUser, token: expiredToken, permission: true, status: http.StatusUnauthorized},
+		{name: "revoked PAT", role: common.RoleAdminUser, token: revokedToken, permission: true, status: http.StatusUnauthorized},
+		{name: "revoked session", role: common.RoleAdminUser, token: bundle.AccessToken, permission: true, status: http.StatusUnauthorized},
+		{name: "authorized admin session", role: common.RoleAdminUser, token: token, permission: true, status: http.StatusOK},
+		{name: "authorized admin PAT", role: common.RoleAdminUser, token: writeToken, permission: true, status: http.StatusOK},
+		{name: "root session", role: common.RoleRootUser, token: token, status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(user).Update("role", tc.role).Error)
+			require.NoError(t, model.PublishUserAuthCache(user.Id))
+			require.NoError(t, authz.SetUserPermissions(user.Id, authz.PermissionsMap{authz.ResourceChannel: {authz.ActionSensitiveWrite: tc.permission}}))
+			before, err := model.LoadAssetChannelConfig(t.Context(), channel.Id)
+			require.NoError(t, err)
+			input.Revision = before.Revision
+			body, err := common.Marshal(input)
+			require.NoError(t, err)
+			request := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/channel/%d/assets", channel.Id), bytes.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			if tc.token != "" {
+				request.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			if tc.cookie != "" {
+				request.AddCookie(&http.Cookie{Name: service.RefreshCookieName, Value: tc.cookie})
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			require.Equal(t, tc.status, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), secret)
+			after, err := model.LoadAssetChannelConfig(t.Context(), channel.Id)
+			require.NoError(t, err)
+			if tc.status != http.StatusOK {
+				assert.Equal(t, before, after, "rejected writes must leave the configuration unchanged")
+				return
+			}
+			var result struct {
+				Success bool                 `json:"success"`
+				Data    dto.AssetChannelView `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			assert.True(t, result.Success)
+			assert.True(t, result.Data.HasSecret)
+			assert.Equal(t, before.Revision+1, result.Data.Revision)
+			assert.Equal(t, result.Data.Revision, after.Revision)
+			assert.Equal(t, secret, after.SecretKey)
+			input.SecretKey = nil
+
+			request = httptest.NewRequest(http.MethodPut, request.URL.String(), bytes.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+tc.token)
+			response = httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			assert.Equal(t, http.StatusConflict, response.Code, "replaying a stale revision must fail")
+			stored, err := model.LoadAssetChannelConfig(t.Context(), channel.Id)
+			require.NoError(t, err)
+			assert.Equal(t, after, stored)
+		})
+	}
+	var logs []model.AuditLog
+	require.NoError(t, model.LOG_DB.Find(&logs).Error)
+	encoded, err := common.Marshal(logs)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), "channel.assets.update")
+	for _, value := range []string{secret, token, writeToken} {
+		assert.NotContains(t, string(encoded), value)
+	}
+	_, err = service.GetVerificationRequirements(identity, "channel.assets.write")
+	assert.ErrorIs(t, err, service.ErrProofScope)
+}
+
+func TestAssetConfigurationCannotBeWrittenThroughGenericOptions(t *testing.T) {
+	_, identity := setupSecurityEnrollmentTest(t)
+	for _, key := range []string{system_setting.AssetStorageOption, model.AssetChannelOptionKey(1)} {
+		encoded, err := common.Marshal(map[string]string{"key": key, "value": "should-not-be-written"})
+		require.NoError(t, err)
+		response := securityEnrollmentRequest(http.MethodPut, "/api/option/", string(encoded), "", identity, UpdateOption)
+		assert.Contains(t, response.Body.String(), `"success":false`)
+	}
+}
+
+func TestAssetStorageRejectsUnauthorizedConfiguration(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	token, _, err := service.IssueAccessToken(identity)
+	require.NoError(t, err)
+	readOnly, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "option:read")
+	bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "storage-test")
+	require.NoError(t, err)
+	engine := gin.New()
+	engine.Use(middleware.RootAuth())
+	engine.PUT("/api/option/asset_storage", UpdateAssetStorage)
+	engine.POST("/api/option/asset_storage/test", TestAssetStorage)
+	for _, tc := range []struct {
+		name   string
+		role   int
+		token  string
+		cookie string
+		status int
+	}{
+		{"anonymous", common.RoleRootUser, "", "", http.StatusUnauthorized},
+		{"refresh cookie only", common.RoleRootUser, "", bundle.RefreshToken, http.StatusUnauthorized},
+		{"user", common.RoleCommonUser, token, "", http.StatusForbidden},
+		{"admin", common.RoleAdminUser, token, "", http.StatusForbidden},
+		{"root read-only PAT", common.RoleRootUser, readOnly, "", http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(user).Update("role", tc.role).Error)
+			require.NoError(t, model.PublishUserAuthCache(user.Id))
+			for _, route := range []struct{ method, path string }{{http.MethodPut, "/api/option/asset_storage"}, {http.MethodPost, "/api/option/asset_storage/test"}} {
+				request := httptest.NewRequest(route.method, route.path, strings.NewReader(`{"enabled":false,"revision":0}`))
+				request.Header.Set("Content-Type", "application/json")
+				if tc.token != "" {
+					request.Header.Set("Authorization", "Bearer "+tc.token)
+				}
+				if tc.cookie != "" {
+					request.AddCookie(&http.Cookie{Name: service.RefreshCookieName, Value: tc.cookie})
+				}
+				response := httptest.NewRecorder()
+				engine.ServeHTTP(response, request)
+				assert.Equal(t, tc.status, response.Code, route.path+": "+response.Body.String())
+			}
+		})
+	}
+	var count int64
+	require.NoError(t, model.DB.Model(&model.Option{}).Where(&model.Option{Key: system_setting.AssetStorageOption}).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestAssetStorageRootCanSaveAndTestWithoutSecurityProof(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	service.InitHttpClient()
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	require.NoError(t, model.DB.Model(user).Update("role", common.RoleRootUser).Error)
+	require.NoError(t, model.PublishUserAuthCache(user.Id))
+	token, _, err := service.IssueAccessToken(identity)
+	require.NoError(t, err)
+	var object []byte
+	var mu sync.Mutex
+	store := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		assert.True(t, strings.HasPrefix(r.URL.Path, "/assets/new-api-assets/check/"))
+		switch r.Method {
+		case http.MethodPut:
+			var readErr error
+			object, readErr = io.ReadAll(r.Body)
+			assert.NoError(t, readErr)
+		case http.MethodGet:
+			assert.NotEmpty(t, r.URL.Query().Get("X-Amz-Signature"))
+			_, _ = w.Write(object)
+		case http.MethodDelete:
+			object = nil
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected storage method %s", r.Method)
+		}
+	}))
+	defer store.Close()
+	input := dto.AssetStorageUpdate{AssetStorageFields: dto.AssetStorageFields{Enabled: true, Endpoint: store.URL, Region: "local", Bucket: "assets", AccessKey: "test-access", ForcePathStyle: true}}
+	secret := "test-secret"
+	input.SecretKey = &secret
+	engine := gin.New()
+	engine.Use(middleware.RootAuth(), middleware.DisableCache())
+	engine.PUT("/api/option/asset_storage", UpdateAssetStorage)
+	engine.POST("/api/option/asset_storage/test", TestAssetStorage)
+	for _, route := range []struct{ method, path string }{{http.MethodPut, "/api/option/asset_storage"}, {http.MethodPost, "/api/option/asset_storage/test"}} {
+		body, err := common.Marshal(input)
+		require.NoError(t, err)
+		request := httptest.NewRequest(route.method, route.path, bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"success":true`)
+		assert.NotContains(t, response.Body.String(), secret)
+		mu.Lock()
+		assert.Empty(t, object)
+		mu.Unlock()
+		input.Revision = 1
+		input.SecretKey = nil
+	}
+	stored, err := model.LoadAssetStorageConfig(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, secret, stored.SecretKey)
+	assert.EqualValues(t, 1, stored.Revision)
+}
+
+func TestAssetManagementRejectsCrossUserAndReadOnlyTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		query  string
+		role   int
+		scopes []string
+		status int
+	}{
+		{name: "other owner", query: "&user_id=2", role: common.RoleCommonUser, scopes: []string{"asset:write"}, status: http.StatusForbidden},
+		{name: "read only token", role: common.RoleCommonUser, scopes: []string{"asset:read"}, status: http.StatusForbidden},
+		{name: "admin missing owner scope", query: "&user_id=2", role: common.RoleAdminUser, scopes: []string{"asset:write"}, status: http.StatusForbidden},
+		{name: "all owners cannot write", query: "&all_users=true", role: common.RoleRootUser, scopes: []string{"asset:write", "user:write"}, status: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, endpoint := range []struct {
+				path, body string
+				handler    gin.HandlerFunc
+			}{
+				{"/api/assets/actions?Action=DeleteAsset&Version=2024-01-01", `{"Id":"asset-na-other"}`, ManageAssetAction},
+				{"/api/assets/batch-delete?", `{"Ids":["asset-na-other"]}`, BatchDeleteAssets},
+			} {
+				response := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(response)
+				c.Request = httptest.NewRequest(http.MethodPost, endpoint.path+tc.query, strings.NewReader(endpoint.body))
+				c.Set("id", 1)
+				c.Set("role", tc.role)
+				c.Set("use_access_token", true)
+				c.Set("access_token_id", 1)
+				c.Set("access_token_scopes", tc.scopes)
+				endpoint.handler(c)
+				assert.Equal(t, tc.status, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), `"success":false`)
+			}
+		})
+	}
+}
+
+func TestAssetBatchDeleteRejectsMalformedRequests(t *testing.T) {
+	for _, body := range []string{`null`, `[]`, `{"Ids":"asset-na-one"}`, `{"Ids":[]}{}`, strings.Repeat(" ", 64<<10) + `{}`} {
+		t.Run(fmt.Sprintf("bytes-%d", len(body)), func(t *testing.T) {
+			response := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(response)
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/assets/batch-delete", strings.NewReader(body))
+			c.Set("id", 1)
+			c.Set("role", common.RoleCommonUser)
+			BatchDeleteAssets(c)
+			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), `"success":false`)
+		})
+	}
+}
+
+func TestAssetBatchDeleteReturnsSafeResultsAndAuditCounts(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	group := model.AssetGroup{PublicID: model.NewAssetGroupID(), UserID: user.Id, ProjectName: "default", Name: "batch", GroupType: model.AssetGroupAIGC}
+	frozenGroup := model.AssetGroup{PublicID: model.NewAssetGroupID(), UserID: user.Id, ProjectName: "default", Name: "frozen", GroupType: model.AssetGroupLivenessFace, InitialChannelID: 1, Lifecycle: model.AssetGroupDeletePending}
+	require.NoError(t, model.DB.Create(&group).Error)
+	require.NoError(t, model.DB.Create(&frozenGroup).Error)
+	asset := model.Asset{PublicID: model.NewAssetID(), UserID: user.Id, ProjectName: "default", GroupID: group.ID}
+	frozen := model.Asset{PublicID: model.NewAssetID(), UserID: user.Id, ProjectName: "default", GroupID: frozenGroup.ID}
+	broken := model.Asset{PublicID: model.NewAssetID(), UserID: user.Id, ProjectName: "default", GroupID: group.ID}
+	require.NoError(t, model.DB.Create(&asset).Error)
+	require.NoError(t, model.DB.Create(&frozen).Error)
+	require.NoError(t, model.DB.Create(&broken).Error)
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("asset_batch_failure", func(tx *gorm.DB) {
+		if target, ok := tx.Statement.Model.(*model.Asset); ok && target.ID == broken.ID {
+			tx.AddError(errors.New("private database connection details"))
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove("asset_batch_failure")) })
+	missing := model.NewAssetID()
+	body, err := common.Marshal(dto.AssetBatchDeleteRequest{IDs: []string{asset.PublicID, missing, frozen.PublicID, broken.PublicID, asset.PublicID}})
+	require.NoError(t, err)
+	response := securityEnrollmentRequest(http.MethodPost, "/api/assets/batch-delete", string(body), "", identity, BatchDeleteAssets)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var result struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Items []dto.AssetBatchDeleteItem `json:"Items"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	assert.True(t, result.Success)
+	assert.Equal(t, []dto.AssetBatchDeleteItem{
+		{ID: asset.PublicID, Status: "deleted"},
+		{ID: missing, Status: "not_found", Error: &dto.AssetFailure{Code: "ResourceNotFound", Message: "The material resource was not found"}},
+		{ID: frozen.PublicID, Status: "failed", Error: &dto.AssetFailure{Code: "AssetGroupUnavailable", Message: "The material group is being deleted"}},
+		{ID: broken.PublicID, Status: "failed", Error: &dto.AssetFailure{Code: "InternalError", Message: "The asset operation could not be completed."}},
+	}, result.Data.Items)
+	var audit model.AuditLog
+	require.NoError(t, model.LOG_DB.Where("action = ?", "asset.manage").First(&audit).Error)
+	require.NotNil(t, audit.Other.Op)
+	params, err := common.Marshal(audit.Other.Op.Params)
+	require.NoError(t, err)
+	assert.JSONEq(t, fmt.Sprintf(`{"action":"BatchDeleteAssets","project_name":"default","ids":[%q,%q,%q,%q],"deleted_count":1,"not_found_count":1,"failed_count":2}`, asset.PublicID, missing, frozen.PublicID, broken.PublicID), string(params))
+	assert.NotContains(t, response.Body.String(), "private database")
+}
+
+func TestVisualValidationResultRequiresWritePermission(t *testing.T) {
+	for _, action := range []string{"CreateVisualValidateSession", "GetVisualValidateResult", "CancelAssetGroupDeletion"} {
+		t.Run(action, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(response)
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/assets/actions?Action="+action+"&Version=2024-01-01", strings.NewReader(`{}`))
+			c.Set("id", 1)
+			c.Set("role", common.RoleCommonUser)
+			c.Set("use_access_token", true)
+			c.Set("access_token_id", 1)
+			c.Set("access_token_scopes", []string{"asset:read"})
+			ManageAssetAction(c)
+			assert.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+		})
+	}
+}
+
+func TestHumanAssetGroupDeletionIsAcceptedAndQueryable(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	group := model.AssetGroup{PublicID: model.NewAssetGroupID(), UserID: user.Id, ProjectName: "default", Name: "portrait", GroupType: model.AssetGroupLivenessFace, InitialChannelID: 1, Lifecycle: model.AssetGroupActive}
+	require.NoError(t, model.DB.Create(&group).Error)
+	body, err := common.Marshal(map[string]string{"Id": group.PublicID})
+	require.NoError(t, err)
+	for range 2 {
+		response := securityEnrollmentRequest(http.MethodPost, "/api/assets/actions?Action=DeleteAssetGroup&Version=2024-01-01", string(body), "", identity, ManageAssetAction)
+		require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"Status":"delete_pending"`)
+		assert.Contains(t, response.Body.String(), group.PublicID)
+	}
+	response := securityEnrollmentRequest(http.MethodPost, "/api/assets/actions?Action=GetAssetGroup&Version=2024-01-01", string(body), "", identity, ManageAssetAction)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"Status":"delete_pending"`)
+	stored, err := model.GetAssetGroup(t.Context(), user.Id, group.PublicID, "default")
+	require.NoError(t, err)
+	assert.Zero(t, stored.DeletedAt)
+}
+
+func TestHumanAssetCallbackDoesNotExposeRedirectCredentials(t *testing.T) {
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/assets/validation/callback/private-state?bytedToken=private-token&resultCode=10000", nil)
+	c.Params = gin.Params{{Key: "state", Value: "private-state"}}
+	AssetValidationCallback(c)
+	assert.Equal(t, http.StatusBadRequest, response.Code)
+	assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+	assert.Equal(t, "no-referrer", response.Header().Get("Referrer-Policy"))
+	assert.Contains(t, response.Header().Get("Content-Security-Policy"), "default-src 'none'")
+	assert.NotContains(t, response.Body.String(), "private-state")
+	assert.NotContains(t, response.Body.String(), "private-token")
+	assert.NotContains(t, response.Body.String(), "10000")
+}
+
+func TestAssetReplicaRetryAuthorization(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Token{}, &model.CasbinRule{}, &model.AuthzRole{}))
+	require.NoError(t, authz.Init(model.DB))
+	previousRegistry := jsplugin.DefaultRegistry
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	t.Cleanup(func() { _ = jsplugin.DefaultRegistry.Unregister("doubao"); jsplugin.DefaultRegistry = previousRegistry })
+	source, err := os.ReadFile("../plugins/tasks/doubao/plugin.js")
+	require.NoError(t, err)
+	_, err = jsplugin.DefaultRegistry.Register(string(source), jsplugin.Options{})
+	require.NoError(t, err)
+	channel := model.Channel{Type: constant.ChannelTypeVolcEngine, Key: "asset-retry-channel-key", Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{ChannelId: channel.Id, Model: "doubao-seedance-2-0-260128", Group: "default", Enabled: true}).Error)
+	require.NoError(t, model.SaveAssetStorageConfig(t.Context(), system_setting.AssetStorageConfig{AssetStorageFields: dto.AssetStorageFields{Enabled: true, Endpoint: "https://storage.example", Bucket: "assets", Region: "test"}}))
+	require.NoError(t, model.SaveAssetChannelConfig(t.Context(), channel.Id, system_setting.AssetChannelConfig{
+		AssetChannelFields: dto.AssetChannelFields{Enabled: true, Endpoint: "https://upstream.example", ProjectName: "default", AuthType: "bearer"},
+		ChannelScope:       model.AssetChannelScope(&channel),
+	}))
+	group := model.AssetGroup{PublicID: model.NewAssetGroupID(), UserID: user.Id, ProjectName: "default", GroupType: "AIGC"}
+	require.NoError(t, model.DB.Create(&group).Error)
+	asset := model.Asset{PublicID: model.NewAssetID(), UserID: user.Id, ProjectName: "default", GroupID: group.ID, GroupPublicID: group.PublicID, AssetType: "Image", ObjectKey: "assets/test", ObjectState: model.AssetReady, Status: model.AssetFailed}
+	require.NoError(t, model.DB.Create(&asset).Error)
+	groupReplica := model.AssetGroupReplica{GroupID: group.ID, ChannelID: channel.Id, State: model.AssetReady, UpstreamID: "remote-group"}
+	require.NoError(t, model.DB.Create(&groupReplica).Error)
+	replica := model.AssetReplica{AssetID: asset.ID, ChannelID: channel.Id, State: model.AssetReady, UpstreamID: "remote-asset", Status: model.AssetFailed, ErrorCode: "UpstreamUnavailable", ErrorMessage: "Temporary upstream failure"}
+	require.NoError(t, model.DB.Create(&replica).Error)
+	session, _, err := service.IssueAccessToken(identity)
+	require.NoError(t, err)
+	writeToken, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "asset:write", "channel:write")
+	readToken, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "asset:read", "channel:read")
+	assetOnly, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "asset:write")
+	channelOnly, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "channel:write")
+	engine := gin.New()
+	engine.POST("/api/assets/:id/replicas/:channel_id/retry", middleware.UserAuth(), RetryAssetReplica)
+	path := fmt.Sprintf("/api/assets/%s/replicas/%d/retry", asset.PublicID, channel.Id)
+	for _, tc := range []struct {
+		name       string
+		role       int
+		token      string
+		query      string
+		permission bool
+		status     int
+	}{
+		{name: "anonymous", role: common.RoleRootUser, status: http.StatusUnauthorized},
+		{name: "ordinary user", role: common.RoleCommonUser, token: session, permission: true, status: http.StatusForbidden},
+		{name: "admin without channel permission", role: common.RoleAdminUser, token: session, status: http.StatusForbidden},
+		{name: "PAT cannot widen account permissions", role: common.RoleAdminUser, token: writeToken, status: http.StatusForbidden},
+		{name: "read-only PAT", role: common.RoleRootUser, token: readToken, status: http.StatusForbidden},
+		{name: "missing channel scope", role: common.RoleRootUser, token: assetOnly, status: http.StatusForbidden},
+		{name: "missing asset scope", role: common.RoleRootUser, token: channelOnly, status: http.StatusForbidden},
+		{name: "missing owner scope", role: common.RoleRootUser, token: writeToken, query: "?user_id=99", status: http.StatusForbidden},
+		{name: "all users cannot write", role: common.RoleRootUser, token: session, query: "?all_users=true", status: http.StatusBadRequest},
+		{name: "authorized admin session", role: common.RoleAdminUser, token: session, permission: true, status: http.StatusOK},
+		{name: "authorized admin PAT", role: common.RoleAdminUser, token: writeToken, permission: true, status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(user).Update("role", tc.role).Error)
+			require.NoError(t, model.PublishUserAuthCache(user.Id))
+			require.NoError(t, authz.SetUserPermissions(user.Id, authz.PermissionsMap{authz.ResourceChannel: {authz.ActionWrite: tc.permission}}))
+			require.NoError(t, model.DB.Model(&model.AssetReplica{}).Where("id = ?", replica.ID).Update("status", model.AssetFailed).Error)
+			var before model.AssetReplica
+			require.NoError(t, model.DB.First(&before, replica.ID).Error)
+			request := httptest.NewRequest(http.MethodPost, path+tc.query, nil)
+			if tc.token != "" {
+				request.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			require.Equal(t, tc.status, response.Code, response.Body.String())
+			var stored model.AssetReplica
+			require.NoError(t, model.DB.First(&stored, replica.ID).Error)
+			if tc.status != http.StatusOK {
+				assert.Equal(t, before, stored)
+				return
+			}
+			assert.Contains(t, response.Body.String(), `"success":true`)
+			assert.Equal(t, model.AssetProcessing, stored.Status)
+			assert.Equal(t, replica.UpstreamID, stored.UpstreamID)
+			assert.Empty(t, stored.ErrorCode)
+			assert.Empty(t, stored.ErrorMessage)
+			response = httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			assert.Equal(t, http.StatusConflict, response.Code, "an already queued replica must not be retried twice")
+		})
+	}
+	var logs []model.AuditLog
+	require.NoError(t, model.LOG_DB.Where("action = ?", "asset.replica.retry").Find(&logs).Error)
+	require.Len(t, logs, 2)
+	for _, entry := range logs {
+		assert.Equal(t, fmt.Sprintf("Retried asset %s on channel %d", asset.PublicID, channel.Id), entry.Content)
+	}
+	encoded, err := common.Marshal(logs)
+	require.NoError(t, err)
+	for _, secret := range []string{channel.Key, session, writeToken, assetOnly, channelOnly} {
+		assert.NotContains(t, string(encoded), secret)
+	}
+}
+
+func TestAssetReplicaDetailsRequireChannelReadPermission(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.CasbinRule{}, &model.AuthzRole{}))
+	require.NoError(t, authz.Init(model.DB))
+	response := securityEnrollmentRequest(http.MethodGet, "/api/assets/asset-na-example/replicas", "", "", identity, GetAssetReplicas)
+	assert.Equal(t, http.StatusForbidden, response.Code)
+	require.NoError(t, model.DB.Model(user).Update("role", common.RoleAdminUser).Error)
+	require.NoError(t, authz.SetUserPermissions(user.Id, authz.PermissionsMap{authz.ResourceChannel: {authz.ActionRead: false}}))
+	response = securityEnrollmentRequest(http.MethodGet, "/api/assets/asset-na-example/replicas", "", "", identity, func(c *gin.Context) {
+		c.Set("role", common.RoleAdminUser)
+		GetAssetReplicas(c)
+	})
+	assert.Equal(t, http.StatusForbidden, response.Code)
+	response = securityEnrollmentRequest(http.MethodGet, "/api/assets/asset-na-example/replicas", "", "", identity, func(c *gin.Context) {
+		c.Set("role", common.RoleRootUser)
+		c.Set("use_access_token", true)
+		c.Set("access_token_id", 1)
+		c.Set("access_token_scopes", []string{"asset:read"})
+		GetAssetReplicas(c)
+	})
+	assert.Equal(t, http.StatusForbidden, response.Code)
+
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	for _, tc := range []struct {
+		name    string
+		ownerID int
+		deleted bool
+		status  int
+	}{
+		{name: "missing", status: http.StatusNotFound},
+		{name: "deleted", ownerID: user.Id, deleted: true, status: http.StatusNotFound},
+		{name: "other owner", ownerID: user.Id + 1, status: http.StatusNotFound},
+		{name: "owned", ownerID: user.Id, status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			asset := model.Asset{PublicID: model.NewAssetID(), UserID: tc.ownerID, ProjectName: "default", ObjectKey: tc.name}
+			if tc.deleted {
+				asset.DeletedAt = time.Now().Unix()
+			}
+			if tc.ownerID != 0 {
+				group := model.AssetGroup{PublicID: model.NewAssetGroupID(), UserID: tc.ownerID, ProjectName: "default", Name: tc.name, GroupType: model.AssetGroupAIGC}
+				require.NoError(t, model.DB.Create(&group).Error)
+				asset.GroupID, asset.GroupPublicID = group.ID, group.PublicID
+				require.NoError(t, model.DB.Create(&asset).Error)
+			}
+			response := securityEnrollmentRequest(http.MethodGet, "/api/assets/"+asset.PublicID+"/replicas", "", "", identity, func(c *gin.Context) {
+				c.Set("role", common.RoleRootUser)
+				c.Params = gin.Params{{Key: "id", Value: asset.PublicID}}
+				GetAssetReplicas(c)
+			})
+			assert.Equal(t, tc.status, response.Code, response.Body.String())
+			if tc.status == http.StatusNotFound {
+				assert.Contains(t, response.Body.String(), `"code":"ResourceNotFound"`)
+			} else {
+				assert.Contains(t, response.Body.String(), `"success":true`)
+			}
+		})
+	}
+}
+
+func TestAssetAdministratorCanCleanUpUnavailableOwners(t *testing.T) {
+	_, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(model.AssetModels()...))
+	group := model.AssetGroup{PublicID: "group-na-disabled", UserID: 99, ProjectName: "default", Name: "Former user", GroupType: "AIGC"}
+	require.NoError(t, model.DB.Create(&group).Error)
+	asset := model.Asset{PublicID: model.NewAssetID(), UserID: 99, ProjectName: "default", GroupID: group.ID}
+	require.NoError(t, model.DB.Create(&asset).Error)
+	body, err := common.Marshal(dto.AssetBatchDeleteRequest{IDs: []string{asset.PublicID}})
+	require.NoError(t, err)
+	response := securityEnrollmentRequest(http.MethodPost, "/api/assets/batch-delete?user_id=99", string(body), "", identity, func(c *gin.Context) {
+		c.Set("role", common.RoleAdminUser)
+		BatchDeleteAssets(c)
+	})
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.JSONEq(t, fmt.Sprintf(`{"success":true,"message":"","data":{"Items":[{"Id":%q,"Status":"deleted"}]}}`, asset.PublicID), response.Body.String())
+	require.NoError(t, model.DB.First(&asset, asset.ID).Error)
+	assert.Positive(t, asset.DeletedAt)
+	response = securityEnrollmentRequest(http.MethodPost, "/api/assets/actions?Action=DeleteAssetGroup&Version=2024-01-01&user_id=99", `{"Id":"group-na-disabled"}`, "", identity, func(c *gin.Context) {
+		c.Set("role", common.RoleAdminUser)
+		ManageAssetAction(c)
+	})
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"success":true`)
+	require.NoError(t, model.DB.First(&group, group.ID).Error)
+	assert.Positive(t, group.DeletedAt)
 }
 
 func securityEnrollmentRequest(method, path, body, proof string, identity service.AuthIdentity, handler gin.HandlerFunc) *httptest.ResponseRecorder {
@@ -755,6 +1544,11 @@ func TestSecurityEnrollmentOperationContext(t *testing.T) {
 		err                  error
 	}{
 		{"channel", "channel.key.read", `{"channel_id":123}`, nil},
+		{"asset channel", "channel.assets.secret.read", `{"channel_id":7}`, nil},
+		{"asset channel missing", "channel.assets.secret.read", `{}`, service.ErrVerificationContextInvalid},
+		{"asset channel extra field", "channel.assets.secret.read", `{"channel_id":7,"extra":true}`, service.ErrVerificationContextInvalid},
+		{"asset storage", "asset.storage.secret.read", `{}`, nil},
+		{"asset storage extra field", "asset.storage.secret.read", `{"channel_id":7}`, service.ErrVerificationContextInvalid},
 		{"missing channel", "channel.key.read", ``, service.ErrVerificationContextInvalid},
 		{"null channel", "channel.key.read", `{"channel_id":null}`, service.ErrVerificationContextInvalid},
 		{"string channel", "channel.key.read", `{"channel_id":"123"}`, service.ErrVerificationContextInvalid},
