@@ -53,13 +53,7 @@ export function AssetGroupLifecycle(props: {
   }
   if (props.group.Status === 'delete_blocked') status = t('Deletion blocked')
   if (!props.group.Status || props.group.Status === 'active') {
-    return (
-      <p className='text-muted-foreground shrink-0 text-sm'>
-        {t(
-          'Each group belongs to one person and stays on its verification channel.'
-        )}
-      </p>
-    )
+    return null
   }
   return (
     <div
