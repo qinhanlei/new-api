@@ -61,6 +61,8 @@ export interface AssetValidationSummary {
   GroupId?: string
   ChannelId: number
   ExpiresAt: number
+  CanPoll: boolean
+  NextPollAt?: number
   Error?: { Code: string; Message: string }
 }
 

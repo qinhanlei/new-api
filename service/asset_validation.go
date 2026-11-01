@@ -122,25 +122,49 @@ func authorizeAssetValidationChannelWithDB(ctx context.Context, tx *gorm.DB, ses
 	return nil
 }
 
-func assetValidationView(session *model.AssetValidationSession) (dto.AssetValidationView, error) {
-	view := dto.AssetValidationView{BytedToken: session.PublicID, Status: session.Status, GroupID: session.GroupID, ExpiresAt: session.ExpiresAt, Name: session.Name, ChannelID: session.ChannelID}
-	if session.ErrorCode != "" {
+func assetValidationSummary(session *model.AssetValidationSession) dto.AssetValidationSummary {
+	view := dto.AssetValidationSummary{SessionID: session.PublicID, Status: session.Status, GroupID: session.GroupID, ExpiresAt: session.ExpiresAt,
+		Name: session.Name, ChannelID: session.ChannelID, NextPollAt: session.NextPollAt}
+	if session.ErrorCode != "" && session.ErrorCode != "ValidationPending" {
 		view.Error = &dto.AssetFailure{Code: session.ErrorCode, Message: session.ErrorMessage}
 	}
 	if session.Status == model.AssetValidationCreated {
-		return view, nil
+		view.NextPollAt = 0
+		return view
 	}
-	if session.ExpiresAt <= time.Now().Unix() && session.UpstreamGroupID == "" {
+	now := time.Now().Unix()
+	if session.ExpiresAt <= now && session.UpstreamGroupID == "" {
 		view.Status = model.AssetValidationExpired
-		return view, nil
+		return view
 	}
-	if session.Status == model.AssetValidationCreating && session.LeaseExpiresAt <= time.Now().Unix() {
+	if session.Status == model.AssetValidationCreating && session.LeaseExpiresAt <= now {
 		view.Status = model.AssetValidationUnknown
 	}
+	if session.Status == model.AssetValidationFailed {
+		return view
+	}
+	switch session.ErrorCode {
+	case "UpstreamConfigurationInvalid", "ValidationSecretUnavailable", "InvalidValidationGroup", "ValidationGroupMismatch":
+		return view
+	}
+	// A saved group can still be bound after the H5 credential expires. An
+	// uncertain create without a credential cannot safely be submitted again.
+	view.CanPoll = session.UpstreamGroupID != "" || session.SecretCipher != "" ||
+		(session.Status == model.AssetValidationCreating && session.LeaseExpiresAt > now)
+	return view
+}
+
+func assetValidationView(session *model.AssetValidationSession) (dto.AssetValidationView, error) {
+	summary := assetValidationSummary(session)
+	view := dto.AssetValidationView{BytedToken: session.PublicID, Status: summary.Status, GroupID: summary.GroupID, ExpiresAt: summary.ExpiresAt,
+		Name: summary.Name, ChannelID: summary.ChannelID, CanPoll: summary.CanPoll, NextPollAt: summary.NextPollAt, Error: summary.Error}
 	if session.SecretCipher != "" && session.ExpiresAt > time.Now().Unix() {
 		secrets, err := openAssetValidationSecrets(session)
 		if err != nil {
-			return view, err
+			code, message, _ := assetFailure(err)
+			view.Error = &dto.AssetFailure{Code: code, Message: message}
+			view.CanPoll = false
+			return view, nil
 		}
 		view.H5Link, view.CallbackURL = secrets.H5Link, secrets.CallbackURL
 	}
@@ -283,7 +307,7 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 	// received. This short detached write never performs a second remote call.
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if saveErr := model.SaveAssetValidationAttempt(persistCtx, session); saveErr != nil {
+	if saveErr := model.SaveAssetValidationAttempt(persistCtx, session, 0); saveErr != nil {
 		return empty, saveErr
 	}
 	if err == nil {
@@ -340,7 +364,7 @@ func GetAssetValidationResult(ctx context.Context, actor dto.AssetActor, token, 
 		}
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		_ = model.SaveAssetValidationAttempt(persistCtx, session)
+		_ = model.SaveAssetValidationAttempt(persistCtx, session, 0)
 	}()
 	channel, err := model.GetChannelById(session.ChannelID, true)
 	if err != nil {
@@ -351,15 +375,15 @@ func GetAssetValidationResult(ctx context.Context, actor dto.AssetActor, token, 
 		return empty, err
 	}
 	secrets := assetValidationSecrets{}
+	pending := false
 	if session.UpstreamGroupID == "" {
 		secrets, err = openAssetValidationSecrets(session)
-		if err != nil {
-			return empty, err
-		}
 		var result struct {
 			GroupID string `json:"GroupId"`
 		}
-		err = callAssetUpstream(ctx, channel, config, "GetVisualValidateResult", map[string]any{"BytedToken": secrets.BytedToken}, &result)
+		if err == nil {
+			err = callAssetUpstream(ctx, channel, config, "GetVisualValidateResult", map[string]any{"BytedToken": secrets.BytedToken}, &result)
+		}
 		if err == nil && result.GroupID != "" && len(result.GroupID) <= 191 && strings.TrimSpace(result.GroupID) == result.GroupID {
 			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			err = model.SaveAssetValidationGroupID(persistCtx, session, result.GroupID)
@@ -367,11 +391,13 @@ func GetAssetValidationResult(ctx context.Context, actor dto.AssetActor, token, 
 			if err != nil {
 				return empty, err
 			}
+		} else if err == nil && result.GroupID == "" {
+			pending = true
 		} else if err == nil {
-			err = assetError(http.StatusConflict, "ValidationPending", "Human verification has not completed")
+			err = assetError(http.StatusBadGateway, "InvalidValidationGroup", "The upstream verification returned an invalid group ID")
 		}
 	}
-	if err == nil {
+	if err == nil && !pending {
 		var group struct {
 			ID          string `json:"Id"`
 			GroupType   string `json:"GroupType"`
@@ -379,7 +405,7 @@ func GetAssetValidationResult(ctx context.Context, actor dto.AssetActor, token, 
 		}
 		err = callAssetUpstream(ctx, channel, config, "GetAssetGroup", map[string]any{"Id": session.UpstreamGroupID}, &group)
 		if err == nil && (group.ID != session.UpstreamGroupID || group.GroupType != model.AssetGroupLivenessFace || group.ProjectName != session.UpstreamProject) {
-			err = assetError(http.StatusBadGateway, "UpstreamInvalidResponse", "The upstream group does not match this human verification")
+			err = assetError(http.StatusBadGateway, "ValidationGroupMismatch", "The upstream group does not match this human verification")
 		}
 	}
 	if err == nil {
@@ -387,22 +413,42 @@ func GetAssetValidationResult(ctx context.Context, actor dto.AssetActor, token, 
 		// the live channel policy and then the original identity under row locks.
 		err = authorizeAssetValidation(ctx, actor, session)
 	}
-	if err == nil {
+	if err == nil && !pending {
 		err = model.CompleteAssetValidationSession(ctx, session, func(tx *gorm.DB) error {
 			return authorizeAssetValidationChannelWithDB(ctx, tx, session)
 		})
 	}
-	if err != nil {
+	if err != nil || pending {
 		session.Status = model.AssetValidationPending
 		if session.UpstreamGroupID != "" {
 			session.Status = model.AssetValidationUnknown
 		}
-		session.ErrorCode, session.ErrorMessage, _ = assetFailure(err)
+		delay := int64(10)
+		if session.ErrorCode != "" && session.ErrorCode != "ValidationPending" {
+			delay = max(10, min(60, 2*(session.NextPollAt-session.UpdatedAt)))
+		}
+		session.NextPollAt = 0
+		session.ErrorCode, session.ErrorMessage = "", ""
+		minimumDelay := int64(0)
+		if err != nil {
+			var retryable bool
+			session.ErrorCode, session.ErrorMessage, retryable = assetFailure(err)
+			var failure *AssetError
+			if errors.As(err, &failure) {
+				// Before H5 completion, providers may return business errors
+				// instead of a waiting result. They do not prove a final failure.
+				retryable = retryable || (failure.HTTPStatus >= 400 && failure.HTTPStatus < 500)
+				session.NextPollAt = failure.RetryAfter
+			}
+			if retryable {
+				minimumDelay = delay
+			}
+		}
 		state := strings.TrimPrefix(secrets.CallbackURL, strings.TrimRight(system_setting.ServerAddress, "/")+assetValidationCallbackPath)
 		session.ErrorCode = safeAssetMessage(session.ErrorCode, secrets.BytedToken, state)
 		session.ErrorMessage = safeAssetMessage(session.ErrorMessage, secrets.BytedToken, state)
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		saveErr := model.SaveAssetValidationAttempt(persistCtx, session)
+		saveErr := model.SaveAssetValidationAttempt(persistCtx, session, minimumDelay)
 		cancel()
 		if saveErr != nil {
 			return empty, saveErr
@@ -429,17 +475,7 @@ func ListAssetValidationSessions(ctx context.Context, actor dto.AssetActor, proj
 	}
 	items := make([]dto.AssetValidationSummary, 0, len(sessions))
 	for _, session := range sessions {
-		status := session.Status
-		if status != model.AssetValidationCreated && session.UpstreamGroupID == "" && session.ExpiresAt <= time.Now().Unix() {
-			status = model.AssetValidationExpired
-		} else if status == model.AssetValidationCreating && session.LeaseExpiresAt <= time.Now().Unix() {
-			status = model.AssetValidationUnknown
-		}
-		item := dto.AssetValidationSummary{SessionID: session.PublicID, Status: status, GroupID: session.GroupID, ExpiresAt: session.ExpiresAt, Name: session.Name, ChannelID: session.ChannelID}
-		if session.ErrorCode != "" {
-			item.Error = &dto.AssetFailure{Code: session.ErrorCode, Message: session.ErrorMessage}
-		}
-		items = append(items, item)
+		items = append(items, assetValidationSummary(&session))
 	}
 	return items, nil
 }

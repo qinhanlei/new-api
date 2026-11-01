@@ -12,13 +12,15 @@ type AssetValidationCreate struct {
 
 // AssetValidationSummary deliberately excludes links and upstream credentials.
 type AssetValidationSummary struct {
-	SessionID string        `json:"SessionId"`
-	Status    string        `json:"Status"`
-	GroupID   string        `json:"GroupId,omitempty"`
-	ExpiresAt int64         `json:"ExpiresAt"`
-	Name      string        `json:"Name"`
-	ChannelID int           `json:"ChannelId"`
-	Error     *AssetFailure `json:"Error,omitempty"`
+	SessionID  string        `json:"SessionId"`
+	Status     string        `json:"Status"`
+	GroupID    string        `json:"GroupId,omitempty"`
+	ExpiresAt  int64         `json:"ExpiresAt"`
+	Name       string        `json:"Name"`
+	ChannelID  int           `json:"ChannelId"`
+	CanPoll    bool          `json:"CanPoll"`
+	NextPollAt int64         `json:"NextPollAt,omitempty"`
+	Error      *AssetFailure `json:"Error,omitempty"`
 }
 
 // BytedToken is an opaque local session identifier, not the provider token.
@@ -32,5 +34,7 @@ type AssetValidationView struct {
 	ExpiresAt   int64         `json:"ExpiresAt"`
 	Name        string        `json:"Name"`
 	ChannelID   int           `json:"ChannelId"`
+	CanPoll     bool          `json:"CanPoll"`
+	NextPollAt  int64         `json:"NextPollAt,omitempty"`
 	Error       *AssetFailure `json:"Error,omitempty"`
 }

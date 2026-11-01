@@ -26,6 +26,7 @@ type AssetError struct {
 	Code       string
 	Message    string
 	Retryable  bool
+	RetryAfter int64 // Earliest upstream retry time, in Unix seconds.
 }
 
 func (err *AssetError) Error() string { return err.Message }
@@ -150,7 +151,7 @@ func safeAssetMessage(message string, secrets ...string) string {
 
 // All actions use the configured management endpoint. Generation credentials
 // stay on that administrator-selected host; only a trailing slash is corrected.
-func callAssetUpstream(ctx context.Context, channel *model.Channel, config system_setting.AssetChannelConfig, action string, payload map[string]any, result any) error {
+func callAssetUpstream(ctx context.Context, channel *model.Channel, config system_setting.AssetChannelConfig, action string, payload map[string]any, result any) (err error) {
 	endpoint, err := url.Parse(config.Endpoint)
 	if err != nil || endpoint.Host == "" {
 		return assetError(http.StatusBadGateway, "UpstreamConfigurationInvalid", "The material endpoint is not configured")
@@ -210,6 +211,21 @@ func callAssetUpstream(ctx context.Context, channel *model.Channel, config syste
 		}
 	}
 	defer response.Body.Close()
+	defer func() {
+		var failure *AssetError
+		if !errors.As(err, &failure) {
+			return
+		}
+		// Preserve a validated deadline for callers that can retry safely. The
+		// header must never turn an uncertain create into an automatic replay.
+		value := strings.TrimSpace(response.Header.Get("Retry-After"))
+		now := time.Now()
+		if seconds, parseErr := strconv.ParseUint(value, 10, 32); parseErr == nil && !strings.HasPrefix(value, "+") {
+			failure.RetryAfter = now.Add(time.Duration(seconds) * time.Second).Unix()
+		} else if deadline, parseErr := http.ParseTime(value); parseErr == nil && deadline.After(now) {
+			failure.RetryAfter = deadline.Unix()
+		}
+	}()
 	body, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
 	if err != nil || len(body) > 1<<20 {
 		return assetError(http.StatusBadGateway, "UpstreamResultUnknown", "The upstream material response could not be read")

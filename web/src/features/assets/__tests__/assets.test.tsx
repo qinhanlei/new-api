@@ -118,6 +118,7 @@ beforeEach(() => {
 })
 afterEach(() => {
   client.clear()
+  vi.useRealTimers()
   vi.unstubAllGlobals()
   useAuthStore.getState().auth.reset()
 })
@@ -1863,7 +1864,8 @@ test.each([true, false])(
 )
 
 test('a saved verification resumes through a write action and selects its created group', async () => {
-  const user = userEvent.setup()
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
   const created = vi.fn()
   vi.mocked(api.get).mockResolvedValue({
     data: {
@@ -1873,6 +1875,7 @@ test('a saved verification resumes through a write action and selects its create
           SessionId: 'validation-na-one',
           Name: 'Alice',
           Status: 'pending',
+          CanPoll: true,
           ChannelId: 7,
           ExpiresAt: Date.now() / 1000 + 1800,
         },
@@ -1888,6 +1891,7 @@ test('a saved verification resumes through a write action and selects its create
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'pending',
+          CanPoll: true,
           ChannelId: 7,
           ExpiresAt: Date.now() / 1000 + 1800,
           H5Link: 'https://verify.example/face',
@@ -1915,16 +1919,22 @@ test('a saved verification resumes through a write action and selects its create
       />
     </QueryClientProvider>
   )
-  const resume = await screen.findByRole('button', {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  const resume = screen.getByRole('button', {
     name: 'Continue verification for Alice',
   })
   expect(post).not.toHaveBeenCalled()
   expect(
     screen.queryByRole('button', { name: 'Open verification' })
   ).not.toBeInTheDocument()
-  await user.click(resume)
+  fireEvent.click(resume)
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
   expect(
-    await screen.findByRole('button', { name: 'Open verification' })
+    screen.getByRole('button', { name: 'Open verification' })
   ).toBeVisible()
   expect(api.get).toHaveBeenCalledWith(
     '/api/assets/validation/sessions',
@@ -1940,8 +1950,13 @@ test('a saved verification resumes through a write action and selects its create
       }),
     })
   )
-  await user.click(screen.getByRole('button', { name: 'Check verification' }))
-  await waitFor(() => expect(created).toHaveBeenCalledWith('group-na-person'))
+  expect(
+    screen.getByRole('button', { name: 'Check verification' })
+  ).toBeDisabled()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10_000)
+  })
+  expect(created).toHaveBeenCalledWith('group-na-person')
   expect(
     screen.queryByRole('button', { name: 'Open verification' })
   ).not.toBeInTheDocument()
@@ -2136,47 +2151,155 @@ test('accepted human deletion stays visible as pending and does not report compl
   expect(success).not.toHaveBeenCalledWith('Deleted successfully')
 })
 
-test('an open verification polls once, pauses on failure and keeps manual recovery available', async () => {
-  const user = userEvent.setup()
-  const created = vi.fn()
-  const scheduled: (() => void)[] = []
-  const setTimeout = window.setTimeout.bind(window)
-  vi.spyOn(window, 'setTimeout').mockImplementation(
-    (callback, delay, ...args) => {
-      if (delay === 10_000 && typeof callback === 'function') {
-        scheduled.push(() => callback(...args))
-        return setTimeout(() => undefined, 0) as unknown as ReturnType<
-          typeof window.setTimeout
-        >
+test.each([
+  {
+    name: 'network interruption',
+    status: undefined,
+    retryAfter: undefined,
+    delay: 10_000,
+  },
+  { name: '429 with seconds', status: 429, retryAfter: '30', delay: 30_000 },
+  {
+    name: '429 with HTTP date',
+    status: 429,
+    retryAfter: 'Sun, 01 Nov 2026 12:00:40 GMT',
+    delay: 30_000,
+  },
+])(
+  'verification polling recovers after $name without restarting verification',
+  async (failure) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
+    const created = vi.fn()
+    const success = vi
+      .spyOn(toast, 'success')
+      .mockImplementation(() => 'verified')
+    vi.mocked(api.get).mockResolvedValue({
+      data: {
+        success: true,
+        data: [
+          {
+            SessionId: 'validation-na-one',
+            Name: 'Alice',
+            Status: 'pending',
+            CanPoll: true,
+            ExpiresAt: Date.now() / 1000 + 1800,
+          },
+        ],
+      },
+    })
+    const error = Object.assign(
+      new Error('Verification temporarily unavailable'),
+      {
+        response: failure.status
+          ? {
+              status: failure.status,
+              headers: { 'retry-after': failure.retryAfter },
+            }
+          : undefined,
       }
-      return setTimeout(callback, delay, ...args) as unknown as ReturnType<
-        typeof window.setTimeout
-      >
-    }
-  )
+    )
+    const post = vi
+      .spyOn(api, 'post')
+      .mockResolvedValueOnce({
+        data: {
+          success: true,
+          data: {
+            BytedToken: 'validation-na-one',
+            Name: 'Alice',
+            Status: 'pending',
+            CanPoll: true,
+            ExpiresAt: Date.now() / 1000 + 1800,
+            H5Link: 'https://verify.example/face',
+          },
+        },
+      })
+      .mockRejectedValueOnce(error)
+      .mockResolvedValueOnce({
+        data: {
+          success: true,
+          data: {
+            BytedToken: 'validation-na-one',
+            Name: 'Alice',
+            Status: 'created',
+            CanPoll: false,
+            GroupId: 'group-na-person',
+          },
+        },
+      })
+    render(
+      <QueryClientProvider client={client}>
+        <AssetValidationDialog
+          project='default'
+          scope={{}}
+          onClose={vi.fn()}
+          onCreated={created}
+        />
+      </QueryClientProvider>
+    )
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Continue verification for Alice' })
+    )
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    expect(post).toHaveBeenCalledTimes(2)
+    expect(
+      screen.getByRole('button', { name: 'Check verification' })
+    ).toBeDisabled()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(failure.delay - 1)
+    })
+    expect(created).not.toHaveBeenCalled()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1)
+    })
+    expect(created).toHaveBeenCalledExactlyOnceWith('group-na-person')
+    expect(success).toHaveBeenCalledExactlyOnceWith(
+      'Verification completed. The person group is ready.'
+    )
+    expect(
+      post.mock.calls.every(
+        ([, , config]) =>
+          (config?.params as { Action?: string } | undefined)?.Action ===
+          'GetVisualValidateResult'
+      )
+    ).toBe(true)
+  }
+)
+
+test('continuing a saved verification retains its target when the first check is throttled', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
+  const created = vi.fn()
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
       data: [
-        { SessionId: 'validation-na-one', Name: 'Alice', Status: 'pending' },
+        {
+          SessionId: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          CanPoll: true,
+          ExpiresAt: Date.now() / 1000 + 1800,
+        },
       ],
     },
   })
   const post = vi
     .spyOn(api, 'post')
-    .mockResolvedValueOnce({
-      data: {
-        success: true,
-        data: {
-          BytedToken: 'validation-na-one',
-          Name: 'Alice',
-          Status: 'pending',
-          ExpiresAt: Date.now() / 1000 + 1800,
-          H5Link: 'https://verify.example/face',
-        },
-      },
-    })
-    .mockRejectedValueOnce(new Error('Verification temporarily unavailable'))
+    .mockRejectedValueOnce(
+      Object.assign(new Error('Request failed with status code 429'), {
+        response: { status: 429, headers: { 'retry-after': '30' } },
+      })
+    )
     .mockResolvedValueOnce({
       data: {
         success: true,
@@ -2184,6 +2307,7 @@ test('an open verification polls once, pauses on failure and keeps manual recove
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'created',
+          CanPoll: false,
           GroupId: 'group-na-person',
         },
       },
@@ -2198,23 +2322,114 @@ test('an open verification polls once, pauses on failure and keeps manual recove
       />
     </QueryClientProvider>
   )
-  await user.click(
-    await screen.findByRole('button', {
-      name: 'Continue verification for Alice',
-    })
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue verification for Alice' })
   )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
   expect(
-    await screen.findByRole('button', { name: 'Open verification' })
-  ).toBeVisible()
-  expect(scheduled).toHaveLength(1)
-  await act(async () => scheduled.shift()?.())
-  expect(await screen.findByRole('alert')).toHaveTextContent(
-    'Verification temporarily unavailable'
+    screen.getByRole('button', { name: 'Check verification' })
+  ).toBeDisabled()
+  expect(
+    screen.queryByRole('button', { name: 'Start verification' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByText('Request failed with status code 429')
+  ).not.toBeInTheDocument()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(30_000)
+  })
+  expect(created).toHaveBeenCalledExactlyOnceWith('group-na-person')
+  expect(post.mock.calls[1][1]).toEqual({
+    ProjectName: 'default',
+    BytedToken: 'validation-na-one',
+  })
+})
+
+test('a recoverable binding continues after H5 expiry and respects the server retry time', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
+  const created = vi.fn()
+  const pending = {
+    Name: 'Alice',
+    Status: 'unknown',
+    CanPoll: true,
+    ExpiresAt: Date.now() / 1000 - 60,
+    Error: {
+      Code: 'UpstreamHTTP503',
+      Message: 'Group information is temporarily unavailable',
+    },
+  }
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [{ ...pending, SessionId: 'validation-na-one' }],
+    },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          ...pending,
+          BytedToken: 'validation-na-one',
+          NextPollAt: Date.now() / 1000 + 60,
+        },
+      },
+    })
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'created',
+          CanPoll: false,
+          GroupId: 'group-na-person',
+        },
+      },
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={created}
+      />
+    </QueryClientProvider>
   )
-  expect(post).toHaveBeenCalledTimes(2)
-  expect(scheduled).toHaveLength(0)
-  await user.click(screen.getByRole('button', { name: 'Check verification' }))
-  await waitFor(() => expect(created).toHaveBeenCalledWith('group-na-person'))
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue verification for Alice' })
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  expect(
+    screen.queryByRole('button', { name: 'Open verification' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByText(/Group information is temporarily unavailable/)
+  ).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Check verification' })
+  ).toBeDisabled()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(59_999)
+  })
+  expect(post).toHaveBeenCalledTimes(1)
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1)
+  })
+  expect(created).toHaveBeenCalledExactlyOnceWith('group-na-person')
 })
 
 test('cancelling a blocked human deletion uses its owner and unfreezes the group after success', async () => {
@@ -2379,28 +2594,158 @@ test('background group refresh never retargets an open delete confirmation', asy
   )
 })
 
-test('a verification link disappears at its deadline even when result polling has failed', async () => {
-  const user = userEvent.setup()
-  let expire: (() => void) | undefined
-  const timer = window.setTimeout.bind(window)
-  vi.spyOn(window, 'setTimeout').mockImplementation(
-    (callback, delay, ...args) => {
-      if (delay && delay > 10_000 && typeof callback === 'function') {
-        expire = () => callback(...args)
-        return timer(() => undefined, 0) as unknown as ReturnType<
-          typeof window.setTimeout
-        >
-      }
-      return timer(callback, delay, ...args) as unknown as ReturnType<
-        typeof window.setTimeout
-      >
-    }
-  )
+test('a verification link disappears at its deadline while a result check is still pending', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
       data: [
-        { SessionId: 'validation-na-one', Name: 'Alice', Status: 'pending' },
+        {
+          SessionId: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          CanPoll: true,
+          ExpiresAt: Date.now() / 1000 + 15,
+        },
+      ],
+    },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          CanPoll: true,
+          ExpiresAt: Date.now() / 1000 + 15,
+          H5Link: 'https://verify.example/face',
+        },
+      },
+    })
+    .mockImplementationOnce(() => new Promise(() => undefined))
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue verification for Alice' })
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  expect(
+    screen.getByRole('button', { name: 'Open verification' })
+  ).toBeVisible()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10_000)
+  })
+  expect(post).toHaveBeenCalledTimes(2)
+  expect(screen.getByRole('button', { name: 'Checking...' })).toBeDisabled()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5_000)
+  })
+  expect(
+    screen.queryByRole('button', { name: 'Open verification' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: 'Copy verification link' })
+  ).not.toBeInTheDocument()
+})
+
+test('a revoked verification authorization stops polling and removes the H5 link', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [
+        {
+          SessionId: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          CanPoll: true,
+          ExpiresAt: Date.now() / 1000 + 1800,
+        },
+      ],
+    },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          CanPoll: true,
+          ExpiresAt: Date.now() / 1000 + 1800,
+          H5Link: 'https://verify.example/face',
+        },
+      },
+    })
+    .mockRejectedValueOnce(
+      Object.assign(new Error('Permission revoked'), {
+        response: { status: 403 },
+      })
+    )
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue verification for Alice' })
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10_000)
+  })
+  expect(screen.getByRole('alert')).toHaveTextContent('Permission revoked')
+  expect(
+    screen.queryByRole('button', { name: 'Open verification' })
+  ).not.toBeInTheDocument()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000)
+  })
+  expect(post).toHaveBeenCalledTimes(2)
+})
+
+test('an uncertain upstream check keeps its diagnosis and can later complete', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
+  const created = vi.fn()
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [
+        {
+          SessionId: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          CanPoll: true,
+          ExpiresAt: Date.now() / 1000 + 1800,
+        },
       ],
     },
   })
@@ -2412,12 +2757,85 @@ test('a verification link disappears at its deadline even when result polling ha
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'pending',
+          CanPoll: true,
           ExpiresAt: Date.now() / 1000 + 1800,
+          NextPollAt: Date.now() / 1000 + 20,
           H5Link: 'https://verify.example/face',
+          Error: {
+            Code: 'InvalidParameter',
+            Message: 'liveness verification failed',
+          },
         },
       },
     })
-    .mockRejectedValueOnce(new Error('Permission revoked'))
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'created',
+          CanPoll: false,
+          GroupId: 'group-na-person',
+        },
+      },
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={created}
+      />
+    </QueryClientProvider>
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue verification for Alice' })
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  expect(
+    screen.getByText(
+      'Last check: InvalidParameter: liveness verification failed'
+    )
+  ).toBeVisible()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(20_000)
+  })
+  expect(created).toHaveBeenCalledExactlyOnceWith('group-na-person')
+})
+
+test('an uncertain creation without recovery credentials is never polled or recreated automatically', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
+  const unknown = {
+    Name: 'Alice',
+    Status: 'unknown',
+    CanPoll: false,
+    ExpiresAt: Date.now() / 1000 + 1800,
+    Error: {
+      Code: 'UpstreamResultUnknown',
+      Message: 'The upstream result could not be confirmed',
+    },
+  }
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [{ ...unknown, SessionId: 'validation-na-one' }],
+    },
+  })
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...unknown, BytedToken: 'validation-na-one' },
+    },
+  })
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
@@ -2428,26 +2846,396 @@ test('a verification link disappears at its deadline even when result polling ha
       />
     </QueryClientProvider>
   )
-  await user.click(
-    await screen.findByRole('button', {
-      name: 'Continue verification for Alice',
-    })
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue verification for Alice' })
   )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+  })
+  expect(post).toHaveBeenCalledTimes(1)
   expect(
-    await screen.findByRole('button', { name: 'Open verification' })
-  ).toBeVisible()
-  await user.click(screen.getByRole('button', { name: 'Check verification' }))
-  expect(await screen.findByRole('alert')).toHaveTextContent(
-    'Permission revoked'
-  )
-  expect(expire).toBeDefined()
-  act(() => expire?.())
+    screen.getByRole('button', { name: 'Check verification' })
+  ).toBeEnabled()
   expect(
     screen.queryByRole('button', { name: 'Open verification' })
   ).not.toBeInTheDocument()
+})
+
+test('binding checks pause after ten minutes and manual recovery keeps the same session', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
+  const pending = {
+    Name: 'Alice',
+    Status: 'unknown',
+    CanPoll: true,
+    ExpiresAt: Date.now() / 1000 - 60,
+    Error: { Code: 'UpstreamHTTP503', Message: 'Temporarily unavailable' },
+  }
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [{ ...pending, SessionId: 'validation-na-one' }],
+    },
+  })
+  const post = vi.spyOn(api, 'post').mockImplementation(async () => ({
+    data: {
+      success: true,
+      data: {
+        ...pending,
+        BytedToken: 'validation-na-one',
+        NextPollAt: Date.now() / 1000 + 60,
+      },
+    },
+  }))
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue verification for Alice' })
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  for (let minute = 0; minute < 10; minute++) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000)
+    })
+  }
   expect(
     screen.getByText(
-      'This verification link has expired. Start a new verification if no group was created.'
+      'Automatic checks paused. You can check this verification again.'
     )
   ).toBeVisible()
+  const attempts = post.mock.calls.length
+  expect(attempts).toBe(10)
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000)
+  })
+  expect(post).toHaveBeenCalledTimes(attempts)
+  fireEvent.click(screen.getByRole('button', { name: 'Check verification' }))
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  expect(post).toHaveBeenCalledTimes(attempts + 1)
+  expect(post.mock.calls.at(-1)?.[1]).toEqual({
+    ProjectName: 'default',
+    BytedToken: 'validation-na-one',
+  })
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000)
+  })
+  expect(post).toHaveBeenCalledTimes(attempts + 2)
+})
+
+test('a throttled creation waits before a manual retry and preserves its request key', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
+  vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockRejectedValueOnce(
+      Object.assign(new Error('Request failed with status code 429'), {
+        response: { status: 429, headers: { 'retry-after': '30' } },
+      })
+    )
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          CanPoll: true,
+          ExpiresAt: Date.now() / 1000 + 1800,
+          H5Link: 'https://verify.example/face',
+        },
+      },
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  fireEvent.change(screen.getByLabelText('Name'), {
+    target: { value: 'Alice' },
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'Start verification' }))
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  expect(
+    screen.getByRole('button', { name: 'Start verification' })
+  ).toBeDisabled()
+  expect(screen.getByRole('alert')).toHaveTextContent(
+    'Too many requests. Please wait before trying again.'
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(30_000)
+  })
+  expect(post).toHaveBeenCalledTimes(1)
+  fireEvent.click(screen.getByRole('button', { name: 'Start verification' }))
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  expect(post).toHaveBeenCalledTimes(2)
+  expect(post.mock.calls[1][1]).toEqual(post.mock.calls[0][1])
+})
+
+test('the final expiry check respects the server cooldown and discovers a binding in progress', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
+  const created = vi.fn()
+  const pending = {
+    Name: 'Alice',
+    Status: 'pending',
+    CanPoll: true,
+    ExpiresAt: Date.now() / 1000 + 5,
+  }
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [{ ...pending, SessionId: 'validation-na-one' }],
+    },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          ...pending,
+          BytedToken: 'validation-na-one',
+          H5Link: 'https://verify.example/face',
+          NextPollAt: Date.now() / 1000 + 30,
+        },
+      },
+    })
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          ...pending,
+          Status: 'verifying',
+          BytedToken: 'validation-na-one',
+        },
+      },
+    })
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          ...pending,
+          Status: 'created',
+          CanPoll: false,
+          BytedToken: 'validation-na-one',
+          GroupId: 'group-na-person',
+        },
+      },
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={created}
+      />
+    </QueryClientProvider>
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue verification for Alice' })
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(29_999)
+  })
+  expect(
+    screen.queryByRole('button', { name: 'Open verification' })
+  ).not.toBeInTheDocument()
+  expect(post).toHaveBeenCalledTimes(1)
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1)
+  })
+  expect(post).toHaveBeenCalledTimes(2)
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10_000)
+  })
+  expect(created).toHaveBeenCalledExactlyOnceWith('group-na-person')
+})
+
+test('a failed final expiry check pauses automatically until manual recovery', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
+  const pending = {
+    Name: 'Alice',
+    Status: 'pending',
+    CanPoll: true,
+    ExpiresAt: Date.now() / 1000 + 5,
+  }
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [{ ...pending, SessionId: 'validation-na-one' }],
+    },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: { ...pending, BytedToken: 'validation-na-one' },
+      },
+    })
+    .mockRejectedValueOnce(new Error('Connection interrupted'))
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue verification for Alice' })
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5_000)
+  })
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5_000)
+  })
+  expect(post).toHaveBeenCalledTimes(2)
+  expect(
+    screen.getByText(
+      'Automatic checks paused. You can check this verification again.'
+    )
+  ).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Check verification' })
+  ).toBeDisabled()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(10_000)
+  })
+  expect(
+    screen.getByRole('button', { name: 'Check verification' })
+  ).toBeEnabled()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000)
+  })
+  expect(post).toHaveBeenCalledTimes(2)
+})
+
+test('closing a verification cancels its scheduled final expiry check', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
+  const pending = {
+    Name: 'Alice',
+    Status: 'pending',
+    CanPoll: true,
+    ExpiresAt: Date.now() / 1000 + 5,
+  }
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [{ ...pending, SessionId: 'validation-na-one' }],
+    },
+  })
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...pending, BytedToken: 'validation-na-one' },
+    },
+  })
+  const view = render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue verification for Alice' })
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5_000)
+  })
+  view.unmount()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000)
+  })
+  expect(post).toHaveBeenCalledTimes(1)
+})
+
+test('a definite verification creation failure retains its error presentation', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        BytedToken: 'validation-na-one',
+        Name: 'Alice',
+        Status: 'failed',
+        CanPoll: false,
+        ExpiresAt: Date.now() / 1000 + 1800,
+        Error: {
+          Code: 'InvalidParameter',
+          Message: 'The callback address was rejected',
+        },
+      },
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await user.type(screen.getByLabelText('Name'), 'Alice')
+  await user.click(screen.getByRole('button', { name: 'Start verification' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'InvalidParameter: The callback address was rejected'
+  )
+  expect(post).toHaveBeenCalledTimes(1)
 })

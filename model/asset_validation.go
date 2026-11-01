@@ -280,10 +280,12 @@ func ReserveAssetValidationSession(ctx context.Context, session *AssetValidation
 	return created, err
 }
 
-func SaveAssetValidationAttempt(ctx context.Context, session *AssetValidationSession) error {
+func SaveAssetValidationAttempt(ctx context.Context, session *AssetValidationSession, minimumDelaySeconds int64) error {
+	now := time.Now().Unix()
+	nextPollAt := max(session.NextPollAt, now+max(5, minimumDelaySeconds))
 	values := map[string]any{"status": session.Status, "secret_cipher": session.SecretCipher, "resource_possible": session.ResourcePossible,
 		"error_code": session.ErrorCode, "error_message": session.ErrorMessage, "lease_token": "", "lease_expires_at": 0,
-		"next_poll_at": time.Now().Add(5 * time.Second).Unix(), "updated_at": time.Now().Unix()}
+		"next_poll_at": nextPollAt, "updated_at": now}
 	result := protectedAssetDB(ctx).Model(&AssetValidationSession{}).Where("id = ? AND lease_token = ?", session.ID, session.LeaseToken).Updates(values)
 	if result.Error != nil {
 		return result.Error
@@ -293,6 +295,8 @@ func SaveAssetValidationAttempt(ctx context.Context, session *AssetValidationSes
 	}
 	session.LeaseToken = ""
 	session.LeaseExpiresAt = 0
+	session.NextPollAt = nextPollAt
+	session.UpdatedAt = now
 	return nil
 }
 
@@ -330,7 +334,10 @@ func ClaimAssetValidationResult(ctx context.Context, session *AssetValidationSes
 		session.LeaseToken = common.GetUUID()
 		session.LeaseExpiresAt = now + 90
 		session.Status = AssetValidationVerifying
-		result := tx.Model(session).Updates(map[string]any{"lease_token": session.LeaseToken, "lease_expires_at": session.LeaseExpiresAt, "status": session.Status, "updated_at": now})
+		// Keep the previous attempt's timestamps in memory for the next backoff;
+		// GORM would overwrite UpdatedAt if this update used session as its model.
+		result := tx.Model(&AssetValidationSession{}).Where("id = ?", session.ID).
+			Updates(map[string]any{"lease_token": session.LeaseToken, "lease_expires_at": session.LeaseExpiresAt, "status": session.Status, "updated_at": now})
 		claimed = result.Error == nil && result.RowsAffected == 1
 		return result.Error
 	})
@@ -404,7 +411,7 @@ func CompleteAssetValidationSession(ctx context.Context, session *AssetValidatio
 		if err = tx.Create(&replica).Error; err != nil {
 			return err
 		}
-		if err = tx.Model(&current).Updates(map[string]any{"group_id": group.PublicID, "status": AssetValidationCreated, "secret_cipher": "", "error_code": "", "error_message": "", "lease_token": "", "lease_expires_at": 0, "updated_at": time.Now().Unix()}).Error; err != nil {
+		if err = tx.Model(&current).Updates(map[string]any{"group_id": group.PublicID, "status": AssetValidationCreated, "secret_cipher": "", "error_code": "", "error_message": "", "lease_token": "", "lease_expires_at": 0, "next_poll_at": 0, "updated_at": time.Now().Unix()}).Error; err != nil {
 			return err
 		}
 		session.GroupID = group.PublicID
@@ -412,6 +419,7 @@ func CompleteAssetValidationSession(ctx context.Context, session *AssetValidatio
 		session.SecretCipher = ""
 		session.ErrorCode, session.ErrorMessage = "", ""
 		session.LeaseToken, session.LeaseExpiresAt = "", 0
+		session.NextPollAt = 0
 		return nil
 	})
 }

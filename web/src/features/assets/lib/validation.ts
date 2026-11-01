@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { convertDetectedLanguage } from '@/i18n/languages'
+import { getServerErrorSources } from '@/lib/server-error-message'
 
 // The provider supports three H5 languages. Other console languages use English.
 export function assetValidationH5Link(
@@ -36,4 +37,27 @@ export function assetValidationH5Link(
   } catch {
     return ''
   }
+}
+
+// Keep the server's cooldown when a transport failure bypasses the session view.
+export function assetValidationRetryAt(error: unknown, now: number): number {
+  for (const source of getServerErrorSources(error)) {
+    const response = source.response as
+      | { headers?: Record<string, unknown> }
+      | undefined
+    const headers = response?.headers
+    const raw = headers?.['retry-after'] ?? headers?.['Retry-After']
+    if (typeof raw !== 'string' && typeof raw !== 'number') continue
+    const value = String(raw).trim()
+    let timestamp = 0
+    if (/^\d+$/.test(value)) {
+      timestamp = now + Number(value) * 1000
+    } else if (/^[a-z]/i.test(value)) {
+      timestamp = Date.parse(value)
+    }
+    if (Number.isFinite(timestamp) && timestamp > now && timestamp <= 8.64e15) {
+      return timestamp
+    }
+  }
+  return 0
 }

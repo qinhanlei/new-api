@@ -126,6 +126,7 @@ func TestAssetValidationLifecycle(t *testing.T) {
 			created, err := CreateAssetValidationSession(t.Context(), actor, input)
 			require.NoError(t, err)
 			assert.Equal(t, "pending", created.Status)
+			assert.True(t, created.CanPoll)
 			assert.True(t, strings.HasPrefix(created.BytedToken, "validation-na-"))
 			assert.NotEqual(t, "upstream-portrait-token", created.BytedToken)
 			assert.Equal(t, callback, created.CallbackURL)
@@ -163,6 +164,10 @@ func TestAssetValidationLifecycle(t *testing.T) {
 			ready, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
 			require.NoError(t, err)
 			assert.Equal(t, "created", ready.Status)
+			assert.False(t, ready.CanPoll)
+			encoded, err = common.Marshal(ready)
+			require.NoError(t, err)
+			assert.Contains(t, string(encoded), `"CanPoll":false`)
 			assert.True(t, strings.HasPrefix(ready.GroupID, model.AssetGroupIDPrefix))
 			assert.Empty(t, ready.H5Link)
 			group, err := model.GetAssetGroup(t.Context(), 1, ready.GroupID, "default")
@@ -263,6 +268,7 @@ func TestAssetValidationPersistsResultBeforeBinding(t *testing.T) {
 	unknown, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
 	require.NoError(t, err)
 	assert.Equal(t, "unknown", unknown.Status)
+	assert.True(t, unknown.CanPoll)
 	row, err := model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
 	require.NoError(t, err)
 	assert.Equal(t, "upstream-human-group", row.UpstreamGroupID)
@@ -271,6 +277,10 @@ func TestAssetValidationPersistsResultBeforeBinding(t *testing.T) {
 	require.NoError(t, err)
 	assert.NoError(t, ValidateAssetValidationCallback(t.Context(), strings.TrimPrefix(callback.Path, assetValidationCallbackPath), "upstream-portrait-token"), "a persisted result keeps the phone return page usable while binding is retried")
 	require.NoError(t, model.DB.Model(row).Update("expires_at", time.Now().Add(-time.Minute).Unix()).Error)
+	list, err := ListAssetValidationSessions(t.Context(), actor, "default")
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.True(t, list[0].CanPoll, "a saved group remains recoverable after the H5 link expires")
 	// A different process can continue with the durable GroupId after the H5
 	// credential and even the old encryption key have expired or been rotated.
 	common.CryptoSecret = "another-application-secret"
@@ -293,6 +303,7 @@ func TestAssetValidationDoesNotReplayUncertainCreate(t *testing.T) {
 	view, err := CreateAssetValidationSession(t.Context(), actor, input)
 	require.NoError(t, err)
 	assert.Equal(t, "unknown", view.Status)
+	assert.False(t, view.CanPoll)
 	assert.Empty(t, view.H5Link)
 	repeated, err := CreateAssetValidationSession(t.Context(), actor, input)
 	require.NoError(t, err)
@@ -324,6 +335,7 @@ func TestAssetValidationExpiryAndIsolation(t *testing.T) {
 	expired, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
 	require.NoError(t, err)
 	assert.Equal(t, "expired", expired.Status)
+	assert.False(t, expired.CanPoll)
 	assert.Empty(t, expired.H5Link)
 	assert.Zero(t, (*calls)["GetVisualValidateResult"])
 	require.NoError(t, model.DB.First(row, row.ID).Error)
@@ -359,6 +371,7 @@ func TestAssetValidationRateAndLeaseFences(t *testing.T) {
 	busy, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
 	require.NoError(t, err)
 	assert.Equal(t, "verifying", busy.Status)
+	assert.True(t, busy.CanPoll, "an active lease must not stop clients from checking for completion")
 	assert.Zero(t, (*calls)["GetVisualValidateResult"])
 	require.NoError(t, model.DB.Model(row).Update("lease_expires_at", time.Now().Add(-time.Minute).Unix()).Error)
 	allowAssetValidationPoll(t, created.BytedToken)
@@ -366,7 +379,7 @@ func TestAssetValidationRateAndLeaseFences(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 	assert.ErrorIs(t, model.SaveAssetValidationGroupID(t.Context(), &stale, "stale-group"), model.ErrAssetConflict)
-	assert.ErrorIs(t, model.SaveAssetValidationAttempt(t.Context(), &stale), model.ErrAssetConflict)
+	assert.ErrorIs(t, model.SaveAssetValidationAttempt(t.Context(), &stale, 0), model.ErrAssetConflict)
 }
 
 func TestAssetValidationBearerRateScope(t *testing.T) {
@@ -563,6 +576,13 @@ func TestAssetValidationUsesApplicationSecret(t *testing.T) {
 			var failure *AssetError
 			require.ErrorAs(t, err, &failure)
 			assert.Equal(t, "ValidationSecretUnavailable", failure.Code)
+			allowAssetValidationPoll(t, created.BytedToken)
+			unavailable, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+			require.NoError(t, err)
+			assert.False(t, unavailable.CanPoll)
+			assert.Empty(t, unavailable.H5Link)
+			require.NotNil(t, unavailable.Error)
+			assert.Equal(t, "ValidationSecretUnavailable", unavailable.Error.Code)
 			common.CryptoSecret = tc.applicationKey
 
 			otherSession := *row
@@ -617,7 +637,8 @@ func TestAssetValidationRejectsMismatchedUpstreamGroup(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, "unknown", result.Status)
 			require.NotNil(t, result.Error)
-			assert.Equal(t, "UpstreamInvalidResponse", result.Error.Code)
+			assert.Equal(t, "ValidationGroupMismatch", result.Error.Code)
+			assert.False(t, result.CanPoll)
 			var count int64
 			require.NoError(t, model.DB.Model(&model.AssetGroup{}).Count(&count).Error)
 			assert.Zero(t, count)
@@ -645,6 +666,7 @@ func TestAssetValidationRedactsPendingErrors(t *testing.T) {
 	result, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
 	require.NoError(t, err)
 	assert.Equal(t, "pending", result.Status)
+	assert.True(t, result.CanPoll, "an undocumented business error is not a final verification decision")
 	require.NotNil(t, result.Error)
 	assert.NotContains(t, result.Error.Message, "upstream-portrait-token")
 	assert.NotContains(t, result.Error.Message, state)
@@ -654,4 +676,172 @@ func TestAssetValidationRedactsPendingErrors(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(encoded), "upstream-portrait-token")
 	assert.NotContains(t, string(encoded), state)
+}
+
+func TestAssetValidationWaitingClearsPreviousErrors(t *testing.T) {
+	actor, input := assetValidationFixture(t)
+	calls := assetValidationUpstream(t, "", func(action string, _ map[string]any) (int, any) {
+		if action == "GetVisualValidateResult" {
+			return http.StatusOK, map[string]any{"Result": map[string]any{"GroupId": ""}}
+		}
+		return 0, nil
+	})
+	created, err := CreateAssetValidationSession(t.Context(), actor, input)
+	require.NoError(t, err)
+	row, err := model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(row).Updates(map[string]any{"error_code": "ValidationPending", "error_message": "Human verification has not completed"}).Error)
+	list, err := ListAssetValidationSessions(t.Context(), actor, "default")
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Nil(t, list[0].Error, "old waiting records are not presented as failures")
+	cached, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+	require.NoError(t, err)
+	assert.Nil(t, cached.Error)
+	require.NoError(t, model.DB.Model(row).Updates(map[string]any{"error_code": "InvalidParameter", "error_message": "A previous query failed"}).Error)
+	allowAssetValidationPoll(t, created.BytedToken)
+	view, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+	require.NoError(t, err)
+	assert.Equal(t, "pending", view.Status)
+	assert.True(t, view.CanPoll)
+	assert.Nil(t, view.Error)
+	assert.Empty(t, view.GroupID)
+	assert.Zero(t, (*calls)["GetAssetGroup"])
+	require.NoError(t, model.DB.First(row, row.ID).Error)
+	assert.Empty(t, row.ErrorCode)
+	assert.Empty(t, row.ErrorMessage)
+	assert.Equal(t, row.UpdatedAt+5, view.NextPollAt)
+	assert.Equal(t, row.NextPollAt, view.NextPollAt)
+	list, err = ListAssetValidationSessions(t.Context(), actor, "default")
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, view.NextPollAt, list[0].NextPollAt)
+	assert.Equal(t, view.CanPoll, list[0].CanPoll)
+}
+
+func TestAssetValidationRejectsInvalidGroupIDWithoutBinding(t *testing.T) {
+	for _, tc := range []struct{ name, id string }{
+		{"surrounding whitespace", " upstream-human-group"},
+		{"overlong ID", strings.Repeat("x", 192)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actor, input := assetValidationFixture(t)
+			invalid := true
+			calls := assetValidationUpstream(t, "", func(action string, _ map[string]any) (int, any) {
+				if action == "GetVisualValidateResult" && invalid {
+					return http.StatusOK, map[string]any{"Result": map[string]any{"GroupId": tc.id}}
+				}
+				return 0, nil
+			})
+			created, err := CreateAssetValidationSession(t.Context(), actor, input)
+			require.NoError(t, err)
+			allowAssetValidationPoll(t, created.BytedToken)
+			view, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+			require.NoError(t, err)
+			require.NotNil(t, view.Error)
+			assert.Equal(t, "InvalidValidationGroup", view.Error.Code)
+			assert.False(t, view.CanPoll)
+			assert.Empty(t, view.GroupID)
+			assert.Zero(t, (*calls)["GetAssetGroup"])
+			invalid = false
+			allowAssetValidationPoll(t, created.BytedToken)
+			ready, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+			require.NoError(t, err)
+			assert.Equal(t, "created", ready.Status, "manual recovery can reuse the original session after the upstream is repaired")
+			assert.Equal(t, 1, (*calls)["CreateVisualValidateSession"])
+		})
+	}
+}
+
+func TestAssetValidationPersistsPollingBackoff(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusBadRequest, http.StatusBadGateway, http.StatusOK} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			actor, input := assetValidationFixture(t)
+			failing := true
+			calls := assetValidationUpstream(t, "", func(action string, _ map[string]any) (int, any) {
+				if action == "GetVisualValidateResult" && failing {
+					if status == http.StatusOK {
+						return status, "invalid result envelope"
+					}
+					return status, map[string]any{"ResponseMetadata": map[string]any{"Error": dto.AssetFailure{Code: "InvalidParameter", Message: "liveness verification failed"}}}
+				}
+				return 0, nil
+			})
+			created, err := CreateAssetValidationSession(t.Context(), actor, input)
+			require.NoError(t, err)
+			row, err := model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
+			require.NoError(t, err)
+			for _, delay := range []int64{10, 20, 40, 60, 60} {
+				previousDelay := row.NextPollAt - row.UpdatedAt
+				past := time.Now().Add(-time.Second).Unix()
+				require.NoError(t, model.DB.Model(row).Updates(map[string]any{"next_poll_at": past, "updated_at": past - previousDelay}).Error)
+				require.NoError(t, model.DB.Model(&model.AssetValidationRateWindow{}).Where("1 = 1").Update("next_call_at", 0).Error)
+				view, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+				require.NoError(t, err)
+				assert.Equal(t, "pending", view.Status)
+				assert.True(t, view.CanPoll)
+				require.NotNil(t, view.Error)
+				if status == http.StatusOK {
+					assert.Equal(t, "UpstreamInvalidResponse", view.Error.Code, "a temporarily invalid response remains recoverable")
+				} else {
+					assert.Equal(t, "InvalidParameter", view.Error.Code)
+				}
+				require.NoError(t, model.DB.First(row, row.ID).Error)
+				assert.Equal(t, row.UpdatedAt+delay, view.NextPollAt)
+				assert.Equal(t, row.NextPollAt, view.NextPollAt)
+				before := (*calls)["GetVisualValidateResult"]
+				cached, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+				require.NoError(t, err)
+				assert.Equal(t, view, cached, "a reopened client sees the same durable backoff")
+				assert.Equal(t, before, (*calls)["GetVisualValidateResult"], "early checks do not hit the upstream")
+			}
+			failing = false
+			allowAssetValidationPoll(t, created.BytedToken)
+			ready, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+			require.NoError(t, err)
+			assert.Equal(t, "created", ready.Status)
+			assert.False(t, ready.CanPoll)
+			assert.Nil(t, ready.Error)
+		})
+	}
+}
+
+func TestAssetValidationHonorsUpstreamRetryAfter(t *testing.T) {
+	deadline := time.Date(2099, time.January, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, header string
+		minimum      int64
+	}{
+		{"seconds", "120", 120},
+		{"HTTP date", deadline.Format(http.TimeFormat), 0},
+		{"malformed", "soon", 10},
+		{"overflow", "9999999999999999999999999", 10},
+		{"negative", "-5", 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actor, input := assetValidationFixture(t)
+			assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
+			created, err := CreateAssetValidationSession(t.Context(), actor, input)
+			require.NoError(t, err)
+			httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+				assert.Equal(t, "GetVisualValidateResult", request.URL.Query().Get("Action"))
+				return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{"Retry-After": []string{tc.header}}, Body: io.NopCloser(strings.NewReader(`{"error":"busy"}`)), Request: request}, nil
+			})
+			allowAssetValidationPoll(t, created.BytedToken)
+			before := time.Now().Unix()
+			view, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+			require.NoError(t, err)
+			require.NotNil(t, view.Error)
+			assert.True(t, view.CanPoll)
+			row, err := model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
+			require.NoError(t, err)
+			assert.Equal(t, row.NextPollAt, view.NextPollAt)
+			if tc.minimum == 0 {
+				assert.Equal(t, deadline.Unix(), view.NextPollAt)
+			} else {
+				assert.GreaterOrEqual(t, view.NextPollAt, before+tc.minimum)
+				assert.LessOrEqual(t, view.NextPollAt, time.Now().Unix()+tc.minimum)
+			}
+		})
+	}
 }
