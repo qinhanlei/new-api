@@ -37,6 +37,9 @@ func assetMutationRateLimit() gin.HandlerFunc {
 		switch c.Query("Action") {
 		case "GetAsset", "GetAssetGroup", "ListAssets", "ListAssetGroups":
 			// These POST actions are reads, including normal status polling.
+		case "GetVisualValidateResult":
+			// Verification polling has durable per-session and credential limits.
+			// It still requires asset:write because completion binds a local group.
 		default:
 			limit(c)
 		}

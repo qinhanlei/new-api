@@ -168,6 +168,8 @@ HTTP 回调会明文传输 `BytedToken`，生产环境应使用 HTTPS。本站�
 
 后台使用相同 Action 的 `/api/assets/actions` 接口。创建和 `GetVisualValidateResult` 均要求 `asset:write`，代其他用户操作还要求管理员身份及 `user:write`；查询安全会话摘要使用 `GET /api/assets/validation/sessions?project_name=default`，可带 `user_id`，要求 `asset:read`（跨用户另需 `user:read`）。会话只对原发起者可见。没有可复核身份的旧式管理令牌不能发起真人认证。
 
+控制台认证结果查询使用上述认证专用节流，不消耗素材写操作额度，避免持续查询阻塞开始认证或重命名。创建认证、重命名、上传和删除等操作仍受素材写操作限流保护。
+
 服务端先持久保存已取得的上游 GroupId，再查询组信息并绑定本地 ID。已有 GroupId 时，即使 H5 凭证过期，也可以在原授权仍有效时继续绑定。若尚未取得 GroupId 就超时或丢失响应，只保留待核实状态，不按名称猜测远端组或重新认证；过期凭证会被清除，但可能存在远端资源的会话继续保护渠道账号和密钥配置。此类记录需管理员在上游人工核实，当前没有自动释放未知资源保护的接口。
 
 ### 真人组删除

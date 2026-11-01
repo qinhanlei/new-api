@@ -67,7 +67,7 @@ func TestAssetActionsKeepArkErrorsAndDoNotShadowVideoRoutes(t *testing.T) {
 
 func TestAssetPollingDoesNotConsumeMutationRateLimit(t *testing.T) {
 	previousEnabled, previousLimit, previousRedis := common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.RedisEnabled
-	common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.RedisEnabled = true, 1, false
+	common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.RedisEnabled = true, 2, false
 	t.Cleanup(func() {
 		common.CriticalRateLimitEnable = previousEnabled
 		common.CriticalRateLimitNum = previousLimit
@@ -80,12 +80,18 @@ func TestAssetPollingDoesNotConsumeMutationRateLimit(t *testing.T) {
 		status int
 	}{
 		{"ListAssets", http.StatusOK}, {"GetAsset", http.StatusOK},
-		{"CreateAsset", http.StatusOK}, {"CreateAsset", http.StatusTooManyRequests},
-		{"ListAssets", http.StatusOK},
+		{"GetVisualValidateResult", http.StatusOK}, {"GetVisualValidateResult", http.StatusOK},
+		{"CreateVisualValidateSession", http.StatusOK}, {"GetVisualValidateResult", http.StatusOK},
+		{"UpdateAssetGroup", http.StatusOK}, {"CreateAsset", http.StatusTooManyRequests},
+		{"UpdateAssetGroup", http.StatusTooManyRequests},
+		{"ListAssets", http.StatusOK}, {"GetVisualValidateResult", http.StatusOK},
 	} {
 		response := httptest.NewRecorder()
 		engine.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/actions?Action="+tc.action, nil))
 		assert.Equal(t, tc.status, response.Code, tc.action)
+		if tc.status == http.StatusTooManyRequests {
+			assert.NotEmpty(t, response.Header().Get("Retry-After"), tc.action)
+		}
 	}
 }
 
