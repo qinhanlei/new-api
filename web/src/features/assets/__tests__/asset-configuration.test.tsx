@@ -31,13 +31,12 @@ import { toast } from 'sonner'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { channelSchema } from '@/features/channels/types'
-import { SettingsPageProvider } from '@/features/system-settings/components/settings-page-context'
-import { AssetStorageSection } from '@/features/system-settings/operations/asset-storage-section'
 import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { assetQueryKeys } from '../api'
 import { AssetChannelSettingsDialog } from '../components/asset-channel-settings-dialog'
+import { AssetStorageSettingsDialog } from '../components/asset-storage-settings-dialog'
 import type {
   AssetChannelConfig,
   AssetChannelUpdate,
@@ -71,13 +70,13 @@ let channelConfigs: Record<number, AssetChannelConfig>
 let client: QueryClient
 
 function StorageFixture() {
-  const [container, setContainer] = useState<HTMLDivElement | null>(null)
+  const [open, setOpen] = useState(true)
   return (
     <>
-      <div ref={setContainer} />
-      <SettingsPageProvider actionsContainer={container}>
-        <AssetStorageSection />
-      </SettingsPageProvider>
+      <button type='button' onClick={() => setOpen(true)}>
+        Storage settings
+      </button>
+      {open && <AssetStorageSettingsDialog onClose={() => setOpen(false)} />}
     </>
   )
 }
@@ -625,7 +624,7 @@ test('saving storage needs no verification and preserves a saved secret when bla
   expect(screen.getByLabelText('Secret key')).toHaveValue('')
   await user.clear(bucket)
   await user.type(bucket, 'new-assets')
-  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await user.click(screen.getByRole('button', { name: 'Save' }))
   await waitFor(() => expect(put).toHaveBeenCalledOnce())
   expect(put).toHaveBeenCalledWith(
     '/api/option/asset_storage',
@@ -642,9 +641,11 @@ test('saving storage needs no verification and preserves a saved secret when bla
     expect.not.objectContaining({ singleUseAuthorization: true })
   )
   expect(api.post).not.toHaveBeenCalled()
-  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('dialog', { name: 'Verify to view saved secret' })
+  ).not.toBeInTheDocument()
   await waitFor(() =>
-    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
   )
 })
 
@@ -669,9 +670,155 @@ test('connection testing needs no verification and keeps unsaved configuration',
     )
   )
   expect(api.post).toHaveBeenCalledOnce()
-  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('dialog', { name: 'Verify to view saved secret' })
+  ).not.toBeInTheDocument()
   expect(screen.getByLabelText('Secret key')).toHaveValue('replacement-secret')
-  expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled()
+  expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+})
+
+test('closing dirty storage preserves a cancelled draft and discarding clears it on reopen', async () => {
+  const user = userEvent.setup()
+  render(
+    <QueryClientProvider client={client}>
+      <StorageFixture />
+    </QueryClientProvider>
+  )
+  await user.type(await screen.findByLabelText('Secret key'), 'draft-secret')
+  await user.keyboard('{Escape}')
+  await user.click(await screen.findByRole('button', { name: 'Cancel' }))
+  expect(screen.getByLabelText('Secret key')).toHaveValue('draft-secret')
+  await user.keyboard('{Escape}')
+  await user.click(
+    await screen.findByRole('button', { name: 'Discard changes' })
+  )
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  await user.click(screen.getByRole('button', { name: 'Storage settings' }))
+  expect(await screen.findByLabelText('Secret key')).toHaveValue('')
+  expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+})
+
+test('reopening storage waits for the current configuration before initializing the form', async () => {
+  const user = userEvent.setup()
+  render(
+    <QueryClientProvider client={client}>
+      <StorageFixture />
+    </QueryClientProvider>
+  )
+  expect(await screen.findByLabelText('Bucket')).toHaveValue('assets')
+  await user.keyboard('{Escape}')
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  let finish!: (value: Awaited<ReturnType<typeof api.get>>) => void
+  vi.mocked(api.get).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve
+      })
+  )
+  await user.click(screen.getByRole('button', { name: 'Storage settings' }))
+  expect(screen.getByRole('dialog', { name: 'Storage settings' })).toBeVisible()
+  expect(screen.queryByLabelText('Bucket')).not.toBeInTheDocument()
+  await act(async () =>
+    finish({
+      data: {
+        success: true,
+        data: { ...config, bucket: 'latest-assets', revision: 3 },
+      },
+    })
+  )
+  expect(await screen.findByLabelText('Bucket')).toHaveValue('latest-assets')
+  expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+})
+
+test.each(['save', 'test'] as const)(
+  'a pending storage %s prevents closing and duplicate submissions',
+  async (operation) => {
+    const user = userEvent.setup()
+    const close = vi.fn()
+    let finish!: (value: Awaited<ReturnType<typeof api.put>>) => void
+    const request =
+      operation === 'save' ? vi.spyOn(api, 'put') : vi.mocked(api.post)
+    request.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve
+        })
+    )
+    render(
+      <QueryClientProvider client={client}>
+        <AssetStorageSettingsDialog onClose={close} />
+      </QueryClientProvider>
+    )
+    await user.type(await screen.findByLabelText('Secret key'), 'draft-secret')
+    await user.click(
+      screen.getByRole('button', {
+        name: operation === 'save' ? 'Save' : 'Test Connection',
+      })
+    )
+    await waitFor(() => expect(request).toHaveBeenCalledOnce())
+    expect(screen.getByLabelText('Bucket')).toBeDisabled()
+    expect(
+      screen.getByRole('button', { name: 'Test Connection' })
+    ).toBeDisabled()
+    expect(
+      screen.getByRole('button', {
+        name: operation === 'save' ? 'Saving...' : 'Save',
+      })
+    ).toBeDisabled()
+    for (const button of screen.getAllByRole('button', { name: 'Close' })) {
+      await user.click(button)
+    }
+    await user.keyboard('{Escape}')
+    expect(close).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    await act(async () =>
+      finish({ data: { success: true, data: { ...config, revision: 3 } } })
+    )
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Test Connection' })
+      ).toBeEnabled()
+    )
+    expect(screen.getByLabelText('Secret key')).toHaveValue(
+      operation === 'save' ? '' : 'draft-secret'
+    )
+  }
+)
+
+test('storage load failures can be retried and a pending reload can be closed', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockRejectedValueOnce(new Error('Storage is unavailable'))
+  render(
+    <QueryClientProvider client={client}>
+      <StorageFixture />
+    </QueryClientProvider>
+  )
+  expect(await screen.findByText('Storage is unavailable')).toBeVisible()
+  expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Retry' }))
+  await screen.findByLabelText('Bucket')
+  await user.keyboard('{Escape}')
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  let finish!: (value: Awaited<ReturnType<typeof api.get>>) => void
+  vi.mocked(api.get).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve
+      })
+  )
+  await user.click(screen.getByRole('button', { name: 'Storage settings' }))
+  expect(screen.getByRole('dialog', { name: 'Storage settings' })).toBeVisible()
+  await user.keyboard('{Escape}')
+  await act(async () => finish({ data: { success: true, data: config } }))
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
 })
 
 test('editing a listed channel loads only its settings and saving returns to the list', async () => {
@@ -1423,7 +1570,7 @@ test('storage errors preserve unsaved secrets and an invalid endpoint prevents s
   const endpoint = await screen.findByLabelText('S3 endpoint')
   await user.clear(endpoint)
   await user.type(endpoint, 'ftp://invalid.example.com')
-  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await user.click(screen.getByRole('button', { name: 'Save' }))
   expect(
     await screen.findByText('Storage endpoint must be an HTTP or HTTPS origin')
   ).toBeVisible()
@@ -1431,10 +1578,10 @@ test('storage errors preserve unsaved secrets and an invalid endpoint prevents s
   await user.clear(endpoint)
   await user.type(endpoint, 'https://replacement.example.com')
   await user.type(screen.getByLabelText('Secret key'), 'new-secret')
-  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await user.click(screen.getByRole('button', { name: 'Save' }))
   await waitFor(() => expect(put).toHaveBeenCalledOnce())
   await waitFor(() =>
-    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
   )
   expect(screen.getByLabelText('Secret key')).toHaveValue('new-secret')
   expect(endpoint).toHaveValue('https://replacement.example.com')
@@ -1456,7 +1603,7 @@ test('legacy storage keeps its addressing mode and exposes all settings', async 
     screen.getByRole('switch', { name: 'Use path-style addressing' })
   ).toBeChecked()
   expect(screen.queryByText('Advanced settings')).not.toBeInTheDocument()
-  expect(screen.getByRole('button', { name: 'Save Changes' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
 })
 
 test('provider selection applies defaults while allowing a manual override', async () => {
@@ -1594,8 +1741,8 @@ test('storage fields use a responsive address row and a shared credential row', 
   const endpoint = await screen.findByLabelText('S3 endpoint')
   const endpointField = endpoint.closest('[data-slot="form-item"]')
   const addressRow = endpointField?.parentElement
-  expect(addressRow).toHaveClass('grid', 'lg:grid-cols-4')
-  expect(endpointField).toHaveClass('lg:col-span-2')
+  expect(addressRow).toHaveClass('grid', 'sm:grid-cols-4')
+  expect(endpointField).toHaveClass('sm:col-span-2')
   expect(addressRow).toContainElement(screen.getByLabelText('Region'))
   expect(addressRow).toContainElement(screen.getByLabelText('Bucket'))
   const accessField = screen
@@ -1605,7 +1752,7 @@ test('storage fields use a responsive address row and a shared credential row', 
     .getByLabelText('Secret key')
     .closest('[data-slot="form-item"]')
   expect(accessField?.parentElement).toBe(secretField?.parentElement)
-  expect(accessField?.parentElement).toHaveClass('grid', 'lg:grid-cols-2')
+  expect(accessField?.parentElement).toHaveClass('grid', 'sm:grid-cols-2')
 })
 
 test('a saved provider preserves its override and keyboard selection persists the new provider', async () => {
@@ -1635,7 +1782,7 @@ test('a saved provider preserves its override and keyboard selection persists th
   await user.click(provider)
   await user.keyboard('{End}{Enter}')
   expect(provider).toHaveTextContent('Oracle Cloud OCI')
-  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await user.click(screen.getByRole('button', { name: 'Save' }))
   await waitFor(() =>
     expect(put).toHaveBeenCalledWith(
       '/api/option/asset_storage',
@@ -1644,7 +1791,7 @@ test('a saved provider preserves its override and keyboard selection persists th
     )
   )
   await waitFor(() =>
-    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
   )
   expect(provider).toHaveTextContent('Oracle Cloud OCI')
 })

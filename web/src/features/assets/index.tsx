@@ -17,8 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
-import { Link } from '@tanstack/react-router'
-import { useId, useState } from 'react'
+import { useId, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { EmptyState } from '@/components/empty-state'
@@ -41,6 +40,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import { assetQueryKeys, getAssetConfig } from './api'
 import { AssetBrowser } from './components/asset-browser'
 import { AssetChannelSettingsDialog } from './components/asset-channel-settings-dialog'
+import { AssetStorageSettingsDialog } from './components/asset-storage-settings-dialog'
 import type { AssetScope } from './types'
 
 export function Assets() {
@@ -61,6 +61,8 @@ export function Assets() {
       ADMIN_PERMISSION_ACTIONS.SENSITIVE_WRITE
     )
   const [channelsOpen, setChannelsOpen] = useState(false)
+  const [storageOpen, setStorageOpen] = useState(false)
+  const storageTrigger = useRef<HTMLButtonElement>(null)
   const [filters, setFilters] = useState<{
     project: string
     scope: AssetScope
@@ -84,13 +86,9 @@ export function Assets() {
       )}
       {user?.role === ROLE.SUPER_ADMIN && (
         <Button
+          ref={storageTrigger}
           variant='outline'
-          render={
-            <Link
-              to='/system-settings/operations/$section'
-              params={{ section: 'assets' }}
-            />
-          }
+          onClick={() => setStorageOpen(true)}
         >
           {t('Storage settings')}
         </Button>
@@ -213,6 +211,13 @@ export function Assets() {
       )}
       {channelsOpen && canConfigureChannels && (
         <AssetChannelSettingsDialog onClose={() => setChannelsOpen(false)} />
+      )}
+      {storageOpen && user?.role === ROLE.SUPER_ADMIN && (
+        <AssetStorageSettingsDialog
+          key={user.id}
+          onClose={() => setStorageOpen(false)}
+          finalFocus={storageTrigger}
+        />
       )}
     </>
   )

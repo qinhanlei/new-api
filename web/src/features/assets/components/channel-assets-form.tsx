@@ -47,10 +47,6 @@ import type {
 } from '@/features/assets/types'
 import { isMultiKeyChannel } from '@/features/channels/lib'
 import type { Channel } from '@/features/channels/types'
-import {
-  SettingsSwitchContent,
-  SettingsSwitchItem,
-} from '@/features/system-settings/components/settings-form-layout'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { AssetSecretInput } from './asset-secret-input'
@@ -184,10 +180,10 @@ export function ChannelAssetsForm(props: {
                 control={form.control}
                 name='enabled'
                 render={({ field }) => (
-                  <SettingsSwitchItem>
-                    <SettingsSwitchContent>
+                  <FormItem className='flex min-w-0 items-center justify-between gap-4 py-2.5'>
+                    <div className='min-w-0 space-y-0.5'>
                       <FormLabel>{t('Enable asset library')}</FormLabel>
-                    </SettingsSwitchContent>
+                    </div>
                     <FormControl>
                       <Switch
                         checked={field.value}
@@ -196,7 +192,7 @@ export function ChannelAssetsForm(props: {
                       />
                     </FormControl>
                     <FormMessage />
-                  </SettingsSwitchItem>
+                  </FormItem>
                 )}
               />
               <FormField
@@ -303,15 +299,15 @@ export function ChannelAssetsForm(props: {
                 control={form.control}
                 name='auth_type'
                 render={({ field }) => (
-                  <SettingsSwitchItem>
-                    <SettingsSwitchContent>
+                  <FormItem className='flex min-w-0 items-center justify-between gap-4 py-2.5'>
+                    <div className='min-w-0 space-y-0.5'>
                       <FormLabel>{t('Use AK/SK authentication')}</FormLabel>
                       <FormDescription>
                         {t(
                           'Enable when the upstream requires AK/SK for material management, including human verification.'
                         )}
                       </FormDescription>
-                    </SettingsSwitchContent>
+                    </div>
                     <FormControl>
                       <Switch
                         checked={field.value === 'aksk'}
@@ -322,7 +318,7 @@ export function ChannelAssetsForm(props: {
                       />
                     </FormControl>
                     <FormMessage />
-                  </SettingsSwitchItem>
+                  </FormItem>
                 )}
               />
               {authType === 'bearer' ? (

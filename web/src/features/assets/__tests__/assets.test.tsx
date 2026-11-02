@@ -109,12 +109,8 @@ async function renderAssetsPage() {
     path: '/asset-library',
     component: Assets,
   })
-  const storage = createRoute({
-    getParentRoute: () => root,
-    path: '/system-settings/operations/$section',
-  })
   const router = createRouter({
-    routeTree: root.addChildren([route, storage]),
+    routeTree: root.addChildren([route]),
     history: createMemoryHistory({ initialEntries: ['/asset-library'] }),
   })
   await router.load()
@@ -123,6 +119,7 @@ async function renderAssetsPage() {
       <RouterProvider router={router} />
     </QueryClientProvider>
   )
+  return router
 }
 
 beforeEach(() => {
@@ -1530,13 +1527,100 @@ test.each([
     ).toBe(channelsVisible)
     const storage = screen.queryByRole('button', { name: 'Storage settings' })
     expect(Boolean(storage)).toBe(storageVisible)
-    if (storage) {
-      expect(storage).toHaveAttribute(
-        'href',
-        '/system-settings/operations/assets'
-      )
-    }
     expect(post).not.toHaveBeenCalled()
+  }
+)
+
+test.each([false, true])(
+  'root configures storage inside the asset page when enabled is %s',
+  async (enabled) => {
+    const user = userEvent.setup()
+    useAuthStore.getState().auth.setUser({
+      id: 1,
+      username: 'root',
+      role: ROLE.SUPER_ADMIN,
+    })
+    const storage = {
+      enabled,
+      endpoint: 'https://s3.example.com',
+      region: 'cn-beijing',
+      bucket: 'assets',
+      access_key: 'access-id',
+      force_path_style: false,
+      revision: 2,
+      has_secret: true,
+    }
+    const get = vi.spyOn(api, 'get').mockImplementation(async (url) => ({
+      data: {
+        success: true,
+        data:
+          url === '/api/option/asset_storage'
+            ? storage
+            : {
+                enabled: storage.enabled,
+                size_limits_mb: { image: 30, video: 200, audio: 15 },
+              },
+      },
+    }))
+    vi.spyOn(api, 'post').mockResolvedValue({
+      data: { success: true, data: { Items: [], TotalCount: 0 } },
+    })
+    vi.spyOn(api, 'put').mockImplementation(async () => {
+      storage.enabled = !enabled
+      storage.revision++
+      return { data: { success: true, data: { ...storage } } }
+    })
+    const router = await renderAssetsPage()
+    if (enabled) {
+      await screen.findByRole('button', { name: 'Create asset group' })
+    } else {
+      await screen.findByText('Asset library is disabled')
+    }
+    const trigger = await screen.findByRole('button', {
+      name: 'Storage settings',
+    })
+    expect(get).not.toHaveBeenCalledWith(
+      '/api/option/asset_storage',
+      expect.anything()
+    )
+    await user.click(trigger)
+    await screen.findByLabelText('Bucket')
+    const dialog = screen.getByRole('dialog', { name: 'Storage settings' })
+    await user.click(
+      await within(dialog).findByRole('switch', {
+        name: 'Enable asset library',
+      })
+    )
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }))
+    await waitFor(() =>
+      expect(
+        within(dialog).getByRole('button', { name: 'Save' })
+      ).toBeDisabled()
+    )
+    await user.keyboard('{Escape}')
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    )
+    expect(router.state.location.pathname).toBe('/asset-library')
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Storage settings' })
+      ).toHaveFocus()
+    )
+    if (enabled) {
+      expect(await screen.findByText('Asset library is disabled')).toBeVisible()
+    } else {
+      expect(
+        await screen.findByRole('button', { name: 'Create asset group' })
+      ).toBeVisible()
+    }
+    expect(
+      get.mock.calls.every(
+        ([url]) =>
+          String(url).startsWith('/api/assets/') ||
+          url === '/api/option/asset_storage'
+      )
+    ).toBe(true)
   }
 )
 
