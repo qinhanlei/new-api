@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -26,6 +28,10 @@ const (
 )
 
 var ErrAssetValidationThrottled = errors.New("human portrait validation is rate limited")
+var ErrAssetValidationActive = errors.New("verification is still active")
+var ErrAssetValidationReviewBatch = errors.New("unconfirmed verification requires individual archival")
+
+var assetValidationPollBlockingCodes = []string{"UpstreamConfigurationInvalid", "ValidationSecretUnavailable", "InvalidValidationGroup", "ValidationGroupMismatch"}
 
 // AssetValidationSession retains credential references and encrypted short-lived
 // provider data. It never stores identity documents, portraits, or biometric data.
@@ -63,6 +69,8 @@ type AssetValidationSession struct {
 	ExpiresAt        int64 `gorm:"index"`
 	CreatedAt        int64
 	UpdatedAt        int64
+	ArchivedAt       int64 `gorm:"not null;default:0"`
+	LastCheckedAt    int64 `gorm:"not null;default:0"`
 }
 
 func (AssetValidationSession) TableName(namer schema.Namer) string {
@@ -104,6 +112,108 @@ func ListAssetValidationSessions(ctx context.Context, userID, initiatorID int, p
 	err := protectedAssetDB(ctx).Where("user_id = ? AND initiator_id = ? AND project_name = ?", userID, initiatorID, project).
 		Order("id DESC").Limit(50).Find(&items).Error
 	return items, err
+}
+
+func AssetValidationPollBlocked(code string) bool {
+	return slices.Contains(assetValidationPollBlockingCodes, code)
+}
+
+// AssetValidationRecordCategory describes the resource outcome, independently
+// of whether the current caller can continue its original authorization.
+func AssetValidationRecordCategory(session *AssetValidationSession, now int64) string {
+	if session.GroupID != "" {
+		return "completed"
+	}
+	if session.UpstreamGroupID != "" || session.LeaseExpiresAt > now {
+		return "pending"
+	}
+	if session.Status != AssetValidationFailed && session.SecretCipher != "" && session.ExpiresAt > now && !AssetValidationPollBlocked(session.ErrorCode) {
+		return "pending"
+	}
+	if session.ResourcePossible {
+		return "needs_review"
+	}
+	return "ended"
+}
+
+// SQL uses the same outcome precedence as AssetValidationRecordCategory; this
+// expression is shared by both counts and page filtering. Regression cases
+// compare each returned category against the summary on every database dialect.
+func assetValidationRecordCategorySQL(now int64) clause.Expr {
+	return gorm.Expr(`CASE
+		WHEN COALESCE(group_id, '') <> '' THEN 'completed'
+		WHEN COALESCE(upstream_group_id, '') <> '' OR lease_expires_at > ? THEN 'pending'
+		WHEN COALESCE(status, '') <> ? AND COALESCE(secret_cipher, '') <> '' AND expires_at > ? AND
+			COALESCE(error_code, '') NOT IN ? THEN 'pending'
+		WHEN resource_possible = ? THEN 'needs_review'
+		ELSE 'ended' END`, now, AssetValidationFailed, now,
+		assetValidationPollBlockingCodes, true)
+}
+
+func ListAssetValidationRecords(ctx context.Context, userID, initiatorID int, project string, filter dto.AssetValidationRecordFilter, now int64) ([]AssetValidationSession, int64, int64, error) {
+	query := protectedAssetDB(ctx).Model(&AssetValidationSession{}).
+		Where("user_id = ? AND initiator_id = ? AND project_name = ?", userID, initiatorID, project)
+	category := assetValidationRecordCategorySQL(now)
+	var pending, total int64
+	if err := query.Session(&gorm.Session{}).Where("(?) IN ?", category, []string{"pending", "needs_review"}).Count(&pending).Error; err != nil {
+		return nil, 0, 0, err
+	}
+	if filter.Name != "" {
+		// Use one explicit escape character on all three databases; wildcard
+		// characters in a person's name are literal search text.
+		name := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(filter.Name)
+		query = query.Where("name LIKE ? ESCAPE '!'", "%"+name+"%")
+	}
+	if filter.Status != "all" {
+		query = query.Where("(?) = ?", category, filter.Status)
+	}
+	switch filter.Archived {
+	case "active":
+		query = query.Where("archived_at = 0")
+	case "archived":
+		query = query.Where("archived_at > 0")
+	}
+	if err := query.Session(&gorm.Session{}).Count(&total).Error; err != nil {
+		return nil, 0, 0, err
+	}
+	items := []AssetValidationSession{}
+	err := query.Order("id DESC").Offset((filter.Page - 1) * filter.PageSize).Limit(filter.PageSize).Find(&items).Error
+	return items, total, pending, err
+}
+
+func ArchiveAssetValidationRecords(ctx context.Context, userID, initiatorID int, project string, ids []string, archived bool) error {
+	return protectedAssetDB(ctx).Transaction(func(tx *gorm.DB) error {
+		var items []AssetValidationSession
+		if err := lockForUpdate(tx).Where("user_id = ? AND initiator_id = ? AND project_name = ? AND public_id IN ?", userID, initiatorID, project, ids).
+			Order("id").Find(&items).Error; err != nil {
+			return err
+		}
+		if len(items) != len(ids) {
+			return gorm.ErrRecordNotFound
+		}
+		now := time.Now().Unix()
+		archivedAt := int64(0)
+		if archived {
+			archivedAt = now
+			for _, item := range items {
+				category := AssetValidationRecordCategory(&item, now)
+				if item.LeaseExpiresAt > now || category == "pending" {
+					return ErrAssetValidationActive
+				}
+				if len(items) > 1 && category == "needs_review" {
+					return ErrAssetValidationReviewBatch
+				}
+			}
+		}
+		query := tx.Model(&AssetValidationSession{}).
+			Where("user_id = ? AND initiator_id = ? AND project_name = ? AND public_id IN ?", userID, initiatorID, project, ids)
+		if archived {
+			query = query.Where("archived_at = 0")
+		}
+		// Archival is display management only. UpdatedAt also participates in
+		// provider backoff, so it must not be touched by this operation.
+		return query.UpdateColumn("archived_at", archivedAt).Error
+	})
 }
 
 func GetAssetValidationByState(ctx context.Context, hash string) (*AssetValidationSession, error) {
@@ -334,10 +444,11 @@ func ClaimAssetValidationResult(ctx context.Context, session *AssetValidationSes
 		session.LeaseToken = common.GetUUID()
 		session.LeaseExpiresAt = now + 90
 		session.Status = AssetValidationVerifying
+		session.LastCheckedAt = now
 		// Keep the previous attempt's timestamps in memory for the next backoff;
 		// GORM would overwrite UpdatedAt if this update used session as its model.
 		result := tx.Model(&AssetValidationSession{}).Where("id = ?", session.ID).
-			Updates(map[string]any{"lease_token": session.LeaseToken, "lease_expires_at": session.LeaseExpiresAt, "status": session.Status, "updated_at": now})
+			Updates(map[string]any{"lease_token": session.LeaseToken, "lease_expires_at": session.LeaseExpiresAt, "status": session.Status, "updated_at": now, "last_checked_at": now})
 		claimed = result.Error == nil && result.RowsAffected == 1
 		return result.Error
 	})

@@ -48,7 +48,30 @@ import { AssetValidationDialog } from '../components/asset-validation-dialog'
 import { Assets } from '../index'
 import { deriveAssetName } from '../lib/asset-source'
 import { assetValidationH5Link } from '../lib/validation'
-import type { Asset, AssetGroup } from '../types'
+import type { Asset, AssetGroup, AssetValidationSummary } from '../types'
+
+function validationRecord(
+  overrides: Partial<AssetValidationSummary> = {}
+): AssetValidationSummary {
+  return {
+    SessionId: 'validation-na-one',
+    Name: 'Alice',
+    Status: 'pending',
+    ChannelId: 7,
+    ChannelName: 'Portrait channel',
+    ProjectName: 'default',
+    CanPoll: true,
+    CanContinue: true,
+    NeedsReview: false,
+    BindingPending: false,
+    CanArchive: false,
+    ArchivedAt: 0,
+    CreatedAt: 0,
+    LastCheckedAt: 0,
+    ExpiresAt: Date.now() / 1000 + 1800,
+    ...overrides,
+  }
+}
 
 const group: AssetGroup = {
   Id: 'group-one',
@@ -288,15 +311,16 @@ test('a size-rejected replica shows the file size and current channel limit', as
 
 test('a result arriving after close cannot replace or close a reopened verification', async () => {
   const user = userEvent.setup()
-  vi.mocked(api.get).mockResolvedValue({
+  vi.mocked(api.get).mockImplementation(async (url) => ({
     data: {
       success: true,
-      data: [
-        { SessionId: 'validation-na-one', Name: 'Alice', Status: 'pending' },
-      ],
+      data: url.endsWith('/channels')
+        ? [{ Id: 7, Name: 'Portrait channel' }]
+        : validationRecord(),
     },
-  })
+  }))
   let finish!: (response: unknown) => void
+  const created = vi.fn()
   vi.spyOn(api, 'post').mockImplementation(async (_url, _body, options) => {
     const action = (options?.params as { Action?: string })?.Action
     if (action === 'GetVisualValidateResult') {
@@ -304,61 +328,45 @@ test('a result arriving after close cannot replace or close a reopened verificat
         finish = resolve
       })
     }
-    if (action === 'CreateVisualValidateSession') {
-      return {
-        data: {
-          success: true,
-          data: {
-            BytedToken: 'validation-na-two',
-            Name: 'Bob',
-            Status: 'pending',
-            ExpiresAt: Date.now() / 1000 + 1800,
-            H5Link: 'https://verify.example/bob',
-          },
-        },
-      }
-    }
     return {
       data: {
         success: true,
         data: {
-          Items:
-            action === 'ListAssetGroups'
-              ? [{ ...group, GroupType: 'LivenessFace' }]
-              : [],
-          TotalCount: 0,
+          ...validationRecord(),
+          BytedToken: 'validation-na-two',
+          Name: 'Bob',
+          H5Link: 'https://verify.example/bob',
         },
       },
     }
   })
-  render(
+  const first = render(
     <QueryClientProvider client={client}>
-      <AssetBrowser project='default' scope={{}} admin={false} />
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        initialSession={validationRecord()}
+        onClose={vi.fn()}
+        onCreated={created}
+      />
     </QueryClientProvider>
   )
-  await screen.findByRole('option', { name: 'Avatars' })
-  await user.selectOptions(
-    screen.getByLabelText('Library type'),
-    'LivenessFace'
-  )
-  expect(screen.getByLabelText('Library type')).toHaveValue('LivenessFace')
-  await user.click(screen.getByRole('button', { name: 'Group actions' }))
-  await user.click(screen.getByRole('menuitem', { name: 'Verify a person' }))
   await user.click(
     await screen.findByRole('button', {
       name: 'Continue verification for Alice',
     })
   )
-  await user.click(
-    within(screen.getByRole('dialog')).getAllByRole('button', {
-      name: 'Close',
-    })[0]
+  first.unmount()
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={created}
+      />
+    </QueryClientProvider>
   )
-  await waitFor(() =>
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-  )
-  await user.click(screen.getByRole('button', { name: 'Group actions' }))
-  await user.click(screen.getByRole('menuitem', { name: 'Verify a person' }))
   await user.type(await screen.findByLabelText('Name'), 'Bob')
   await user.click(screen.getByRole('button', { name: 'Start verification' }))
   expect(
@@ -369,8 +377,8 @@ test('a result arriving after close cannot replace or close a reopened verificat
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           BytedToken: 'validation-na-one',
-          Name: 'Alice',
           Status: 'created',
           GroupId: 'group-alice',
         },
@@ -381,7 +389,7 @@ test('a result arriving after close cannot replace or close a reopened verificat
   expect(
     screen.getByRole('button', { name: 'Open verification' })
   ).toHaveAttribute('href', 'https://verify.example/bob?lng=en')
-  expect(screen.getByLabelText('Asset group')).toHaveValue(group.Id)
+  expect(created).not.toHaveBeenCalled()
 })
 
 test.each([
@@ -1796,7 +1804,9 @@ test.each([true, false])(
       })
     }
     const user = userEvent.setup()
-    vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
+    vi.mocked(api.get).mockResolvedValue({
+      data: { success: true, data: [{ Id: 7, Name: 'Portrait channel' }] },
+    })
     const post = vi
       .spyOn(api, 'post')
       .mockRejectedValueOnce(new Error('Connection interrupted'))
@@ -1804,6 +1814,7 @@ test.each([true, false])(
         data: {
           success: true,
           data: {
+            ...validationRecord(),
             BytedToken: 'validation-na-one',
             Name: 'Alice',
             Status: 'pending',
@@ -1828,9 +1839,7 @@ test.each([true, false])(
     )
     await user.type(screen.getByLabelText('Name'), 'Alice')
     await user.click(screen.getByRole('button', { name: 'Start verification' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Connection interrupted'
-    )
+    expect(await screen.findByText('Connection interrupted')).toBeVisible()
     expect(screen.getByLabelText('Name')).toHaveValue('Alice')
     await user.click(screen.getByRole('button', { name: 'Start verification' }))
     const link = await screen.findByRole('button', {
@@ -1849,6 +1858,7 @@ test.each([true, false])(
     expect(post.mock.calls[1][1]).toEqual({
       ProjectName: 'studio',
       Name: 'Alice',
+      ChannelId: 7,
       IdempotencyKey: expect.stringMatching(/^[A-Za-z0-9_-]{8,128}$/),
     })
     expect(post.mock.calls[1][2]).toEqual(
@@ -1870,16 +1880,15 @@ test('a saved verification resumes through a write action and selects its create
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
-      data: [
-        {
-          SessionId: 'validation-na-one',
-          Name: 'Alice',
-          Status: 'pending',
-          CanPoll: true,
-          ChannelId: 7,
-          ExpiresAt: Date.now() / 1000 + 1800,
-        },
-      ],
+      data: {
+        ...validationRecord(),
+        SessionId: 'validation-na-one',
+        Name: 'Alice',
+        Status: 'pending',
+        CanPoll: true,
+        ChannelId: 7,
+        ExpiresAt: Date.now() / 1000 + 1800,
+      },
     },
   })
   const post = vi
@@ -1888,6 +1897,7 @@ test('a saved verification resumes through a write action and selects its create
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'pending',
@@ -1902,6 +1912,7 @@ test('a saved verification resumes through a write action and selects its create
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'created',
@@ -1912,6 +1923,7 @@ test('a saved verification resumes through a write action and selects its create
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
+        initialSession={validationRecord()}
         project='studio'
         scope={{ userId: 23 }}
         onClose={vi.fn()}
@@ -1937,7 +1949,7 @@ test('a saved verification resumes through a write action and selects its create
     screen.getByRole('button', { name: 'Open verification' })
   ).toBeVisible()
   expect(api.get).toHaveBeenCalledWith(
-    '/api/assets/validation/sessions',
+    '/api/assets/validation/records/validation-na-one',
     expect.objectContaining({ params: { project_name: 'studio', user_id: 23 } })
   )
   expect(post).toHaveBeenCalledWith(
@@ -1973,20 +1985,24 @@ test.each([
     vi.mocked(api.get).mockResolvedValue({
       data: {
         success: true,
-        data: [
-          { SessionId: 'validation-na-one', Name: 'Alice', Status: 'pending' },
-        ],
+        data: validationRecord(),
       },
     })
     vi.spyOn(api, 'post').mockResolvedValue({
       data: {
         success: true,
-        data: { ...result, BytedToken: 'validation-na-one', Name: 'Alice' },
+        data: {
+          ...validationRecord(),
+          ...result,
+          BytedToken: 'validation-na-one',
+          Name: 'Alice',
+        },
       },
     })
     render(
       <QueryClientProvider client={client}>
         <AssetValidationDialog
+          initialSession={validationRecord()}
           project='default'
           scope={{}}
           onClose={vi.fn()}
@@ -2177,15 +2193,14 @@ test.each([
     vi.mocked(api.get).mockResolvedValue({
       data: {
         success: true,
-        data: [
-          {
-            SessionId: 'validation-na-one',
-            Name: 'Alice',
-            Status: 'pending',
-            CanPoll: true,
-            ExpiresAt: Date.now() / 1000 + 1800,
-          },
-        ],
+        data: {
+          ...validationRecord(),
+          SessionId: 'validation-na-one',
+          Name: 'Alice',
+          Status: 'pending',
+          CanPoll: true,
+          ExpiresAt: Date.now() / 1000 + 1800,
+        },
       },
     })
     const error = Object.assign(
@@ -2205,6 +2220,7 @@ test.each([
         data: {
           success: true,
           data: {
+            ...validationRecord(),
             BytedToken: 'validation-na-one',
             Name: 'Alice',
             Status: 'pending',
@@ -2219,6 +2235,7 @@ test.each([
         data: {
           success: true,
           data: {
+            ...validationRecord(),
             BytedToken: 'validation-na-one',
             Name: 'Alice',
             Status: 'created',
@@ -2230,6 +2247,7 @@ test.each([
     render(
       <QueryClientProvider client={client}>
         <AssetValidationDialog
+          initialSession={validationRecord()}
           project='default'
           scope={{}}
           onClose={vi.fn()}
@@ -2282,15 +2300,14 @@ test('continuing a saved verification retains its target when the first check is
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
-      data: [
-        {
-          SessionId: 'validation-na-one',
-          Name: 'Alice',
-          Status: 'pending',
-          CanPoll: true,
-          ExpiresAt: Date.now() / 1000 + 1800,
-        },
-      ],
+      data: {
+        ...validationRecord(),
+        SessionId: 'validation-na-one',
+        Name: 'Alice',
+        Status: 'pending',
+        CanPoll: true,
+        ExpiresAt: Date.now() / 1000 + 1800,
+      },
     },
   })
   const post = vi
@@ -2304,6 +2321,7 @@ test('continuing a saved verification retains its target when the first check is
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'created',
@@ -2315,6 +2333,7 @@ test('continuing a saved verification retains its target when the first check is
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
+        initialSession={validationRecord()}
         project='default'
         scope={{}}
         onClose={vi.fn()}
@@ -2357,6 +2376,7 @@ test('a recoverable binding continues after H5 expiry and respects the server re
   const pending = {
     Name: 'Alice',
     Status: 'unknown',
+    BindingPending: true,
     CanPoll: true,
     ExpiresAt: Date.now() / 1000 - 60,
     Error: {
@@ -2367,7 +2387,11 @@ test('a recoverable binding continues after H5 expiry and respects the server re
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
-      data: [{ ...pending, SessionId: 'validation-na-one' }],
+      data: {
+        ...validationRecord(),
+        ...pending,
+        SessionId: 'validation-na-one',
+      },
     },
   })
   const post = vi
@@ -2376,6 +2400,7 @@ test('a recoverable binding continues after H5 expiry and respects the server re
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           ...pending,
           BytedToken: 'validation-na-one',
           NextPollAt: Date.now() / 1000 + 60,
@@ -2386,6 +2411,7 @@ test('a recoverable binding continues after H5 expiry and respects the server re
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'created',
@@ -2397,6 +2423,7 @@ test('a recoverable binding continues after H5 expiry and respects the server re
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
+        initialSession={validationRecord()}
         project='default'
         scope={{}}
         onClose={vi.fn()}
@@ -2600,15 +2627,14 @@ test('a verification link disappears at its deadline while a result check is sti
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
-      data: [
-        {
-          SessionId: 'validation-na-one',
-          Name: 'Alice',
-          Status: 'pending',
-          CanPoll: true,
-          ExpiresAt: Date.now() / 1000 + 15,
-        },
-      ],
+      data: {
+        ...validationRecord(),
+        SessionId: 'validation-na-one',
+        Name: 'Alice',
+        Status: 'pending',
+        CanPoll: true,
+        ExpiresAt: Date.now() / 1000 + 15,
+      },
     },
   })
   const post = vi
@@ -2617,6 +2643,7 @@ test('a verification link disappears at its deadline while a result check is sti
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'pending',
@@ -2630,6 +2657,7 @@ test('a verification link disappears at its deadline while a result check is sti
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
+        initialSession={validationRecord()}
         project='default'
         scope={{}}
         onClose={vi.fn()}
@@ -2671,15 +2699,14 @@ test('a revoked verification authorization stops polling and removes the H5 link
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
-      data: [
-        {
-          SessionId: 'validation-na-one',
-          Name: 'Alice',
-          Status: 'pending',
-          CanPoll: true,
-          ExpiresAt: Date.now() / 1000 + 1800,
-        },
-      ],
+      data: {
+        ...validationRecord(),
+        SessionId: 'validation-na-one',
+        Name: 'Alice',
+        Status: 'pending',
+        CanPoll: true,
+        ExpiresAt: Date.now() / 1000 + 1800,
+      },
     },
   })
   const post = vi
@@ -2688,6 +2715,7 @@ test('a revoked verification authorization stops polling and removes the H5 link
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'pending',
@@ -2705,6 +2733,7 @@ test('a revoked verification authorization stops polling and removes the H5 link
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
+        initialSession={validationRecord()}
         project='default'
         scope={{}}
         onClose={vi.fn()}
@@ -2729,6 +2758,9 @@ test('a revoked verification authorization stops polling and removes the H5 link
     await vi.advanceTimersByTimeAsync(60_000)
   })
   expect(post).toHaveBeenCalledTimes(2)
+  expect(
+    screen.getByRole('button', { name: 'Check verification' })
+  ).toBeDisabled()
 })
 
 test('an uncertain upstream check keeps its diagnosis and can later complete', async () => {
@@ -2738,15 +2770,14 @@ test('an uncertain upstream check keeps its diagnosis and can later complete', a
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
-      data: [
-        {
-          SessionId: 'validation-na-one',
-          Name: 'Alice',
-          Status: 'pending',
-          CanPoll: true,
-          ExpiresAt: Date.now() / 1000 + 1800,
-        },
-      ],
+      data: {
+        ...validationRecord(),
+        SessionId: 'validation-na-one',
+        Name: 'Alice',
+        Status: 'pending',
+        CanPoll: true,
+        ExpiresAt: Date.now() / 1000 + 1800,
+      },
     },
   })
   vi.spyOn(api, 'post')
@@ -2754,6 +2785,7 @@ test('an uncertain upstream check keeps its diagnosis and can later complete', a
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'pending',
@@ -2772,6 +2804,7 @@ test('an uncertain upstream check keeps its diagnosis and can later complete', a
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'created',
@@ -2783,6 +2816,7 @@ test('an uncertain upstream check keeps its diagnosis and can later complete', a
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
+        initialSession={validationRecord()}
         project='default'
         scope={{}}
         onClose={vi.fn()}
@@ -2800,9 +2834,7 @@ test('an uncertain upstream check keeps its diagnosis and can later complete', a
     await vi.advanceTimersByTimeAsync(0)
   })
   expect(
-    screen.getByText(
-      'Last check: InvalidParameter: liveness verification failed'
-    )
+    screen.getByText('Last check: liveness verification failed')
   ).toBeVisible()
   expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   await act(async () => {
@@ -2818,6 +2850,8 @@ test('an uncertain creation without recovery credentials is never polled or recr
     Name: 'Alice',
     Status: 'unknown',
     CanPoll: false,
+    CanContinue: false,
+    NeedsReview: true,
     ExpiresAt: Date.now() / 1000 + 1800,
     Error: {
       Code: 'UpstreamResultUnknown',
@@ -2827,18 +2861,27 @@ test('an uncertain creation without recovery credentials is never polled or recr
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
-      data: [{ ...unknown, SessionId: 'validation-na-one' }],
+      data: {
+        ...validationRecord(),
+        ...unknown,
+        SessionId: 'validation-na-one',
+      },
     },
   })
   const post = vi.spyOn(api, 'post').mockResolvedValue({
     data: {
       success: true,
-      data: { ...unknown, BytedToken: 'validation-na-one' },
+      data: {
+        ...validationRecord(),
+        ...unknown,
+        BytedToken: 'validation-na-one',
+      },
     },
   })
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
+        initialSession={validationRecord()}
         project='default'
         scope={{}}
         onClose={vi.fn()}
@@ -2849,16 +2892,16 @@ test('an uncertain creation without recovery credentials is never polled or recr
   await act(async () => {
     await vi.advanceTimersByTimeAsync(0)
   })
-  fireEvent.click(
-    screen.getByRole('button', { name: 'Continue verification for Alice' })
-  )
+  expect(
+    screen.queryByRole('button', { name: 'Continue verification for Alice' })
+  ).not.toBeInTheDocument()
   await act(async () => {
     await vi.advanceTimersByTimeAsync(10 * 60_000)
   })
-  expect(post).toHaveBeenCalledTimes(1)
+  expect(post).not.toHaveBeenCalled()
   expect(
-    screen.getByRole('button', { name: 'Check verification' })
-  ).toBeEnabled()
+    screen.queryByRole('button', { name: 'Check verification' })
+  ).not.toBeInTheDocument()
   expect(
     screen.queryByRole('button', { name: 'Open verification' })
   ).not.toBeInTheDocument()
@@ -2870,6 +2913,7 @@ test('binding checks pause after ten minutes and manual recovery keeps the same 
   const pending = {
     Name: 'Alice',
     Status: 'unknown',
+    BindingPending: true,
     CanPoll: true,
     ExpiresAt: Date.now() / 1000 - 60,
     Error: { Code: 'UpstreamHTTP503', Message: 'Temporarily unavailable' },
@@ -2877,13 +2921,18 @@ test('binding checks pause after ten minutes and manual recovery keeps the same 
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
-      data: [{ ...pending, SessionId: 'validation-na-one' }],
+      data: {
+        ...validationRecord(),
+        ...pending,
+        SessionId: 'validation-na-one',
+      },
     },
   })
   const post = vi.spyOn(api, 'post').mockImplementation(async () => ({
     data: {
       success: true,
       data: {
+        ...validationRecord(),
         ...pending,
         BytedToken: 'validation-na-one',
         NextPollAt: Date.now() / 1000 + 60,
@@ -2893,6 +2942,7 @@ test('binding checks pause after ten minutes and manual recovery keeps the same 
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
+        initialSession={validationRecord()}
         project='default'
         scope={{}}
         onClose={vi.fn()}
@@ -2943,7 +2993,9 @@ test('binding checks pause after ten minutes and manual recovery keeps the same 
 test('a throttled creation waits before a manual retry and preserves its request key', async () => {
   vi.useFakeTimers()
   vi.setSystemTime(new Date('2026-11-01T12:00:00Z'))
-  vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
+  vi.mocked(api.get).mockResolvedValue({
+    data: { success: true, data: [{ Id: 7, Name: 'Portrait channel' }] },
+  })
   const post = vi
     .spyOn(api, 'post')
     .mockRejectedValueOnce(
@@ -2955,6 +3007,7 @@ test('a throttled creation waits before a manual retry and preserves its request
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           BytedToken: 'validation-na-one',
           Name: 'Alice',
           Status: 'pending',
@@ -2987,9 +3040,10 @@ test('a throttled creation waits before a manual retry and preserves its request
   expect(
     screen.getByRole('button', { name: 'Start verification' })
   ).toBeDisabled()
-  expect(screen.getByRole('alert')).toHaveTextContent(
-    'Too many requests. Please wait before trying again.'
-  )
+  expect(
+    screen.getByText('Too many requests. Please wait before trying again.')
+  ).toBeVisible()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   await act(async () => {
     await vi.advanceTimersByTimeAsync(30_000)
   })
@@ -3015,7 +3069,11 @@ test('the final expiry check respects the server cooldown and discovers a bindin
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
-      data: [{ ...pending, SessionId: 'validation-na-one' }],
+      data: {
+        ...validationRecord(),
+        ...pending,
+        SessionId: 'validation-na-one',
+      },
     },
   })
   const post = vi
@@ -3024,6 +3082,7 @@ test('the final expiry check respects the server cooldown and discovers a bindin
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           ...pending,
           BytedToken: 'validation-na-one',
           H5Link: 'https://verify.example/face',
@@ -3035,8 +3094,10 @@ test('the final expiry check respects the server cooldown and discovers a bindin
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           ...pending,
           Status: 'verifying',
+          BindingPending: true,
           BytedToken: 'validation-na-one',
         },
       },
@@ -3045,6 +3106,7 @@ test('the final expiry check respects the server cooldown and discovers a bindin
       data: {
         success: true,
         data: {
+          ...validationRecord(),
           ...pending,
           Status: 'created',
           CanPoll: false,
@@ -3056,6 +3118,7 @@ test('the final expiry check respects the server cooldown and discovers a bindin
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
+        initialSession={validationRecord()}
         project='default'
         scope={{}}
         onClose={vi.fn()}
@@ -3098,7 +3161,11 @@ test('a failed final expiry check pauses automatically until manual recovery', a
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
-      data: [{ ...pending, SessionId: 'validation-na-one' }],
+      data: {
+        ...validationRecord(),
+        ...pending,
+        SessionId: 'validation-na-one',
+      },
     },
   })
   const post = vi
@@ -3106,13 +3173,18 @@ test('a failed final expiry check pauses automatically until manual recovery', a
     .mockResolvedValueOnce({
       data: {
         success: true,
-        data: { ...pending, BytedToken: 'validation-na-one' },
+        data: {
+          ...validationRecord(),
+          ...pending,
+          BytedToken: 'validation-na-one',
+        },
       },
     })
     .mockRejectedValueOnce(new Error('Connection interrupted'))
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
+        initialSession={validationRecord()}
         project='default'
         scope={{}}
         onClose={vi.fn()}
@@ -3168,18 +3240,27 @@ test('closing a verification cancels its scheduled final expiry check', async ()
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
-      data: [{ ...pending, SessionId: 'validation-na-one' }],
+      data: {
+        ...validationRecord(),
+        ...pending,
+        SessionId: 'validation-na-one',
+      },
     },
   })
   const post = vi.spyOn(api, 'post').mockResolvedValue({
     data: {
       success: true,
-      data: { ...pending, BytedToken: 'validation-na-one' },
+      data: {
+        ...validationRecord(),
+        ...pending,
+        BytedToken: 'validation-na-one',
+      },
     },
   })
   const view = render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
+        initialSession={validationRecord()}
         project='default'
         scope={{}}
         onClose={vi.fn()}
@@ -3205,11 +3286,14 @@ test('closing a verification cancels its scheduled final expiry check', async ()
 
 test('a definite verification creation failure retains its error presentation', async () => {
   const user = userEvent.setup()
-  vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
+  vi.mocked(api.get).mockResolvedValue({
+    data: { success: true, data: [{ Id: 7, Name: 'Portrait channel' }] },
+  })
   const post = vi.spyOn(api, 'post').mockResolvedValue({
     data: {
       success: true,
       data: {
+        ...validationRecord(),
         BytedToken: 'validation-na-one',
         Name: 'Alice',
         Status: 'failed',
@@ -3235,7 +3319,281 @@ test('a definite verification creation failure retains its error presentation', 
   await user.type(screen.getByLabelText('Name'), 'Alice')
   await user.click(screen.getByRole('button', { name: 'Start verification' }))
   expect(await screen.findByRole('alert')).toHaveTextContent(
-    'InvalidParameter: The callback address was rejected'
+    'The callback address was rejected'
   )
   expect(post).toHaveBeenCalledTimes(1)
+})
+
+test('a completed record opens its group without using the original verification authorization', async () => {
+  const user = userEvent.setup()
+  const record = validationRecord({
+    Status: 'created',
+    GroupId: 'group-alice',
+    CanPoll: false,
+    CanContinue: false,
+    CanArchive: true,
+    ExpiresAt: 1,
+  })
+  vi.mocked(api.get).mockResolvedValue({
+    data: { success: true, data: record },
+  })
+  const post = vi.spyOn(api, 'post')
+  const success = vi.spyOn(toast, 'success')
+  const created = vi.fn()
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        initialSession={record}
+        onClose={vi.fn()}
+        onCreated={created}
+      />
+    </QueryClientProvider>
+  )
+  await user.click(
+    await screen.findByRole('button', { name: 'View person group' })
+  )
+  expect(created).toHaveBeenCalledExactlyOnceWith('group-alice')
+  expect(post).not.toHaveBeenCalled()
+  expect(success).not.toHaveBeenCalled()
+  expect(
+    screen.queryByRole('button', { name: 'Check verification' })
+  ).not.toBeInTheDocument()
+})
+
+test.each([
+  { name: 'expired result', Status: 'expired' as const, NeedsReview: true },
+  { name: 'unknown creation', Status: 'unknown' as const, NeedsReview: true },
+  {
+    name: 'another sign-in',
+    Status: 'pending' as const,
+    NeedsReview: false,
+    ContinueError: {
+      Code: 'ValidationSessionMismatch',
+      Message: 'Use the sign-in session that started this verification',
+    },
+  },
+])('a record with $name has no ineffective continue action', async (state) => {
+  const record = validationRecord({
+    ...state,
+    CanContinue: false,
+    CanPoll: false,
+  })
+  vi.mocked(api.get).mockResolvedValue({
+    data: { success: true, data: record },
+  })
+  const post = vi.spyOn(api, 'post')
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        initialSession={record}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await waitFor(() =>
+    expect(api.get).toHaveBeenCalledWith(
+      '/api/assets/validation/records/validation-na-one',
+      expect.anything()
+    )
+  )
+  expect(
+    screen.queryByRole('button', { name: 'Continue verification for Alice' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: 'Check verification' })
+  ).not.toBeInTheDocument()
+  expect(post).not.toHaveBeenCalled()
+  if (state.ContinueError) {
+    expect(screen.getByText(state.ContinueError.Message)).toBeVisible()
+  }
+  if (state.NeedsReview) {
+    expect(screen.getByText('Result needs review')).toBeVisible()
+  }
+})
+
+test('verification creation requires an explicit choice when multiple channels are available', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockResolvedValue({
+    data: {
+      success: true,
+      data: [
+        { Id: 7, Name: 'Portrait channel' },
+        { Id: 9, Name: 'Second channel' },
+      ],
+    },
+  })
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        ...validationRecord(),
+        BytedToken: 'validation-na-one',
+        ChannelId: 9,
+      },
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='studio'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await user.type(screen.getByLabelText('Name'), 'Alice')
+  expect(screen.getByText('studio')).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Start verification' })
+  ).toBeDisabled()
+  await user.selectOptions(
+    await screen.findByLabelText('Verification channel'),
+    '9'
+  )
+  await user.click(screen.getByRole('button', { name: 'Start verification' }))
+  expect(post).toHaveBeenCalledWith(
+    '/api/assets/actions',
+    expect.objectContaining({ ChannelId: 9, ProjectName: 'studio' }),
+    expect.anything()
+  )
+  expect(
+    screen.queryByRole('region', { name: 'Recent verifications' })
+  ).not.toBeInTheDocument()
+})
+
+test('a manual result check shows progress and an explicit waiting result', async () => {
+  const user = userEvent.setup()
+  const record = validationRecord()
+  vi.mocked(api.get).mockResolvedValue({
+    data: { success: true, data: record },
+  })
+  let finish!: (response: unknown) => void
+  const post = vi.spyOn(api, 'post').mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve
+      })
+  )
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        initialSession={record}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await user.click(
+    await screen.findByRole('button', {
+      name: 'Continue verification for Alice',
+    })
+  )
+  expect(screen.getByRole('button', { name: 'Checking...' })).toBeDisabled()
+  await act(async () =>
+    finish({
+      data: {
+        success: true,
+        data: {
+          ...record,
+          BytedToken: record.SessionId,
+          LastCheckedAt: Math.floor(Date.now() / 1000),
+        },
+      },
+    })
+  )
+  expect(
+    screen.getByText(
+      'Verification is not complete yet. Finish the phone steps and wait for the next check.'
+    )
+  ).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Check verification' })
+  ).toBeDisabled()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(post).toHaveBeenCalledTimes(1)
+})
+
+test('restoring waits for current permissions before enabling continuation', async () => {
+  const user = userEvent.setup()
+  const record = validationRecord()
+  let finish!: (response: unknown) => void
+  vi.mocked(api.get).mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve
+      })
+  )
+  const post = vi.spyOn(api, 'post')
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        initialSession={record}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  const resume = screen.getByRole('button', {
+    name: 'Continue verification for Alice',
+  })
+  expect(resume).toBeDisabled()
+  await user.click(resume)
+  await act(async () =>
+    finish({
+      data: {
+        success: true,
+        data: {
+          ...record,
+          CanContinue: false,
+          ContinueError: {
+            Code: 'ValidationReadOnly',
+            Message: 'This credential has read-only access',
+          },
+        },
+      },
+    })
+  )
+  expect(
+    await screen.findByText('This credential has read-only access')
+  ).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: 'Continue verification for Alice' })
+  ).not.toBeInTheDocument()
+  expect(post).not.toHaveBeenCalled()
+})
+
+test('an empty channel list explains why verification cannot start', async () => {
+  const user = userEvent.setup()
+  vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
+  const post = vi.spyOn(api, 'post')
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await user.type(screen.getByLabelText('Name'), 'Alice')
+  expect(
+    await screen.findByText(
+      'No material channel is available for human verification'
+    )
+  ).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Start verification' })
+  ).toBeDisabled()
+  expect(post).not.toHaveBeenCalled()
 })

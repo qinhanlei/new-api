@@ -31,6 +31,11 @@ import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
 import { Button } from '@/components/ui/button'
 import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import {
   Form,
   FormControl,
   FormField,
@@ -39,6 +44,8 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { NativeSelect } from '@/components/ui/native-select'
 import { toIntlLocale } from '@/i18n/languages'
 import {
   getServerErrorMessage,
@@ -50,7 +57,8 @@ import {
 import {
   assetQueryKeys,
   executeAssetAction,
-  getAssetValidationSessions,
+  getAssetValidationChannels,
+  getAssetValidationRecord,
 } from '../api'
 import { assetGroupSchema } from '../lib/schemas'
 import {
@@ -67,13 +75,16 @@ import { AssetValidationStatus } from './asset-validation-status'
 export function AssetValidationDialog(props: {
   project: string
   scope: AssetScope
+  initialSession?: AssetValidationSummary
+  onOpenRecords?: () => void
   onClose: () => void
   onCreated: (groupId: string) => void
 }) {
   const { t, i18n } = useTranslation()
   const client = useQueryClient()
   const id = useId()
-  const [session, setSession] = useState<AssetValidationView | null>(null)
+  const [activeView, setSession] = useState<AssetValidationView | null>(null)
+  const [selectedChannel, setSelectedChannel] = useState(0)
   const [now, setNow] = useState(Date.now)
   const [polling, setPolling] = useState({
     nextAt: 0,
@@ -85,7 +96,11 @@ export function AssetValidationDialog(props: {
   })
   const activeSession = useRef('')
   const completedSession = useRef('')
-  const request = useRef<{ name: string; key: string } | null>(null)
+  const request = useRef<{
+    name: string
+    channelId: number
+    key: string
+  } | null>(null)
   const mounted = useRef(false)
   useEffect(() => {
     mounted.current = true
@@ -97,18 +112,52 @@ export function AssetValidationDialog(props: {
     resolver: zodResolver(assetGroupSchema(t)),
     defaultValues: { name: '' },
   })
-  const sessions = useQuery({
-    queryKey: [...assetQueryKeys.all, 'validation', props.project, props.scope],
+  const record = useQuery({
+    queryKey: [
+      ...assetQueryKeys.all,
+      'validation',
+      'record',
+      props.project,
+      props.scope,
+      props.initialSession?.SessionId,
+    ],
     queryFn: ({ signal }) =>
-      getAssetValidationSessions(props.project, props.scope, signal),
-    refetchInterval: 10_000,
+      getAssetValidationRecord(
+        props.initialSession?.SessionId ?? '',
+        props.project,
+        props.scope,
+        signal
+      ),
+    enabled: Boolean(props.initialSession) && !activeView,
     meta: { errorToast: false },
   })
+  const initial = record.data ?? props.initialSession
+  const session: AssetValidationView | null =
+    activeView ??
+    (initial ? { ...initial, BytedToken: initial.SessionId } : null)
+  const restoring = Boolean(initial && !activeView)
+  const channels = useQuery({
+    queryKey: [
+      ...assetQueryKeys.all,
+      'validation',
+      'channels',
+      props.project,
+      props.scope,
+    ],
+    queryFn: ({ signal }) =>
+      getAssetValidationChannels(props.project, props.scope, signal),
+    enabled: !session,
+    meta: { errorToast: false },
+  })
+  const channelId =
+    channels.data?.length === 1 ? channels.data[0].Id : selectedChannel
+  const channelAvailable =
+    channels.data?.some((item) => item.Id === channelId) === true
   function receiveSession(result: AssetValidationView, expectedId?: string) {
     void client.invalidateQueries({
       queryKey: [...assetQueryKeys.all, 'validation'],
     })
-    const ready = result.Status === 'created' && result.GroupId
+    const ready = Boolean(result.GroupId)
     if (ready) void client.invalidateQueries({ queryKey: assetQueryKeys.all })
     if (
       !mounted.current ||
@@ -121,11 +170,7 @@ export function AssetValidationDialog(props: {
     setSession(result)
     setNow(receivedAt)
     setPolling((previous) => {
-      const binding =
-        previous.binding ||
-        (result.CanPoll &&
-          (result.Status === 'unknown' ||
-            result.ExpiresAt * 1000 <= receivedAt))
+      const binding = previous.binding || result.BindingPending
       let until = previous.until || result.ExpiresAt * 1000
       if (binding && !previous.binding) until = receivedAt + 10 * 60_000
       return {
@@ -152,14 +197,19 @@ export function AssetValidationDialog(props: {
 
   const create = useMutation({
     mutationFn: (values: { name: string }) => {
-      if (!request.current || request.current.name !== values.name) {
-        request.current = { name: values.name, key: nanoid() }
+      if (
+        !request.current ||
+        request.current.name !== values.name ||
+        request.current.channelId !== channelId
+      ) {
+        request.current = { name: values.name, channelId, key: nanoid() }
       }
       return executeAssetAction<AssetValidationView>(
         'CreateVisualValidateSession',
         {
           ProjectName: props.project,
           Name: values.name,
+          ChannelId: channelId,
           IdempotencyKey: request.current.key,
         },
         props.scope
@@ -219,6 +269,8 @@ export function AssetValidationDialog(props: {
               ...previous,
               H5Link: undefined,
               CallbackURL: undefined,
+              CanContinue: false,
+              CanPoll: false,
             }
         )
       }
@@ -229,9 +281,11 @@ export function AssetValidationDialog(props: {
   })
   const checkSession = check.mutate
   const sessionId = session?.BytedToken
-  const status = session?.Status
+  const status = session?.GroupId ? 'created' : session?.Status
   const expiresAt = (session?.ExpiresAt || 0) * 1000
-  const canPoll = session?.CanPoll === true && status !== 'created'
+  const canContinue =
+    session?.CanContinue === true && status !== 'created' && !polling.blocked
+  const canPoll = !restoring && canContinue && session?.CanPoll === true
   const nextCheckAt = Math.max(
     polling.nextAt,
     (session?.NextPollAt || 0) * 1000
@@ -300,19 +354,17 @@ export function AssetValidationDialog(props: {
   ])
 
   function continueSession(item: AssetValidationSummary) {
+    if (!item.CanContinue || item.GroupId || !record.isSuccess) return
     const time = Date.now()
-    const binding =
-      item.CanPoll &&
-      (item.Status === 'unknown' || item.ExpiresAt * 1000 <= time)
     activeSession.current = item.SessionId
     setSession({ ...item, BytedToken: item.SessionId })
     setNow(time)
     setPolling({
       nextAt: (item.NextPollAt || 0) * 1000,
-      until: binding ? time + 10 * 60_000 : item.ExpiresAt * 1000,
+      until: item.BindingPending ? time + 10 * 60_000 : item.ExpiresAt * 1000,
       failures: 0,
       blocked: false,
-      binding,
+      binding: item.BindingPending,
       expiryChecked: false,
     })
     create.reset()
@@ -324,17 +376,22 @@ export function AssetValidationDialog(props: {
 
   const expired = Boolean(session && expiresAt <= now)
   const link =
-    !expired &&
-    !polling.blocked &&
-    (status === 'pending' || status === 'verifying')
+    !expired && canContinue && (status === 'pending' || status === 'verifying')
       ? assetValidationH5Link(
           session?.H5Link,
           i18n.resolvedLanguage || i18n.language
         )
       : ''
   const error = create.error || check.error
+  const errorStatus = getServerErrorStatus(error)
+  const transientError =
+    Boolean(error) &&
+    (errorStatus === undefined ||
+      errorStatus === 408 ||
+      errorStatus === 429 ||
+      (errorStatus !== undefined && errorStatus >= 500))
   const sessionError = session?.Error
-    ? `${session.Error.Code}: ${translateServerText(t, session.Error.Message)}`
+    ? translateServerText(t, session.Error.Message)
     : ''
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   return (
@@ -346,13 +403,24 @@ export function AssetValidationDialog(props: {
       )}
       onOpenChange={(open) => !open && !create.isPending && props.onClose()}
       footer={
-        <Button
-          variant='outline'
-          onClick={props.onClose}
-          disabled={create.isPending}
-        >
-          {t('Close')}
-        </Button>
+        <>
+          {props.onOpenRecords && (
+            <Button
+              variant='ghost'
+              onClick={props.onOpenRecords}
+              disabled={create.isPending}
+            >
+              {t('Verification records')}
+            </Button>
+          )}
+          <Button
+            variant='outline'
+            onClick={props.onClose}
+            disabled={create.isPending}
+          >
+            {t('Close')}
+          </Button>
+        </>
       }
     >
       <div className='space-y-4'>
@@ -360,7 +428,11 @@ export function AssetValidationDialog(props: {
           <div className='space-y-3'>
             <div className='flex flex-wrap items-center gap-2'>
               <p className='min-w-0 font-medium break-words'>{session.Name}</p>
-              <AssetValidationStatus status={session.Status} />
+              <AssetValidationStatus
+                status={status ?? session.Status}
+                needsReview={session.NeedsReview}
+                bindingPending={session.BindingPending}
+              />
             </div>
             {link && (
               <>
@@ -407,20 +479,75 @@ export function AssetValidationDialog(props: {
                 </p>
               </>
             )}
-            {(status === 'expired' || expired) && !canPoll && (
-              <p className='text-muted-foreground text-sm'>
+            <dl className='grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-sm'>
+              <dt className='text-muted-foreground'>{t('Project')}</dt>
+              <dd className='break-words'>{props.project}</dd>
+              <dt className='text-muted-foreground'>
+                {t('Verification channel')}
+              </dt>
+              <dd className='break-words'>
+                {session.ChannelName || session.ChannelId}
+              </dd>
+              <dt className='text-muted-foreground'>{t('Last checked')}</dt>
+              <dd>
+                {session.LastCheckedAt
+                  ? new Date(session.LastCheckedAt * 1000).toLocaleString(
+                      locale
+                    )
+                  : t('Not recorded')}
+              </dd>
+            </dl>
+            {restoring && record.isPending && <LoadingState />}
+            {restoring && record.isError && (
+              <ErrorState
+                description={getServerErrorMessage(record.error)}
+                onRetry={() => void record.refetch()}
+              />
+            )}
+            {session.ContinueError && status !== 'created' && (
+              <p role='status' className='text-muted-foreground text-sm'>
+                {translateServerText(t, session.ContinueError.Message)}
+              </p>
+            )}
+            {session.NeedsReview && status !== 'created' && (
+              <p role='status' className='text-muted-foreground text-sm'>
                 {t(
-                  'This verification link has expired. Start a new verification if no group was created.'
+                  'The link cannot be resumed, and the provider result is unconfirmed. Check the record before starting again.'
                 )}
               </p>
             )}
-            {status === 'unknown' && (
-              <p className='text-muted-foreground text-sm'>
+            {session.BindingPending && status !== 'created' && (
+              <p role='status' className='text-muted-foreground text-sm'>
                 {t(
-                  'The provider result is unconfirmed. Check again before starting a new verification.'
+                  'The provider result is saved. Linking can continue after the verification link expires.'
                 )}
               </p>
             )}
+            {(status === 'expired' || expired) &&
+              !session.NeedsReview &&
+              !session.BindingPending &&
+              status !== 'created' &&
+              !canPoll && (
+                <p className='text-muted-foreground text-sm'>
+                  {t('This verification link has expired.')}
+                </p>
+              )}
+            {check.isPending && (
+              <p role='status' className='text-muted-foreground text-sm'>
+                {t('Checking...')}
+              </p>
+            )}
+            {check.isSuccess &&
+              canContinue &&
+              !session.BindingPending &&
+              !session.NeedsReview &&
+              !check.isPending && (
+                <p role='status' className='text-muted-foreground text-sm'>
+                  {t(
+                    'Verification is not complete yet. Finish the phone steps and wait for the next check.'
+                  )}
+                </p>
+              )}
             {sessionError && !check.error && (
               <p
                 role={status === 'failed' ? 'alert' : 'status'}
@@ -446,55 +573,119 @@ export function AssetValidationDialog(props: {
                   )}
                 </p>
               )}
+            {session.Error && (
+              <Collapsible className='text-muted-foreground text-xs'>
+                <CollapsibleTrigger
+                  render={<Button variant='ghost' size='sm' />}
+                >
+                  {t('Diagnostic details')}
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <p className='mt-2 break-all'>{session.Error.Code}</p>
+                </CollapsibleContent>
+              </Collapsible>
+            )}
             <div className='flex flex-wrap gap-2'>
-              <Button
-                variant='outline'
-                disabled={check.isPending || cooldown || status === 'created'}
-                onClick={() => {
-                  if (Date.now() < nextCheckAt) return
-                  setPolling((previous) => ({
-                    ...previous,
-                    blocked: false,
-                    until: previous.binding
-                      ? Date.now() + 10 * 60_000
-                      : session.ExpiresAt * 1000,
-                  }))
-                  check.mutate(session.BytedToken)
-                }}
-              >
-                {check.isPending ? t('Checking...') : t('Check verification')}
-              </Button>
-              <Button
-                variant='ghost'
-                disabled={check.isPending}
-                onClick={() => {
-                  activeSession.current = ''
-                  setSession(null)
-                  setPolling({
-                    nextAt: 0,
-                    until: 0,
-                    failures: 0,
-                    blocked: false,
-                    binding: false,
-                    expiryChecked: false,
-                  })
-                  create.reset()
-                  check.reset()
-                  request.current = null
-                }}
-              >
-                {t('Back')}
-              </Button>
+              {status === 'created' && session.GroupId && (
+                <Button
+                  onClick={() => {
+                    if (session.GroupId) props.onCreated(session.GroupId)
+                  }}
+                >
+                  {t('View person group')}
+                </Button>
+              )}
+              {restoring && canContinue && initial && (
+                <Button
+                  disabled={!record.isSuccess || record.isFetching || cooldown}
+                  aria-label={t('Continue verification for {{name}}', {
+                    name: session.Name,
+                  })}
+                  onClick={() => continueSession(initial)}
+                >
+                  {t('Continue verification')}
+                </Button>
+              )}
+              {!restoring &&
+                (canContinue || check.isPending || Boolean(check.error)) &&
+                status !== 'created' && (
+                  <Button
+                    variant='outline'
+                    disabled={!canContinue || check.isPending || cooldown}
+                    onClick={() => {
+                      if (!canContinue || Date.now() < nextCheckAt) return
+                      setPolling((previous) => ({
+                        ...previous,
+                        until: previous.binding
+                          ? Date.now() + 10 * 60_000
+                          : session.ExpiresAt * 1000,
+                      }))
+                      check.mutate(session.BytedToken)
+                    }}
+                  >
+                    {check.isPending
+                      ? t('Checking...')
+                      : t('Check verification')}
+                  </Button>
+                )}
             </div>
+            {status !== 'created' && (
+              <p className='text-muted-foreground text-xs'>
+                {t(
+                  'Closing pauses automatic checks. Your verification remains in Verification records.'
+                )}
+              </p>
+            )}
           </div>
         ) : (
           <>
+            <p className='text-muted-foreground text-sm'>
+              {t('Project')}:{' '}
+              <span className='text-foreground'>{props.project}</span>
+            </p>
+            <div className='space-y-2'>
+              <Label htmlFor={`${id}-channel`}>
+                {t('Verification channel')}
+              </Label>
+              <NativeSelect
+                id={`${id}-channel`}
+                className='w-full'
+                value={channelId || ''}
+                disabled={
+                  channels.isPending ||
+                  create.isPending ||
+                  channels.data?.length === 1
+                }
+                onChange={(event) =>
+                  setSelectedChannel(Number(event.target.value))
+                }
+              >
+                <option value=''>{t('Select a channel')}</option>
+                {channels.data?.map((channel) => (
+                  <option key={channel.Id} value={channel.Id}>
+                    {channel.Name}
+                  </option>
+                ))}
+              </NativeSelect>
+              {channels.isPending && <LoadingState />}
+              {channels.isError && (
+                <ErrorState
+                  description={getServerErrorMessage(channels.error)}
+                  onRetry={() => void channels.refetch()}
+                />
+              )}
+              {channels.isSuccess && !channels.data.length && (
+                <p role='status' className='text-muted-foreground text-sm'>
+                  {t('No material channel is available for human verification')}
+                </p>
+              )}
+            </div>
             <Form {...form}>
               <form
                 id={id}
                 className='space-y-3'
                 onSubmit={form.handleSubmit((values) => {
-                  if (Date.now() < nextCheckAt) return
+                  if (!channelAvailable || Date.now() < nextCheckAt) return
                   check.reset()
                   create.mutate(values)
                 })}
@@ -519,7 +710,13 @@ export function AssetValidationDialog(props: {
                 />
                 <Button
                   type='submit'
-                  disabled={create.isPending || check.isPending || cooldown}
+                  disabled={
+                    !channelAvailable ||
+                    channels.isFetching ||
+                    create.isPending ||
+                    check.isPending ||
+                    cooldown
+                  }
                 >
                   {create.isPending
                     ? t('Creating...')
@@ -527,52 +724,13 @@ export function AssetValidationDialog(props: {
                 </Button>
               </form>
             </Form>
-            {sessions.isPending && <LoadingState />}
-            {sessions.isError && (
-              <ErrorState
-                description={getServerErrorMessage(sessions.error)}
-                onRetry={() => void sessions.refetch()}
-              />
-            )}
-            {Boolean(sessions.data?.length) && (
-              <section
-                className='space-y-2'
-                aria-label={t('Recent verifications')}
-              >
-                <h3 className='text-sm font-medium'>
-                  {t('Recent verifications')}
-                </h3>
-                {sessions.data?.map((item) => (
-                  <div
-                    key={item.SessionId}
-                    className='flex flex-wrap items-center gap-2 rounded-lg border p-3'
-                  >
-                    <span className='min-w-0 flex-1 text-sm break-words'>
-                      {item.Name}
-                    </span>
-                    <AssetValidationStatus status={item.Status} />
-                    <Button
-                      variant='outline'
-                      size='sm'
-                      disabled={check.isPending || create.isPending}
-                      aria-label={t('Continue verification for {{name}}', {
-                        name: item.Name,
-                      })}
-                      onClick={() => continueSession(item)}
-                    >
-                      {t('Continue')}
-                    </Button>
-                  </div>
-                ))}
-              </section>
-            )}
           </>
         )}
         {error && (
           <p
-            role={autoChecking ? 'status' : 'alert'}
+            role={transientError ? 'status' : 'alert'}
             className={
-              autoChecking
+              transientError
                 ? 'text-muted-foreground text-sm break-words'
                 : 'text-destructive text-sm break-words'
             }

@@ -164,6 +164,11 @@ func assetManagementActor(c *gin.Context, action string) (dto.AssetActor, bool) 
 	actor.AllUsers = allUsers
 	actor.InitiatorID = c.GetInt("id")
 	actor.AccessTokenID = c.GetInt("access_token_id")
+	if c.GetBool("use_access_token") && actor.AccessTokenID > 0 {
+		permissions := c.GetStringSlice("access_token_scopes")
+		actor.ReadOnly = !service.AccessTokenScopeGranted(permissions, "asset:write") ||
+			(actor.UserID != actor.InitiatorID && !service.AccessTokenScopeGranted(permissions, "user:write"))
+	}
 	if identity, ok := middleware.GetStepUpIdentity(c); ok {
 		actor.AuthSessionID = identity.SessionID
 		actor.UserAuthVersion = identity.UserAuthVersion
@@ -252,6 +257,74 @@ func ListAssetValidationSessions(c *gin.Context) {
 		return
 	}
 	result, err := service.ListAssetValidationSessions(c.Request.Context(), actor, c.Query("project_name"))
+	if err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
+	common.ApiSuccess(c, result)
+}
+
+func ListAssetValidationRecords(c *gin.Context) {
+	actor, ok := assetManagementActor(c, "ListVisualValidateRecords")
+	if !ok {
+		return
+	}
+	page, pageErr := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, sizeErr := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageErr != nil || sizeErr != nil || page <= 0 || pageSize <= 0 {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid verification record filters"))
+		return
+	}
+	filter := dto.AssetValidationRecordFilter{Page: page, PageSize: pageSize, Name: c.Query("name"), Status: c.Query("status"), Archived: c.Query("archived")}
+	result, err := service.ListAssetValidationRecords(c.Request.Context(), actor, c.Query("project_name"), filter)
+	if err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
+	common.ApiSuccess(c, result)
+}
+
+func GetAssetValidationRecord(c *gin.Context) {
+	actor, ok := assetManagementActor(c, "GetVisualValidateRecord")
+	if !ok {
+		return
+	}
+	result, err := service.GetAssetValidationRecord(c.Request.Context(), actor, c.Param("id"), c.Query("project_name"))
+	if err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
+	common.ApiSuccess(c, result)
+}
+
+func ArchiveAssetValidationRecords(c *gin.Context) {
+	actor, ok := assetManagementActor(c, "ArchiveVisualValidateRecords")
+	if !ok {
+		return
+	}
+	var input dto.AssetValidationArchive
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10))
+	if err != nil || common.Unmarshal(body, &input) != nil {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+		return
+	}
+	if err = service.ArchiveAssetValidationRecords(c.Request.Context(), actor, input); err != nil {
+		writeAssetManagementError(c, err)
+		return
+	}
+	recordManageAuditFor(c, actor.UserID, "asset.manage", map[string]any{
+		"action": "ArchiveVisualValidateRecords", "project_name": input.ProjectName,
+		"record_count": len(input.SessionIDs), "archived": *input.Archived,
+	})
+	common.ApiSuccess(c, nil)
+}
+
+func ListAssetValidationChannels(c *gin.Context) {
+	actor, ok := assetManagementActor(c, "ListVisualValidateChannels")
+	if !ok {
+		return
+	}
+	result, err := service.ListAssetValidationChannels(c.Request.Context(), actor)
 	if err != nil {
 		writeAssetManagementError(c, err)
 		return

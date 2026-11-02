@@ -24,6 +24,8 @@ import type { AssetValidationSummary } from '../types'
 
 export function AssetValidationStatus(props: {
   status: AssetValidationSummary['Status']
+  needsReview?: boolean
+  bindingPending?: boolean
 }) {
   const { t } = useTranslation()
   let label = t('Awaiting verification')
@@ -41,11 +43,15 @@ export function AssetValidationStatus(props: {
       label = t('Verification failed')
       break
     case 'expired':
-      label = t('Verification expired')
+      label = t('Verification link expired')
       break
     case 'unknown':
       label = t('Verification outcome unknown')
       break
+  }
+  if (props.status !== 'created') {
+    if (props.bindingPending) label = t('Linking person group')
+    else if (props.needsReview) label = t('Result needs review')
   }
   return <Badge variant='secondary'>{label}</Badge>
 }

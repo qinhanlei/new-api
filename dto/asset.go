@@ -12,6 +12,7 @@ type AssetActor struct {
 	AuthSessionID   string
 	UserAuthVersion int64
 	SessionVersion  int64
+	ReadOnly        bool
 }
 
 type AssetStorageFields struct {

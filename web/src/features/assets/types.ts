@@ -62,6 +62,16 @@ export interface AssetValidationSummary {
   ChannelId: number
   ExpiresAt: number
   CanPoll: boolean
+  CanContinue: boolean
+  ContinueError?: { Code: string; Message: string }
+  NeedsReview: boolean
+  BindingPending: boolean
+  CanArchive: boolean
+  ArchivedAt: number
+  CreatedAt: number
+  LastCheckedAt: number
+  ChannelName?: string
+  ProjectName?: string
   NextPollAt?: number
   Error?: { Code: string; Message: string }
 }
@@ -73,6 +83,27 @@ export interface AssetValidationView extends Omit<
   BytedToken: string
   H5Link?: string
   CallbackURL?: string
+}
+
+export interface AssetValidationRecordFilter {
+  page: number
+  page_size: number
+  name?: string
+  status: 'all' | 'pending' | 'completed' | 'needs_review' | 'ended'
+  archived: 'active' | 'archived' | 'all'
+}
+
+export interface AssetValidationRecords {
+  Items: AssetValidationSummary[]
+  TotalCount: number
+  PendingCount: number
+  Page: number
+  PageSize: number
+}
+
+export interface AssetValidationChannel {
+  Id: number
+  Name: string
 }
 
 export interface Asset {

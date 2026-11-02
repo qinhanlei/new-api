@@ -19,6 +19,15 @@ For commercial licensing, please contact support@quantumnous.com
 // Static translation keys that don't get picked up by the t('...') regex.
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
+  // Human verification management errors returned by the backend.
+  'Your current credential cannot change verification records',
+  'Continue with the API credential that started this verification',
+  'Continue in the login session that started this verification',
+  'The verification channel configuration has changed',
+  'Waiting or checking verification records cannot be archived',
+  'Archive records with unconfirmed results individually',
+  'Invalid verification record filters',
+  'Select between 1 and 50 verification records',
   'Viewed asset storage secret key',
   'Viewed channel asset secret key (ID: {{id}})',
   'The upstream material list was invalid',

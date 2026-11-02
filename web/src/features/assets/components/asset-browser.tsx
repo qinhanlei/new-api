@@ -19,9 +19,10 @@ For commercial licensing, please contact support@quantumnous.com
 import {
   useInfiniteQuery,
   useMutation,
+  useQuery,
   useQueryClient,
 } from '@tanstack/react-query'
-import { Copy, MoreHorizontal, Plus, RefreshCw } from 'lucide-react'
+import { Copy, History, MoreHorizontal, Plus, RefreshCw } from 'lucide-react'
 import {
   lazy,
   Suspense,
@@ -51,10 +52,22 @@ import {
 import { Label } from '@/components/ui/label'
 import { NativeSelect } from '@/components/ui/native-select'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatNumber } from '@/lib/format'
+import { handleServerError } from '@/lib/handle-server-error'
 import { getServerErrorMessage } from '@/lib/server-error-message'
 
-import { assetQueryKeys, executeAssetAction } from '../api'
-import type { AssetGroup, AssetGroupType, AssetScope } from '../types'
+import {
+  assetQueryKeys,
+  executeAssetAction,
+  getAssetValidationRecords,
+} from '../api'
+import type {
+  AssetGroup,
+  AssetGroupType,
+  AssetScope,
+  AssetValidationSummary,
+} from '../types'
 import { AssetCreateDialog } from './asset-create-dialog'
 import { AssetGroupDialog } from './asset-group-dialog'
 import { AssetGroupLifecycle } from './asset-group-lifecycle'
@@ -65,6 +78,12 @@ type AssetGroupTarget = { group: AssetGroup; scope: AssetScope }
 const AssetValidationDialog = lazy(() =>
   import('./asset-validation-dialog').then((module) => ({
     default: module.AssetValidationDialog,
+  }))
+)
+
+const AssetValidationRecordsDrawer = lazy(() =>
+  import('./asset-validation-records').then((module) => ({
+    default: module.AssetValidationRecordsDrawer,
   }))
 )
 
@@ -83,13 +102,16 @@ export function AssetBrowser({
   filterControls?: ReactNode
   filterActions?: ReactNode
 }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const id = useId()
   const client = useQueryClient()
   const { copyToClipboard } = useCopyToClipboard()
   const [groupId, setGroupId] = useState('')
   const [groupType, setGroupType] = useState<AssetGroupType>('AIGC')
   const [validating, setValidating] = useState(false)
+  const [validationRecord, setValidationRecord] =
+    useState<AssetValidationSummary>()
+  const [showRecords, setShowRecords] = useState(false)
   const [groupDialog, setGroupDialog] = useState<{
     group?: AssetGroup
     project: string
@@ -117,9 +139,78 @@ export function AssetBrowser({
     meta: { errorToast: false },
   })
   const items = groups.data?.pages.flatMap((page) => page.Items) ?? []
-  const group = items.find((item) => item.Id === groupId) ?? items[0]
+  const listedGroup = items.find((item) => item.Id === groupId)
+  const selectedGroup = useQuery({
+    queryKey: [...assetQueryKeys.all, 'group', groupId, project, scope],
+    queryFn: ({ signal }) =>
+      executeAssetAction<AssetGroup>(
+        'GetAssetGroup',
+        { ProjectName: project, Id: groupId },
+        scope,
+        signal
+      ),
+    enabled: Boolean(groupId && !listedGroup && !scope.allUsers),
+    staleTime: 30_000,
+    retry: false,
+    meta: { errorToast: false },
+  })
+  const selected =
+    selectedGroup.data?.Id === groupId ? selectedGroup.data : undefined
+  const group = groupId ? (listedGroup ?? selected) : items[0]
+  const groupOptions = selected && !listedGroup ? [...items, selected] : items
+  const recordsCount = useQuery({
+    queryKey: [
+      ...assetQueryKeys.all,
+      'validation-records-count',
+      project,
+      scope,
+    ],
+    queryFn: ({ signal }) =>
+      getAssetValidationRecords(
+        project,
+        scope,
+        {
+          page: 1,
+          page_size: 1,
+          status: 'all',
+          archived: 'active',
+        },
+        signal
+      ),
+    enabled: groupType === 'LivenessFace' && !scope.allUsers,
+    refetchInterval: 30_000,
+    meta: { errorToast: false },
+  })
+  async function viewVerifiedGroup(id: string) {
+    const result = await client.fetchQuery({
+      queryKey: [...assetQueryKeys.all, 'group', id, project, scope],
+      queryFn: ({ signal }) =>
+        executeAssetAction<AssetGroup>(
+          'GetAssetGroup',
+          { ProjectName: project, Id: id },
+          scope,
+          signal
+        ),
+      staleTime: 0,
+    })
+    if (
+      result.Id !== id ||
+      result.GroupType !== 'LivenessFace' ||
+      result.ProjectName !== project
+    ) {
+      throw new Error(t('The verified person group is unavailable.'))
+    }
+    setGroupId(id)
+    setValidating(false)
+    setShowRecords(false)
+    setValidationRecord(undefined)
+  }
   const frozen = Boolean(group?.Status && group.Status !== 'active')
-  const addingGroup = items.find((item) => item.Id === adding?.group.Id)
+  const addingGroup =
+    items.find((item) => item.Id === adding?.group.Id) ??
+    (selected?.Id === adding?.group.Id && !selectedGroup.isError
+      ? selected
+      : undefined)
   const canAddToGroup = Boolean(
     adding &&
     (adding.group.GroupType !== 'LivenessFace' ||
@@ -135,8 +226,14 @@ export function AssetBrowser({
         { ProjectName: target.group.ProjectName, Id: target.group.Id },
         target.scope
       ),
-    onSuccess: (result) => {
+    onSuccess: (result, target) => {
       setDeleting(null)
+      if (
+        (!result.Status || result.Status === 'deleted') &&
+        groupId === target.group.Id
+      ) {
+        setGroupId('')
+      }
       void client.invalidateQueries({ queryKey: assetQueryKeys.all })
       toast.success(
         result.Status && result.Status !== 'deleted'
@@ -175,6 +272,21 @@ export function AssetBrowser({
         onRetry={() => void groups.refetch()}
       />
     )
+  } else if (groupId && !group) {
+    emptyState =
+      selectedGroup.isPending && !scope.allUsers ? (
+        <LoadingState />
+      ) : (
+        <ErrorState
+          description={getServerErrorMessage(
+            selectedGroup.error,
+            t('The selected asset group is unavailable.')
+          )}
+          onRetry={() =>
+            void (scope.allUsers ? groups.refetch() : selectedGroup.refetch())
+          }
+        />
+      )
   }
   return (
     <>
@@ -182,6 +294,31 @@ export function AssetBrowser({
         <SectionPageLayout.Title>{t('Asset library')}</SectionPageLayout.Title>
         <SectionPageLayout.Actions>
           {settingsActions}
+          {groupType === 'LivenessFace' && !scope.allUsers && (
+            <>
+              <Button variant='outline' onClick={() => setShowRecords(true)}>
+                <History className='size-4' aria-hidden='true' />
+                {t('Verification records')}
+                {recordsCount.data && recordsCount.data.PendingCount > 0 && (
+                  <span aria-label={t('Pending verification records')}>
+                    {formatNumber(
+                      recordsCount.data.PendingCount,
+                      toIntlLocale(i18n.resolvedLanguage || i18n.language)
+                    )}
+                  </span>
+                )}
+              </Button>
+              <Button
+                variant='outline'
+                onClick={() => {
+                  setValidationRecord(undefined)
+                  setValidating(true)
+                }}
+              >
+                {t('Verify a person')}
+              </Button>
+            </>
+          )}
           <Button
             disabled={!group || scope.allUsers || frozen}
             onClick={() => group && setAdding({ group, scope: { ...scope } })}
@@ -236,6 +373,8 @@ export function AssetBrowser({
                           setAdding(null)
                           setGroupDialog(null)
                           setValidating(false)
+                          setShowRecords(false)
+                          setValidationRecord(undefined)
                           setDeleting(null)
                         }}
                       >
@@ -249,14 +388,19 @@ export function AssetBrowser({
                         <NativeSelect
                           id={id}
                           className='w-48 max-w-full'
-                          value={group?.Id ?? ''}
+                          value={group?.Id ?? groupId}
                           onChange={(event) => setGroupId(event.target.value)}
                           disabled={groups.isPending}
                         >
-                          {!items.length && (
+                          {!groupOptions.length && !groupId && (
                             <option value=''>{t('No asset groups')}</option>
                           )}
-                          {items.map((item) => (
+                          {groupId && !group && (
+                            <option value={groupId}>
+                              {t('Selected group unavailable')}
+                            </option>
+                          )}
+                          {groupOptions.map((item) => (
                             <option value={item.Id} key={item.Id}>
                               {scope.allUsers
                                 ? `${item.Name} (${item.UserId})`
@@ -393,10 +537,38 @@ export function AssetBrowser({
           <AssetValidationDialog
             project={project}
             scope={scope}
-            onClose={() => setValidating(false)}
-            onCreated={(createdId) => {
-              setGroupId(createdId)
+            initialSession={validationRecord}
+            onClose={() => {
               setValidating(false)
+              setValidationRecord(undefined)
+            }}
+            onOpenRecords={() => {
+              setValidating(false)
+              setValidationRecord(undefined)
+              setShowRecords(true)
+            }}
+            onCreated={(createdId) => {
+              void viewVerifiedGroup(createdId).catch(handleServerError)
+            }}
+          />
+        </Suspense>
+      )}
+      {showRecords && !scope.allUsers && (
+        <Suspense fallback={<LoadingState />}>
+          <AssetValidationRecordsDrawer
+            project={project}
+            scope={scope}
+            onClose={() => setShowRecords(false)}
+            onContinue={(record) => {
+              setShowRecords(false)
+              setValidationRecord(record)
+              setValidating(true)
+            }}
+            onViewGroup={viewVerifiedGroup}
+            onStartNew={() => {
+              setShowRecords(false)
+              setValidationRecord(undefined)
+              setValidating(true)
             }}
           />
         </Suspense>

@@ -166,6 +166,7 @@ export function MobileCardList<TData>(props: MobileCardListProps<TData>) {
           <Checkbox
             checked={table.getIsAllPageRowsSelected()}
             indeterminate={table.getIsSomePageRowsSelected()}
+            disabled={!rows.some((row) => row.getCanSelect())}
             onCheckedChange={(value) =>
               table.toggleAllPageRowsSelected(Boolean(value))
             }
@@ -188,6 +189,7 @@ export function MobileCardList<TData>(props: MobileCardListProps<TData>) {
                 <Checkbox
                   className='mt-0.5'
                   checked={row.getIsSelected()}
+                  disabled={!row.getCanSelect()}
                   onCheckedChange={(value) =>
                     row.toggleSelected(Boolean(value))
                   }

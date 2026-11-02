@@ -32,6 +32,9 @@ import type {
   AssetStorageConfig,
   AssetStorageUpdate,
   AssetValidationSummary,
+  AssetValidationRecordFilter,
+  AssetValidationRecords,
+  AssetValidationChannel,
 } from './types'
 
 interface AssetResponse<T> {
@@ -128,6 +131,70 @@ export async function getAssetValidationSessions(
 ) {
   const { data } = await api.get<AssetResponse<AssetValidationSummary[]>>(
     '/api/assets/validation/sessions',
+    {
+      ...authRequestOptions,
+      signal,
+      params: { project_name: project, user_id: scope.userId },
+    }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function getAssetValidationRecords(
+  project: string,
+  scope: AssetScope,
+  filter: AssetValidationRecordFilter,
+  signal?: AbortSignal
+) {
+  const { data } = await api.get<AssetResponse<AssetValidationRecords>>(
+    '/api/assets/validation/records',
+    {
+      ...authRequestOptions,
+      signal,
+      params: { project_name: project, user_id: scope.userId, ...filter },
+    }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function getAssetValidationRecord(
+  id: string,
+  project: string,
+  scope: AssetScope,
+  signal?: AbortSignal
+) {
+  const { data } = await api.get<AssetResponse<AssetValidationSummary>>(
+    `/api/assets/validation/records/${encodeURIComponent(id)}`,
+    {
+      ...authRequestOptions,
+      signal,
+      params: { project_name: project, user_id: scope.userId },
+    }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function archiveAssetValidationRecords(
+  project: string,
+  scope: AssetScope,
+  sessionIds: string[],
+  archived: boolean
+) {
+  const { data } = await api.post<AssetResponse<null>>(
+    '/api/assets/validation/records/archive',
+    { ProjectName: project, SessionIds: sessionIds, Archived: archived },
+    { ...authRequestOptions, params: { user_id: scope.userId } }
+  )
+  requireServerSuccess(data)
+}
+
+export async function getAssetValidationChannels(
+  project: string,
+  scope: AssetScope,
+  signal?: AbortSignal
+) {
+  const { data } = await api.get<AssetResponse<AssetValidationChannel[]>>(
+    '/api/assets/validation/channels',
     {
       ...authRequestOptions,
       signal,

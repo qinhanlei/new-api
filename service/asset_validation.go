@@ -85,7 +85,11 @@ func assetValidationError(err error) error {
 	case errors.Is(err, model.ErrAssetValidationThrottled):
 		return assetError(http.StatusTooManyRequests, "Throttling", "Human verification is busy; retry shortly")
 	case errors.Is(err, model.ErrUserSessionInactive):
-		return assetError(http.StatusForbidden, "AccessDenied", "The original verification authorization is no longer valid")
+		return assetError(http.StatusForbidden, "ValidationAuthorizationRevoked", "The original verification authorization is no longer valid")
+	case errors.Is(err, model.ErrAssetValidationActive):
+		return assetError(http.StatusConflict, "ValidationStillActive", "Waiting or checking verification records cannot be archived")
+	case errors.Is(err, model.ErrAssetValidationReviewBatch):
+		return assetError(http.StatusConflict, "ValidationReviewRequired", "Archive records with unconfirmed results individually")
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		return assetError(http.StatusNotFound, "ResourceNotFound", "The verification session was not found")
 	default:
@@ -93,10 +97,28 @@ func assetValidationError(err error) error {
 	}
 }
 
+func assetValidationActorFailure(actor dto.AssetActor, session *model.AssetValidationSession) *dto.AssetFailure {
+	if actor.ReadOnly {
+		return &dto.AssetFailure{Code: "ValidationReadOnly", Message: "Your current credential cannot change verification records"}
+	}
+	if actor.AllUsers || actor.UserID != session.UserID || actor.InitiatorID != session.InitiatorID {
+		return &dto.AssetFailure{Code: "AccessDenied", Message: "The original verification authorization is no longer valid"}
+	}
+	if actor.TokenID != session.TokenID || actor.AccessTokenID != session.AccessTokenID {
+		return &dto.AssetFailure{Code: "ValidationCredentialMismatch", Message: "Continue with the API credential that started this verification"}
+	}
+	if actor.AuthSessionID != session.AuthSessionID {
+		return &dto.AssetFailure{Code: "ValidationSessionMismatch", Message: "Continue in the login session that started this verification"}
+	}
+	if actor.UserAuthVersion != session.UserAuthVersion || actor.SessionVersion != session.SessionVersion {
+		return &dto.AssetFailure{Code: "ValidationAuthorizationRevoked", Message: "The original verification authorization is no longer valid"}
+	}
+	return nil
+}
+
 func authorizeAssetValidation(ctx context.Context, actor dto.AssetActor, session *model.AssetValidationSession) error {
-	if actor.AllUsers || actor.UserID != session.UserID || actor.InitiatorID != session.InitiatorID || actor.TokenID != session.TokenID || actor.AccessTokenID != session.AccessTokenID ||
-		actor.AuthSessionID != session.AuthSessionID || actor.UserAuthVersion != session.UserAuthVersion || actor.SessionVersion != session.SessionVersion {
-		return assetError(http.StatusForbidden, "AccessDenied", "The original verification authorization is no longer valid")
+	if failure := assetValidationActorFailure(actor, session); failure != nil {
+		return assetError(http.StatusForbidden, failure.Code, failure.Message)
 	}
 	if actor.TokenID > 0 && !slices.Contains(actor.ChannelIDs, session.ChannelID) {
 		return assetError(http.StatusForbidden, "AccessDenied", "The verification channel is unavailable to this caller")
@@ -108,7 +130,11 @@ func authorizeAssetValidation(ctx context.Context, actor dto.AssetActor, session
 	if !allowed {
 		return assetError(http.StatusForbidden, "AccessDenied", "The verification channel is unavailable to this caller")
 	}
-	return assetValidationError(model.ValidateAssetValidationSession(ctx, session))
+	err = model.ValidateAssetValidationSession(ctx, session)
+	if errors.Is(err, model.ErrAssetConflict) {
+		return assetError(http.StatusForbidden, "ValidationChannelChanged", "The verification channel configuration has changed")
+	}
+	return assetValidationError(err)
 }
 
 func authorizeAssetValidationChannelWithDB(ctx context.Context, tx *gorm.DB, session *model.AssetValidationSession) error {
@@ -122,48 +148,58 @@ func authorizeAssetValidationChannelWithDB(ctx context.Context, tx *gorm.DB, ses
 	return nil
 }
 
-func assetValidationSummary(session *model.AssetValidationSession) dto.AssetValidationSummary {
+func assetValidationSummary(session *model.AssetValidationSession, actor dto.AssetActor, now int64) dto.AssetValidationSummary {
 	view := dto.AssetValidationSummary{SessionID: session.PublicID, Status: session.Status, GroupID: session.GroupID, ExpiresAt: session.ExpiresAt,
-		Name: session.Name, ChannelID: session.ChannelID, NextPollAt: session.NextPollAt}
+		Name: session.Name, ChannelID: session.ChannelID, NextPollAt: session.NextPollAt, ProjectName: session.ProjectName,
+		ArchivedAt: session.ArchivedAt, CreatedAt: session.CreatedAt, LastCheckedAt: session.LastCheckedAt}
+	category := model.AssetValidationRecordCategory(session, now)
+	view.NeedsReview = category == "needs_review"
+	view.BindingPending = session.GroupID == "" && session.UpstreamGroupID != ""
+	view.CanArchive = !actor.ReadOnly && (session.ArchivedAt > 0 || (category != "pending" && session.LeaseExpiresAt <= now))
 	if session.ErrorCode != "" && session.ErrorCode != "ValidationPending" {
 		view.Error = &dto.AssetFailure{Code: session.ErrorCode, Message: session.ErrorMessage}
 	}
-	if session.Status == model.AssetValidationCreated {
+	if session.GroupID != "" {
+		view.Status = model.AssetValidationCreated
 		view.NextPollAt = 0
 		return view
 	}
-	now := time.Now().Unix()
-	if session.ExpiresAt <= now && session.UpstreamGroupID == "" {
+	if session.ExpiresAt <= now && session.UpstreamGroupID == "" && session.LeaseExpiresAt <= now {
 		view.Status = model.AssetValidationExpired
 		return view
 	}
 	if session.Status == model.AssetValidationCreating && session.LeaseExpiresAt <= now {
 		view.Status = model.AssetValidationUnknown
 	}
-	if session.Status == model.AssetValidationFailed {
-		return view
-	}
-	switch session.ErrorCode {
-	case "UpstreamConfigurationInvalid", "ValidationSecretUnavailable", "InvalidValidationGroup", "ValidationGroupMismatch":
+	if session.Status == model.AssetValidationFailed && session.UpstreamGroupID == "" && session.LeaseExpiresAt <= now {
 		return view
 	}
 	// A saved group can still be bound after the H5 credential expires. An
 	// uncertain create without a credential cannot safely be submitted again.
-	view.CanPoll = session.UpstreamGroupID != "" || session.SecretCipher != "" ||
-		(session.Status == model.AssetValidationCreating && session.LeaseExpiresAt > now)
+	view.CanContinue = session.UpstreamGroupID != "" || session.LeaseExpiresAt > now || (session.SecretCipher != "" && session.ExpiresAt > now)
+	view.CanPoll = view.CanContinue && (session.LeaseExpiresAt > now || !model.AssetValidationPollBlocked(session.ErrorCode))
+	if view.CanContinue {
+		view.ContinueError = assetValidationActorFailure(actor, session)
+		if view.ContinueError != nil {
+			view.CanContinue, view.CanPoll = false, false
+		}
+	}
 	return view
 }
 
-func assetValidationView(session *model.AssetValidationSession) (dto.AssetValidationView, error) {
-	summary := assetValidationSummary(session)
+func assetValidationView(session *model.AssetValidationSession, actor dto.AssetActor) (dto.AssetValidationView, error) {
+	summary := assetValidationSummary(session, actor, time.Now().Unix())
 	view := dto.AssetValidationView{BytedToken: session.PublicID, Status: summary.Status, GroupID: summary.GroupID, ExpiresAt: summary.ExpiresAt,
-		Name: summary.Name, ChannelID: summary.ChannelID, CanPoll: summary.CanPoll, NextPollAt: summary.NextPollAt, Error: summary.Error}
+		Name: summary.Name, ChannelID: summary.ChannelID, CanPoll: summary.CanPoll, NextPollAt: summary.NextPollAt, Error: summary.Error,
+		CanContinue: summary.CanContinue, ContinueError: summary.ContinueError, NeedsReview: summary.NeedsReview, BindingPending: summary.BindingPending,
+		CanArchive: summary.CanArchive, ArchivedAt: summary.ArchivedAt, CreatedAt: summary.CreatedAt, LastCheckedAt: summary.LastCheckedAt, ProjectName: summary.ProjectName}
 	if session.SecretCipher != "" && session.ExpiresAt > time.Now().Unix() {
 		secrets, err := openAssetValidationSecrets(session)
 		if err != nil {
 			code, message, _ := assetFailure(err)
 			view.Error = &dto.AssetFailure{Code: code, Message: message}
-			view.CanPoll = false
+			view.CanPoll, view.CanContinue = false, false
+			view.NeedsReview = session.ResourcePossible && session.UpstreamGroupID == ""
 			return view, nil
 		}
 		view.H5Link, view.CallbackURL = secrets.H5Link, secrets.CallbackURL
@@ -173,7 +209,7 @@ func assetValidationView(session *model.AssetValidationSession) (dto.AssetValida
 
 func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, input dto.AssetValidationCreate) (dto.AssetValidationView, error) {
 	var empty dto.AssetValidationView
-	if actor.UserID <= 0 || actor.InitiatorID <= 0 || actor.AllUsers || (actor.TokenID == 0 && actor.AuthSessionID == "") {
+	if actor.ReadOnly || actor.UserID <= 0 || actor.InitiatorID <= 0 || actor.AllUsers || (actor.TokenID == 0 && actor.AuthSessionID == "") {
 		return empty, assetError(http.StatusForbidden, "AccessDenied", "Human verification requires a current session or scoped API credential")
 	}
 	var err error
@@ -199,7 +235,7 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 		if err = authorizeAssetValidation(ctx, actor, existing); err != nil {
 			return empty, err
 		}
-		return assetValidationView(existing)
+		return assetValidationView(existing, actor)
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return empty, err
@@ -273,7 +309,7 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 		if err = authorizeAssetValidation(ctx, actor, session); err != nil {
 			return empty, err
 		}
-		return assetValidationView(session)
+		return assetValidationView(session, actor)
 	}
 	var upstream struct {
 		BytedToken  string `json:"BytedToken"`
@@ -315,7 +351,7 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 			return empty, err
 		}
 	}
-	return assetValidationView(session)
+	return assetValidationView(session, actor)
 }
 
 func GetAssetValidationResult(ctx context.Context, actor dto.AssetActor, token, project string) (dto.AssetValidationView, error) {
@@ -335,21 +371,21 @@ func GetAssetValidationResult(ctx context.Context, actor dto.AssetActor, token, 
 		return empty, err
 	}
 	if session.Status == model.AssetValidationCreated {
-		return assetValidationView(session)
+		return assetValidationView(session, actor)
 	}
-	if session.ExpiresAt <= time.Now().Unix() && session.UpstreamGroupID == "" {
+	if session.ExpiresAt <= time.Now().Unix() && session.UpstreamGroupID == "" && session.LeaseExpiresAt <= time.Now().Unix() {
 		if err = model.ExpireAssetValidationSecrets(ctx, time.Now().Unix()); err != nil {
 			return empty, err
 		}
 		session.SecretCipher = ""
-		return assetValidationView(session)
+		return assetValidationView(session, actor)
 	}
 	claimed, err := model.ClaimAssetValidationResult(ctx, session)
 	if err != nil {
 		return empty, assetValidationError(err)
 	}
 	if !claimed {
-		return assetValidationView(session)
+		return assetValidationView(session, actor)
 	}
 	defer func() {
 		if session.LeaseToken == "" {
@@ -458,7 +494,7 @@ func GetAssetValidationResult(ctx context.Context, actor dto.AssetActor, token, 
 			return empty, permissionErr
 		}
 	}
-	return assetValidationView(session)
+	return assetValidationView(session, actor)
 }
 
 func ListAssetValidationSessions(ctx context.Context, actor dto.AssetActor, project string) ([]dto.AssetValidationSummary, error) {
@@ -473,9 +509,156 @@ func ListAssetValidationSessions(ctx context.Context, actor dto.AssetActor, proj
 	if err != nil {
 		return nil, err
 	}
+	return assetValidationSummaries(ctx, actor, sessions, time.Now().Unix()), nil
+}
+
+// History never decrypts an H5 credential, contacts an upstream, or invokes the
+// transactional authorization path. These capabilities are hints; mutations
+// still validate the original authorization and channel under locks.
+func assetValidationSummaries(ctx context.Context, actor dto.AssetActor, sessions []model.AssetValidationSession, now int64) []dto.AssetValidationSummary {
 	items := make([]dto.AssetValidationSummary, 0, len(sessions))
+	var currentActor dto.AssetActor
+	var permissionErr error
+	permissionsLoaded := false
+	channels := make(map[int]*model.Channel)
+	configs := make(map[int]system_setting.AssetChannelConfig)
 	for _, session := range sessions {
-		items = append(items, assetValidationSummary(&session))
+		view := assetValidationSummary(&session, actor, now)
+		channel, loaded := channels[session.ChannelID]
+		if !loaded {
+			channel, _ = model.GetChannelById(session.ChannelID, true)
+			channels[session.ChannelID] = channel
+			config, _ := model.LoadAssetChannelConfig(ctx, session.ChannelID)
+			configs[session.ChannelID] = config
+		}
+		if channel != nil {
+			view.ChannelName = channel.Name
+		}
+		if view.CanContinue {
+			if !permissionsLoaded {
+				currentActor, permissionErr = AssetActorForUser(ctx, actor.UserID, actor.TokenID)
+				permissionsLoaded = true
+			}
+			if permissionErr != nil || !slices.Contains(currentActor.ChannelIDs, session.ChannelID) ||
+				(actor.TokenID > 0 && !slices.Contains(actor.ChannelIDs, session.ChannelID)) {
+				view.ContinueError = &dto.AssetFailure{Code: "ValidationChannelUnavailable", Message: "The verification channel is unavailable to this caller"}
+			} else if config := configs[session.ChannelID]; channel == nil || model.AssetChannelScope(channel) != session.ChannelScope ||
+				model.AssetValidationConfigHash(config) != session.ChannelConfig || config.ProjectName != session.UpstreamProject {
+				view.ContinueError = &dto.AssetFailure{Code: "ValidationChannelChanged", Message: "The verification channel configuration has changed"}
+			}
+			if view.ContinueError != nil {
+				view.CanContinue, view.CanPoll = false, false
+			}
+		}
+		items = append(items, view)
+	}
+	return items
+}
+
+func ListAssetValidationRecords(ctx context.Context, actor dto.AssetActor, project string, filter dto.AssetValidationRecordFilter) (dto.AssetValidationRecords, error) {
+	var result dto.AssetValidationRecords
+	if actor.UserID <= 0 || actor.InitiatorID <= 0 || actor.AllUsers {
+		return result, assetError(http.StatusForbidden, "AccessDenied", "Select an asset owner before viewing verification sessions")
+	}
+	project, err := normalizeAssetProject(project)
+	if err != nil {
+		return result, err
+	}
+	if filter.Page == 0 {
+		filter.Page = 1
+	}
+	if filter.PageSize == 0 {
+		filter.PageSize = 20
+	}
+	if filter.Status == "" {
+		filter.Status = "all"
+	}
+	if filter.Archived == "" {
+		filter.Archived = "active"
+	}
+	filter.Name = strings.TrimSpace(filter.Name)
+	if filter.Page < 1 || filter.Page > 100000 || filter.PageSize < 1 || filter.PageSize > 50 || utf8.RuneCountInString(filter.Name) > 64 || strings.ContainsRune(filter.Name, '\x00') ||
+		!slices.Contains([]string{"all", "pending", "completed", "needs_review", "ended"}, filter.Status) ||
+		!slices.Contains([]string{"active", "archived", "all"}, filter.Archived) {
+		return result, assetError(http.StatusBadRequest, "InvalidParameter", "Invalid verification record filters")
+	}
+	now := time.Now().Unix()
+	sessions, total, pending, err := model.ListAssetValidationRecords(ctx, actor.UserID, actor.InitiatorID, project, filter, now)
+	if err != nil {
+		return result, err
+	}
+	result.Items = assetValidationSummaries(ctx, actor, sessions, now)
+	result.TotalCount, result.PendingCount = total, pending
+	result.Page, result.PageSize = filter.Page, filter.PageSize
+	return result, nil
+}
+
+func GetAssetValidationRecord(ctx context.Context, actor dto.AssetActor, id, project string) (dto.AssetValidationSummary, error) {
+	var empty dto.AssetValidationSummary
+	if actor.UserID <= 0 || actor.InitiatorID <= 0 || actor.AllUsers {
+		return empty, assetError(http.StatusForbidden, "AccessDenied", "Select an asset owner before viewing verification sessions")
+	}
+	if !strings.HasPrefix(id, "validation-na-") || len(id) > 64 {
+		return empty, assetError(http.StatusBadRequest, "InvalidParameter", "Use the verification session returned by this gateway")
+	}
+	project, err := normalizeAssetProject(project)
+	if err != nil {
+		return empty, err
+	}
+	session, err := model.GetAssetValidationSession(ctx, actor.UserID, actor.InitiatorID, id, project)
+	if err != nil {
+		return empty, assetValidationError(err)
+	}
+	return assetValidationSummaries(ctx, actor, []model.AssetValidationSession{*session}, time.Now().Unix())[0], nil
+}
+
+func ArchiveAssetValidationRecords(ctx context.Context, actor dto.AssetActor, input dto.AssetValidationArchive) error {
+	if actor.ReadOnly || actor.AllUsers || actor.UserID <= 0 || actor.InitiatorID <= 0 {
+		return assetError(http.StatusForbidden, "AccessDenied", "Your current credential cannot change verification records")
+	}
+	project, err := normalizeAssetProject(input.ProjectName)
+	if err != nil {
+		return err
+	}
+	if input.Archived == nil || len(input.SessionIDs) == 0 || len(input.SessionIDs) > 50 {
+		return assetError(http.StatusBadRequest, "InvalidParameter", "Select between 1 and 50 verification records")
+	}
+	ids := slices.Clone(input.SessionIDs)
+	for _, id := range ids {
+		if !strings.HasPrefix(id, "validation-na-") || len(id) > 64 {
+			return assetError(http.StatusBadRequest, "InvalidParameter", "Use the verification session returned by this gateway")
+		}
+	}
+	slices.Sort(ids)
+	ids = slices.Compact(ids)
+	return assetValidationError(model.ArchiveAssetValidationRecords(ctx, actor.UserID, actor.InitiatorID, project, ids, *input.Archived))
+}
+
+func ListAssetValidationChannels(ctx context.Context, actor dto.AssetActor) ([]dto.AssetValidationChannel, error) {
+	if actor.UserID <= 0 || actor.InitiatorID <= 0 || actor.AllUsers {
+		return nil, assetError(http.StatusForbidden, "AccessDenied", "Select an asset owner before viewing verification sessions")
+	}
+	currentActor, err := AssetActorForUser(ctx, actor.UserID, actor.TokenID)
+	if err != nil {
+		return nil, err
+	}
+	items := []dto.AssetValidationChannel{}
+	for _, id := range currentActor.ChannelIDs {
+		if actor.TokenID > 0 && !slices.Contains(actor.ChannelIDs, id) {
+			continue
+		}
+		config, err := model.LoadAssetChannelConfig(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if config.AuthType != "bearer" && (config.AuthType != "aksk" || config.AccessKey == "" || config.SecretKey == "") {
+			continue
+		}
+		channel, err := model.GetChannelById(id, false)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, dto.AssetValidationChannel{ID: id, Name: channel.Name})
 	}
 	return items, nil
 }

@@ -43,6 +43,10 @@ func accessTokenScopeRule(scope string) accessTokenRouteRule {
 var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/assets/config":                          accessTokenScopeRule("asset:read"),
 	"GET /api/assets/validation/sessions":             accessTokenScopeRule("asset:read"),
+	"GET /api/assets/validation/records":              accessTokenScopeRule("asset:read"),
+	"GET /api/assets/validation/records/:id":          accessTokenScopeRule("asset:read"),
+	"POST /api/assets/validation/records/archive":     accessTokenScopeRule("asset:write"),
+	"GET /api/assets/validation/channels":             accessTokenScopeRule("asset:read"),
 	"POST /api/assets/actions":                        accessTokenAnyRule,
 	"POST /api/assets/batch-delete":                   accessTokenScopeRule("asset:write"),
 	"POST /api/assets/upload":                         accessTokenScopeRule("asset:write"),

@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func assetValidationFixture(t *testing.T) (dto.AssetActor, dto.AssetValidationCreate) {
@@ -281,6 +282,9 @@ func TestAssetValidationPersistsResultBeforeBinding(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	assert.True(t, list[0].CanPoll, "a saved group remains recoverable after the H5 link expires")
+	assert.True(t, list[0].BindingPending)
+	assert.True(t, list[0].CanContinue)
+	assert.False(t, list[0].CanArchive)
 	// A different process can continue with the durable GroupId after the H5
 	// credential and even the old encryption key have expired or been rotated.
 	common.CryptoSecret = "another-application-secret"
@@ -373,6 +377,14 @@ func TestAssetValidationRateAndLeaseFences(t *testing.T) {
 	assert.Equal(t, "verifying", busy.Status)
 	assert.True(t, busy.CanPoll, "an active lease must not stop clients from checking for completion")
 	assert.Zero(t, (*calls)["GetVisualValidateResult"])
+	require.NoError(t, model.DB.Model(row).Update("expires_at", time.Now().Add(-time.Minute).Unix()).Error)
+	busy, err = GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+	require.NoError(t, err)
+	assert.True(t, busy.CanPoll, "link expiry does not cancel another request's active lease")
+	assert.True(t, busy.CanContinue)
+	assert.False(t, busy.NeedsReview)
+	assert.Zero(t, (*calls)["GetVisualValidateResult"])
+	require.NoError(t, model.DB.Model(row).Update("expires_at", time.Now().Add(time.Minute).Unix()).Error)
 	require.NoError(t, model.DB.Model(row).Update("lease_expires_at", time.Now().Add(-time.Minute).Unix()).Error)
 	allowAssetValidationPoll(t, created.BytedToken)
 	claimed, err = model.ClaimAssetValidationResult(t.Context(), row)
@@ -844,4 +856,300 @@ func TestAssetValidationHonorsUpstreamRetryAfter(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAssetValidationHistoryDistinguishesAnotherCredential(t *testing.T) {
+	actor, input := assetValidationFixture(t)
+	calls := assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
+	created, err := CreateAssetValidationSession(t.Context(), actor, input)
+	require.NoError(t, err)
+	other := actor
+	other.TokenID = 2
+	items, err := ListAssetValidationSessions(t.Context(), other, "default")
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	encoded, err := common.Marshal(items[0])
+	require.NoError(t, err)
+	var record struct {
+		CanContinue   *bool
+		NeedsReview   bool
+		CanArchive    bool
+		ContinueError *dto.AssetFailure
+	}
+	require.NoError(t, common.Unmarshal(encoded, &record))
+	require.NotNil(t, record.CanContinue, "history must describe whether the current credential can continue")
+	assert.False(t, *record.CanContinue)
+	assert.False(t, record.NeedsReview, "another credential does not change a waiting result")
+	assert.False(t, record.CanArchive, "a waiting record cannot be archived by changing credentials")
+	require.NotNil(t, record.ContinueError)
+	assert.Equal(t, "ValidationCredentialMismatch", record.ContinueError.Code)
+	assert.Equal(t, "pending", items[0].Status)
+	_, err = GetAssetValidationResult(t.Context(), other, created.BytedToken, "default")
+	require.Error(t, err)
+	var failure *AssetError
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, "ValidationCredentialMismatch", failure.Code)
+	assert.Equal(t, map[string]int{"CreateVisualValidateSession": 1}, *calls)
+}
+
+func TestAssetValidationChannelsRespectCurrentEligibility(t *testing.T) {
+	actor, _ := assetValidationFixture(t)
+	channels, err := ListAssetValidationChannels(t.Context(), actor)
+	require.NoError(t, err)
+	assert.Equal(t, []dto.AssetValidationChannel{{ID: 1, Name: "channel-1"}, {ID: 2, Name: "channel-2"}}, channels)
+	encoded, err := common.Marshal(channels)
+	require.NoError(t, err)
+	assert.JSONEq(t, `[{"Id":1,"Name":"channel-1"},{"Id":2,"Name":"channel-2"}]`, string(encoded))
+	actor.ChannelIDs = []int{1}
+	channels, err = ListAssetValidationChannels(t.Context(), actor)
+	require.NoError(t, err)
+	require.Len(t, channels, 1)
+	assert.Equal(t, 1, channels[0].ID)
+	require.NoError(t, model.DB.Model(&model.Ability{}).Where("channel_id = ?", 1).Update("enabled", false).Error)
+	channels, err = ListAssetValidationChannels(t.Context(), actor)
+	require.NoError(t, err)
+	assert.Empty(t, channels)
+	actor.AllUsers = true
+	_, err = ListAssetValidationChannels(t.Context(), actor)
+	require.Error(t, err)
+}
+
+func TestAssetValidationHistoryPermissionsAndCompletedRecord(t *testing.T) {
+	actor, input := assetValidationFixture(t)
+	actor.TokenID, actor.AuthSessionID, actor.UserAuthVersion, actor.SessionVersion = 0, "validation-original-browser", 1, 1
+	require.NoError(t, model.DB.Create(&model.UserSession{SID: actor.AuthSessionID, UserID: 1, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, ExpiresAt: time.Now().Add(time.Hour).Unix()}).Error)
+	calls := assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
+	created, err := CreateAssetValidationSession(t.Context(), actor, input)
+	require.NoError(t, err)
+	assert.True(t, created.CanContinue)
+	assert.Zero(t, created.LastCheckedAt)
+	for _, tc := range []struct {
+		name   string
+		change func(*dto.AssetActor)
+		code   string
+	}{
+		{"another login", func(value *dto.AssetActor) { value.AuthSessionID = "another-browser" }, "ValidationSessionMismatch"},
+		{"revoked version", func(value *dto.AssetActor) { value.UserAuthVersion++ }, "ValidationAuthorizationRevoked"},
+		{"read only", func(value *dto.AssetActor) { value.ReadOnly = true }, "ValidationReadOnly"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			other := actor
+			tc.change(&other)
+			view, err := GetAssetValidationRecord(t.Context(), other, created.BytedToken, "default")
+			require.NoError(t, err)
+			assert.False(t, view.CanContinue)
+			assert.False(t, view.NeedsReview)
+			assert.False(t, view.CanArchive)
+			require.NotNil(t, view.ContinueError)
+			assert.Equal(t, tc.code, view.ContinueError.Code)
+			_, err = GetAssetValidationResult(t.Context(), other, created.BytedToken, "default")
+			var failure *AssetError
+			require.ErrorAs(t, err, &failure)
+			assert.Equal(t, tc.code, failure.Code)
+		})
+	}
+	require.NoError(t, model.DB.Model(&model.Ability{}).Where("channel_id = ?", 1).Update("enabled", false).Error)
+	view, err := GetAssetValidationRecord(t.Context(), actor, created.BytedToken, "default")
+	require.NoError(t, err)
+	require.NotNil(t, view.ContinueError)
+	assert.Equal(t, "ValidationChannelUnavailable", view.ContinueError.Code)
+	assert.False(t, view.CanContinue)
+	assert.Equal(t, map[string]int{"CreateVisualValidateSession": 1}, *calls)
+	require.NoError(t, model.DB.Model(&model.Ability{}).Where("channel_id = ?", 1).Update("enabled", true).Error)
+	allowAssetValidationPoll(t, created.BytedToken)
+	ready, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+	require.NoError(t, err)
+	assert.Positive(t, ready.LastCheckedAt)
+	other := actor
+	other.AuthSessionID = "another-browser"
+	completed, err := GetAssetValidationRecord(t.Context(), other, created.BytedToken, "default")
+	require.NoError(t, err)
+	assert.Equal(t, ready.GroupID, completed.GroupID)
+	assert.Equal(t, model.AssetValidationCreated, completed.Status)
+	assert.False(t, completed.CanContinue)
+	assert.Nil(t, completed.ContinueError, "viewing a finished record needs no original credential")
+	assert.True(t, completed.CanArchive)
+	assert.Equal(t, ready.LastCheckedAt, completed.LastCheckedAt)
+	other.ReadOnly = true
+	completed, err = GetAssetValidationRecord(t.Context(), other, created.BytedToken, "default")
+	require.NoError(t, err)
+	assert.False(t, completed.CanArchive)
+}
+
+func TestAssetValidationRecordsFilterOutcomeAndRemainReadOnly(t *testing.T) {
+	actor, input := assetValidationFixture(t)
+	calls := assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
+	created, err := CreateAssetValidationSession(t.Context(), actor, input)
+	require.NoError(t, err)
+	base, err := model.GetAssetValidationSession(t.Context(), actor.UserID, actor.InitiatorID, created.BytedToken, "default")
+	require.NoError(t, err)
+	now := time.Now().Unix()
+	cases := []struct {
+		name                    string
+		status                  string
+		category                string
+		secret, upstream, group string
+		possible                bool
+		expires, lease          int64
+		errorCode               string
+		archived                int64
+	}{
+		{"completed", "expired", "completed", "", "known-group", "local-group", true, now - 60, 0, "", 0},
+		{"binding", "expired", "pending", "", "known-group", "", true, now - 60, 0, "", 0},
+		{"expired", "pending", "needs_review", base.SecretCipher, "", "", true, now - 60, 0, "", 0},
+		{"unknown", "unknown", "needs_review", "", "", "", true, now + 60, 0, "", now - 10},
+		{"definite_failure", "failed", "ended", "", "", "", false, now + 60, 0, "InvalidParameter", 0},
+		{"active_create", "creating", "pending", "", "", "", true, now - 60, now + 60, "", 0},
+		{"lost_create", "creating", "needs_review", "", "", "", true, now + 60, 0, "", 0},
+		{"invalid_group", "pending", "needs_review", base.SecretCipher, "", "", true, now + 60, 0, "InvalidValidationGroup", 0},
+	}
+	for _, tc := range cases {
+		row := *base
+		row.ID, row.PublicID, row.Name = 0, "validation-na-"+tc.name, tc.name
+		row.IdempotencyHash, row.StateHash = assetValidationHash(tc.name), assetValidationHash("state-"+tc.name)
+		row.Status, row.SecretCipher, row.UpstreamGroupID, row.GroupID = tc.status, tc.secret, tc.upstream, tc.group
+		row.ResourcePossible, row.ExpiresAt, row.LeaseExpiresAt = tc.possible, tc.expires, tc.lease
+		row.ErrorCode, row.ArchivedAt = tc.errorCode, tc.archived
+		require.NoError(t, model.DB.Create(&row).Error)
+		assert.Equal(t, tc.category, model.AssetValidationRecordCategory(&row, now))
+	}
+	var before []model.AssetValidationSession
+	require.NoError(t, model.DB.Order("id").Find(&before).Error)
+	writes := 0
+	callback := func(*gorm.DB) { writes++ }
+	require.NoError(t, model.DB.Callback().Create().Before("gorm:create").Register("validation-history-readonly", callback))
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("validation-history-readonly", callback))
+	require.NoError(t, model.DB.Callback().Delete().Before("gorm:delete").Register("validation-history-readonly", callback))
+	t.Cleanup(func() {
+		_ = model.DB.Callback().Create().Remove("validation-history-readonly")
+		_ = model.DB.Callback().Update().Remove("validation-history-readonly")
+		_ = model.DB.Callback().Delete().Remove("validation-history-readonly")
+	})
+	for _, category := range []string{"pending", "completed", "needs_review", "ended"} {
+		result, err := ListAssetValidationRecords(t.Context(), actor, "default", dto.AssetValidationRecordFilter{Status: category, Archived: "all", PageSize: 50})
+		require.NoError(t, err)
+		assert.EqualValues(t, 7, result.PendingCount)
+		expected := 0
+		for _, row := range before {
+			if model.AssetValidationRecordCategory(&row, now) == category {
+				expected++
+			}
+		}
+		assert.EqualValues(t, expected, result.TotalCount)
+		require.Len(t, result.Items, expected)
+		for _, item := range result.Items {
+			switch category {
+			case "completed":
+				assert.Equal(t, model.AssetValidationCreated, item.Status)
+				assert.NotEmpty(t, item.GroupID)
+			case "pending":
+				assert.False(t, item.NeedsReview)
+				assert.True(t, item.CanContinue)
+			case "needs_review":
+				assert.True(t, item.NeedsReview)
+			case "ended":
+				assert.False(t, item.NeedsReview)
+				assert.False(t, item.CanContinue)
+			}
+			detail, err := GetAssetValidationRecord(t.Context(), actor, item.SessionID, "default")
+			require.NoError(t, err)
+			assert.Equal(t, item, detail)
+		}
+	}
+	first, err := ListAssetValidationRecords(t.Context(), actor, "default", dto.AssetValidationRecordFilter{PageSize: 2})
+	require.NoError(t, err)
+	assert.EqualValues(t, 8, first.TotalCount)
+	assert.EqualValues(t, 7, first.PendingCount)
+	require.Len(t, first.Items, 2)
+	assert.Equal(t, "invalid_group", first.Items[0].Name)
+	second, err := ListAssetValidationRecords(t.Context(), actor, "default", dto.AssetValidationRecordFilter{Page: 2, PageSize: 2})
+	require.NoError(t, err)
+	require.Len(t, second.Items, 2)
+	assert.NotEqual(t, first.Items[0].SessionID, second.Items[0].SessionID)
+	filtered, err := ListAssetValidationRecords(t.Context(), actor, "default", dto.AssetValidationRecordFilter{Name: "_", Archived: "all"})
+	require.NoError(t, err)
+	assert.EqualValues(t, 4, filtered.TotalCount, "an underscore is literal name text")
+	archived, err := ListAssetValidationRecords(t.Context(), actor, "default", dto.AssetValidationRecordFilter{Archived: "archived"})
+	require.NoError(t, err)
+	require.Len(t, archived.Items, 1)
+	assert.True(t, archived.Items[0].NeedsReview)
+	assert.True(t, archived.Items[0].CanArchive, "write permission allows restoring an archived record")
+	assert.EqualValues(t, 7, archived.PendingCount)
+	encoded, err := common.Marshal(archived)
+	require.NoError(t, err)
+	for _, secret := range []string{"SecretCipher", "BytedToken", "H5Link", "CallbackURL", "AuthSessionID", "upstream-portrait-token", base.SecretCipher} {
+		assert.NotContains(t, string(encoded), secret)
+	}
+	other := actor
+	other.InitiatorID = 2
+	result, err := ListAssetValidationRecords(t.Context(), other, "default", dto.AssetValidationRecordFilter{})
+	require.NoError(t, err)
+	assert.Empty(t, result.Items)
+	assert.Zero(t, result.TotalCount)
+	_, err = GetAssetValidationRecord(t.Context(), other, created.BytedToken, "default")
+	require.Error(t, err)
+	var after []model.AssetValidationSession
+	require.NoError(t, model.DB.Order("id").Find(&after).Error)
+	assert.Equal(t, before, after)
+	assert.Zero(t, writes)
+	assert.Equal(t, map[string]int{"CreateVisualValidateSession": 1}, *calls)
+}
+
+func TestAssetValidationArchivePreservesResourcesAndRetryState(t *testing.T) {
+	actor, input := assetValidationFixture(t)
+	assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
+	created, err := CreateAssetValidationSession(t.Context(), actor, input)
+	require.NoError(t, err)
+	base, err := model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
+	require.NoError(t, err)
+	archived := true
+	request := dto.AssetValidationArchive{ProjectName: "default", SessionIDs: []string{created.BytedToken}, Archived: &archived}
+	assert.Error(t, ArchiveAssetValidationRecords(t.Context(), actor, request), "pending sessions cannot be hidden as finished")
+	completed := *base
+	completed.ID, completed.PublicID, completed.IdempotencyHash, completed.StateHash = 0, "validation-na-finished", assetValidationHash("finished"), assetValidationHash("finished-state")
+	completed.Status, completed.GroupID, completed.SecretCipher = model.AssetValidationCreated, "bound-local-group", ""
+	require.NoError(t, model.DB.Create(&completed).Error)
+	request.SessionIDs = []string{completed.PublicID, base.PublicID}
+	assert.Error(t, ArchiveAssetValidationRecords(t.Context(), actor, request), "mixed batches are atomic")
+	require.NoError(t, model.DB.First(&completed, completed.ID).Error)
+	assert.Zero(t, completed.ArchivedAt)
+	require.NoError(t, model.DB.Model(base).Updates(map[string]any{"expires_at": time.Now().Unix() - 60, "secret_cipher": "", "status": model.AssetValidationExpired, "last_checked_at": 100, "updated_at": 101, "next_poll_at": 121}).Error)
+	require.NoError(t, model.DB.First(base, base.ID).Error)
+	assert.Error(t, ArchiveAssetValidationRecords(t.Context(), actor, request), "unknown resources need individual acknowledgement")
+	request.SessionIDs = []string{base.PublicID, base.PublicID}
+	other := actor
+	other.TokenID = 2
+	require.NoError(t, ArchiveAssetValidationRecords(t.Context(), other, request), "display management does not need the old credential")
+	var saved model.AssetValidationSession
+	require.NoError(t, model.DB.First(&saved, base.ID).Error)
+	assert.Positive(t, saved.ArchivedAt)
+	archiveTime := saved.ArchivedAt
+	saved.ArchivedAt = 0
+	assert.Equal(t, *base, saved, "archive changes only ArchivedAt")
+	require.NoError(t, ArchiveAssetValidationRecords(t.Context(), other, request))
+	require.NoError(t, model.DB.First(&saved, base.ID).Error)
+	assert.Equal(t, archiveTime, saved.ArchivedAt)
+	assert.ErrorIs(t, model.PendingValidationChannelGuard(model.DB, []int{base.ChannelID}), model.ErrAssetInUse)
+	result, err := ListAssetValidationRecords(t.Context(), actor, "default", dto.AssetValidationRecordFilter{})
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, result.PendingCount)
+	assert.EqualValues(t, 1, result.TotalCount)
+	other.ReadOnly = true
+	request.SessionIDs = []string{completed.PublicID}
+	assert.Error(t, ArchiveAssetValidationRecords(t.Context(), other, request))
+	other.ReadOnly = false
+	request.SessionIDs = []string{completed.PublicID, "validation-na-missing"}
+	assert.Error(t, ArchiveAssetValidationRecords(t.Context(), other, request))
+	require.NoError(t, model.DB.First(&completed, completed.ID).Error)
+	assert.Zero(t, completed.ArchivedAt)
+	require.NoError(t, model.DB.Model(&completed).Update("lease_expires_at", time.Now().Unix()+60).Error)
+	request.SessionIDs = []string{completed.PublicID}
+	assert.Error(t, ArchiveAssetValidationRecords(t.Context(), other, request), "active leases are checked even for completed rows")
+	archived = false
+	request.SessionIDs = []string{base.PublicID, completed.PublicID}
+	require.NoError(t, ArchiveAssetValidationRecords(t.Context(), other, request))
+	require.NoError(t, model.DB.First(&saved, base.ID).Error)
+	assert.Zero(t, saved.ArchivedAt)
+	assert.Equal(t, *base, saved)
+	assert.ErrorIs(t, model.PendingValidationChannelGuard(model.DB, []int{base.ChannelID}), model.ErrAssetInUse)
 }
