@@ -17,7 +17,7 @@ type AssetValidationSummary struct {
 	GroupID        string        `json:"GroupId,omitempty"`
 	ExpiresAt      int64         `json:"ExpiresAt"`
 	Name           string        `json:"Name"`
-	ChannelID      int           `json:"ChannelId"`
+	ChannelID      int           `json:"ChannelId,omitempty"`
 	CanPoll        bool          `json:"CanPoll"`
 	NextPollAt     int64         `json:"NextPollAt,omitempty"`
 	Error          *AssetFailure `json:"Error,omitempty"`
@@ -43,7 +43,7 @@ type AssetValidationView struct {
 	GroupID        string        `json:"GroupId,omitempty"`
 	ExpiresAt      int64         `json:"ExpiresAt"`
 	Name           string        `json:"Name"`
-	ChannelID      int           `json:"ChannelId"`
+	ChannelID      int           `json:"ChannelId,omitempty"`
 	CanPoll        bool          `json:"CanPoll"`
 	NextPollAt     int64         `json:"NextPollAt,omitempty"`
 	Error          *AssetFailure `json:"Error,omitempty"`

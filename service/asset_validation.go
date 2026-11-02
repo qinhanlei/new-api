@@ -150,14 +150,31 @@ func authorizeAssetValidationChannelWithDB(ctx context.Context, tx *gorm.DB, ses
 
 func assetValidationSummary(session *model.AssetValidationSession, actor dto.AssetActor, now int64) dto.AssetValidationSummary {
 	view := dto.AssetValidationSummary{SessionID: session.PublicID, Status: session.Status, GroupID: session.GroupID, ExpiresAt: session.ExpiresAt,
-		Name: session.Name, ChannelID: session.ChannelID, NextPollAt: session.NextPollAt, ProjectName: session.ProjectName,
+		Name: session.Name, NextPollAt: session.NextPollAt, ProjectName: session.ProjectName,
 		ArchivedAt: session.ArchivedAt, CreatedAt: session.CreatedAt, LastCheckedAt: session.LastCheckedAt}
+	if actor.CanReadChannels {
+		view.ChannelID = session.ChannelID
+	}
 	category := model.AssetValidationRecordCategory(session, now)
 	view.NeedsReview = category == "needs_review"
 	view.BindingPending = session.GroupID == "" && session.UpstreamGroupID != ""
 	view.CanArchive = !actor.ReadOnly && (session.ArchivedAt > 0 || (category != "pending" && session.LeaseExpiresAt <= now))
 	if session.ErrorCode != "" && session.ErrorCode != "ValidationPending" {
 		view.Error = &dto.AssetFailure{Code: session.ErrorCode, Message: session.ErrorMessage}
+		if !actor.CanReadChannels {
+			switch {
+			case session.ErrorCode == "Throttling":
+				view.Error.Message = "Human verification is busy; retry shortly"
+			case model.AssetValidationPollBlocked(session.ErrorCode):
+				view.Error.Message = "Human verification cannot continue. Contact an administrator."
+			case session.Status == model.AssetValidationFailed && session.SecretCipher == "" && session.UpstreamGroupID == "" && !session.ResourcePossible:
+				view.Error = &dto.AssetFailure{Code: "ValidationCreateFailed", Message: "Human verification could not be started. Contact an administrator."}
+			case session.SecretCipher != "" || session.UpstreamGroupID != "":
+				view.Error = &dto.AssetFailure{Code: "ValidationCheckUnavailable", Message: "Unable to check verification right now. Try again later."}
+			default:
+				view.Error = &dto.AssetFailure{Code: "ValidationResultUnknown", Message: "The verification result could not be confirmed. Contact an administrator."}
+			}
+		}
 	}
 	if session.GroupID != "" {
 		view.Status = model.AssetValidationCreated
@@ -197,6 +214,9 @@ func assetValidationView(session *model.AssetValidationSession, actor dto.AssetA
 		secrets, err := openAssetValidationSecrets(session)
 		if err != nil {
 			code, message, _ := assetFailure(err)
+			if !actor.CanReadChannels {
+				message = "Human verification cannot continue. Contact an administrator."
+			}
 			view.Error = &dto.AssetFailure{Code: code, Message: message}
 			view.CanPoll, view.CanContinue = false, false
 			view.NeedsReview = session.ResourcePossible && session.UpstreamGroupID == ""
@@ -240,9 +260,18 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return empty, err
 	}
+	// Replaying a fully matched old request above remains valid even if the
+	// caller could choose a channel before manual selection became restricted.
+	if input.ChannelID != 0 && !actor.CanReadChannels {
+		return empty, assetError(http.StatusForbidden, "AccessDenied", "You do not have permission to select a verification channel.")
+	}
 	callbackBase, err := url.Parse(strings.TrimRight(system_setting.ServerAddress, "/"))
 	if err != nil || (callbackBase.Scheme != "http" && callbackBase.Scheme != "https") || callbackBase.Host == "" || callbackBase.User != nil || callbackBase.RawQuery != "" || callbackBase.Fragment != "" || (callbackBase.Path != "" && callbackBase.Path != "/") {
-		return empty, assetError(http.StatusServiceUnavailable, "ValidationConfigurationRequired", "Human verification requires an HTTP or HTTPS server address without a path or query")
+		message := "Human verification is not configured correctly. Contact an administrator."
+		if actor.CanReadChannels {
+			message = "Human verification requires an HTTP or HTTPS server address without a path or query"
+		}
+		return empty, assetError(http.StatusServiceUnavailable, "ValidationConfigurationRequired", message)
 	}
 	currentActor, err := AssetActorForUser(ctx, actor.UserID, actor.TokenID)
 	if err != nil {
@@ -272,14 +301,25 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 		break
 	}
 	if channel == nil {
-		return empty, assetError(http.StatusForbidden, "NoAvailableChannel", "No material channel is available for human verification")
+		message := "Human verification is not available. Contact an administrator."
+		if actor.CanReadChannels {
+			message = "No material channel is available for human verification"
+			if input.ChannelID != 0 {
+				return empty, assetError(http.StatusForbidden, "ValidationChannelUnavailable", "The selected channel is unavailable for human verification.")
+			}
+		}
+		return empty, assetError(http.StatusForbidden, "NoAvailableChannel", message)
 	}
 	// Keep the AK scope compatible with sessions and rate windows already stored.
 	rateIdentity := "ark-validation\x00" + config.AccessKey
 	if config.AuthType == "bearer" {
 		endpoint, parseErr := url.Parse(config.Endpoint)
 		if parseErr != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
-			return empty, assetError(http.StatusBadGateway, "UpstreamConfigurationInvalid", "The material endpoint is invalid")
+			message := "Human verification is not configured correctly. Contact an administrator."
+			if actor.CanReadChannels {
+				message = "The material endpoint is invalid"
+			}
+			return empty, assetError(http.StatusBadGateway, "UpstreamConfigurationInvalid", message)
 		}
 		endpoint.Host = strings.TrimSuffix(strings.ToLower(endpoint.Host), ":443")
 		// Equivalent endpoint spellings share a gate; different providers and
@@ -332,9 +372,15 @@ func CreateAssetValidationSession(ctx context.Context, actor dto.AssetActor, inp
 		session.Status = model.AssetValidationUnknown
 		session.ErrorCode, session.ErrorMessage, _ = assetFailure(err)
 		var failure *AssetError
-		if errors.As(err, &failure) && failure.HTTPStatus >= 400 && failure.HTTPStatus < 500 && failure.HTTPStatus != http.StatusRequestTimeout && failure.Code != "UpstreamResultUnknown" {
-			session.Status = model.AssetValidationFailed
-			session.ResourcePossible = false
+		if errors.As(err, &failure) {
+			if failure.HTTPStatus >= 400 && failure.HTTPStatus < 500 && failure.HTTPStatus != http.StatusRequestTimeout && failure.Code != "UpstreamResultUnknown" {
+				session.Status = model.AssetValidationFailed
+				session.ResourcePossible = false
+			}
+			if failure.HTTPStatus == http.StatusTooManyRequests {
+				session.ErrorCode = "Throttling"
+				session.NextPollAt = failure.RetryAfter
+			}
 		}
 		session.ErrorCode = safeAssetMessage(session.ErrorCode, state, upstream.BytedToken)
 		session.ErrorMessage = safeAssetMessage(session.ErrorMessage, state, upstream.BytedToken)
@@ -475,12 +521,18 @@ func GetAssetValidationResult(ctx context.Context, actor dto.AssetActor, token, 
 				// instead of a waiting result. They do not prove a final failure.
 				retryable = retryable || (failure.HTTPStatus >= 400 && failure.HTTPStatus < 500)
 				session.NextPollAt = failure.RetryAfter
+				if failure.HTTPStatus == http.StatusTooManyRequests {
+					session.ErrorCode = "Throttling"
+				}
 			}
 			if retryable {
 				minimumDelay = delay
 			}
 		}
-		state := strings.TrimPrefix(secrets.CallbackURL, strings.TrimRight(system_setting.ServerAddress, "/")+assetValidationCallbackPath)
+		state := ""
+		if callback, parseErr := url.Parse(secrets.CallbackURL); parseErr == nil {
+			state = strings.TrimPrefix(callback.Path, assetValidationCallbackPath)
+		}
 		session.ErrorCode = safeAssetMessage(session.ErrorCode, secrets.BytedToken, state)
 		session.ErrorMessage = safeAssetMessage(session.ErrorMessage, secrets.BytedToken, state)
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -531,7 +583,7 @@ func assetValidationSummaries(ctx context.Context, actor dto.AssetActor, session
 			config, _ := model.LoadAssetChannelConfig(ctx, session.ChannelID)
 			configs[session.ChannelID] = config
 		}
-		if channel != nil {
+		if actor.CanReadChannels && channel != nil {
 			view.ChannelName = channel.Name
 		}
 		if view.CanContinue {
@@ -635,6 +687,9 @@ func ArchiveAssetValidationRecords(ctx context.Context, actor dto.AssetActor, in
 }
 
 func ListAssetValidationChannels(ctx context.Context, actor dto.AssetActor) ([]dto.AssetValidationChannel, error) {
+	if !actor.CanReadChannels {
+		return nil, assetError(http.StatusForbidden, "AccessDenied", "You do not have permission to view verification channels.")
+	}
 	if actor.UserID <= 0 || actor.InitiatorID <= 0 || actor.AllUsers {
 		return nil, assetError(http.StatusForbidden, "AccessDenied", "Select an asset owner before viewing verification sessions")
 	}

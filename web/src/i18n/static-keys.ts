@@ -19,6 +19,15 @@ For commercial licensing, please contact support@quantumnous.com
 // Static translation keys that don't get picked up by the t('...') regex.
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
+  'Human verification cannot continue. Contact an administrator.',
+  'Human verification could not be started. Contact an administrator.',
+  'Unable to check verification right now. Try again later.',
+  'The verification result could not be confirmed. Contact an administrator.',
+  'You do not have permission to select a verification channel.',
+  'Human verification is not configured correctly. Contact an administrator.',
+  'Human verification is not available. Contact an administrator.',
+  'The selected channel is unavailable for human verification.',
+  'You do not have permission to view verification channels.',
   // Human verification management errors returned by the backend.
   'Your current credential cannot change verification records',
   'Continue with the API credential that started this verification',

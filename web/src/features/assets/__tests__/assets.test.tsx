@@ -1858,7 +1858,6 @@ test.each([true, false])(
     expect(post.mock.calls[1][1]).toEqual({
       ProjectName: 'studio',
       Name: 'Alice',
-      ChannelId: 7,
       IdempotencyKey: expect.stringMatching(/^[A-Za-z0-9_-]{8,128}$/),
     })
     expect(post.mock.calls[1][2]).toEqual(
@@ -3416,8 +3415,120 @@ test.each([
   }
 })
 
-test('verification creation requires an explicit choice when multiple channels are available', async () => {
+test.each([
+  { role: ROLE.USER, channelRead: false },
+  { role: ROLE.ADMIN, channelRead: false },
+])(
+  'verification automatically selects a channel without exposing routing to role $role with channel read $channelRead',
+  async ({ role, channelRead }) => {
+    const user = userEvent.setup()
+    useAuthStore.getState().auth.setUser({
+      id: 1,
+      username: 'caller',
+      role,
+      permissions: { admin_permissions: { channel: { read: channelRead } } },
+    })
+    vi.mocked(api.get).mockResolvedValue({
+      data: {
+        success: true,
+        data: [
+          { Id: 7, Name: 'Portrait channel' },
+          { Id: 9, Name: 'Second channel' },
+        ],
+      },
+    })
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          ...validationRecord(),
+          BytedToken: 'validation-na-one',
+          Error: { Code: 'UpstreamError', Message: 'Please try again later' },
+        },
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <AssetValidationDialog
+          project='studio'
+          scope={{}}
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+        />
+      </QueryClientProvider>
+    )
+    await user.type(screen.getByLabelText('Name'), 'Alice')
+    expect(screen.getByText('studio')).toBeVisible()
+    expect(
+      screen.queryByLabelText('Verification channel')
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Specify a channel' })
+    ).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Start verification' }))
+    expect(post).toHaveBeenCalledWith(
+      '/api/assets/actions',
+      {
+        Name: 'Alice',
+        ProjectName: 'studio',
+        IdempotencyKey: expect.any(String),
+      },
+      expect.anything()
+    )
+    expect(api.get).not.toHaveBeenCalled()
+    expect(screen.queryByText('Portrait channel')).not.toBeInTheDocument()
+    expect(screen.queryByText('Verification channel')).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Diagnostic details' })
+    ).not.toBeInTheDocument()
+    expect(screen.getByText('Last check: Please try again later')).toBeVisible()
+  }
+)
+
+test('an authorized administrator starts automatic verification without loading channel options', async () => {
   const user = userEvent.setup()
+  vi.mocked(api.get).mockResolvedValue({
+    data: { success: true, data: [{ Id: 7, Name: 'Portrait channel' }] },
+  })
+  useAuthStore.getState().auth.setUser({
+    id: 1,
+    username: 'admin',
+    role: ROLE.ADMIN,
+    permissions: { admin_permissions: { channel: { read: true } } },
+  })
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...validationRecord(), BytedToken: 'validation-na-one' },
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  expect(
+    screen.getByRole('button', { name: 'Specify a channel' })
+  ).toHaveAttribute('aria-expanded', 'false')
+  await user.type(screen.getByLabelText('Name'), 'Alice')
+  await user.click(screen.getByRole('button', { name: 'Start verification' }))
+  expect(api.get).not.toHaveBeenCalled()
+  expect(post.mock.calls[0][1]).not.toHaveProperty('ChannelId')
+})
+
+test('an authorized administrator can explicitly choose a channel after opening the optional control', async () => {
+  const user = userEvent.setup()
+  useAuthStore.getState().auth.setUser({
+    id: 1,
+    username: 'admin',
+    role: ROLE.ADMIN,
+    permissions: { admin_permissions: { channel: { read: true } } },
+  })
   vi.mocked(api.get).mockResolvedValue({
     data: {
       success: true,
@@ -3448,10 +3559,8 @@ test('verification creation requires an explicit choice when multiple channels a
     </QueryClientProvider>
   )
   await user.type(screen.getByLabelText('Name'), 'Alice')
-  expect(screen.getByText('studio')).toBeVisible()
-  expect(
-    screen.getByRole('button', { name: 'Start verification' })
-  ).toBeDisabled()
+  expect(api.get).not.toHaveBeenCalled()
+  await user.click(screen.getByRole('button', { name: 'Specify a channel' }))
   await user.selectOptions(
     await screen.findByLabelText('Verification channel'),
     '9'
@@ -3462,9 +3571,6 @@ test('verification creation requires an explicit choice when multiple channels a
     expect.objectContaining({ ChannelId: 9, ProjectName: 'studio' }),
     expect.anything()
   )
-  expect(
-    screen.queryByRole('region', { name: 'Recent verifications' })
-  ).not.toBeInTheDocument()
 })
 
 test('a manual result check shows progress and an explicit waiting result', async () => {
@@ -3572,10 +3678,78 @@ test('restoring waits for current permissions before enabling continuation', asy
   expect(post).not.toHaveBeenCalled()
 })
 
-test('an empty channel list explains why verification cannot start', async () => {
+test.each(['empty', 'error'])(
+  'an administrator can use automatic selection when channel options are %s',
+  async (result) => {
+    const user = userEvent.setup()
+    useAuthStore.getState().auth.setUser({
+      id: 1,
+      username: 'admin',
+      role: ROLE.ADMIN,
+      permissions: { admin_permissions: { channel: { read: true } } },
+    })
+    if (result === 'empty') {
+      vi.mocked(api.get).mockResolvedValue({
+        data: { success: true, data: [] },
+      })
+    } else {
+      vi.mocked(api.get).mockRejectedValue(new Error('Could not load channels'))
+    }
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        success: true,
+        data: { ...validationRecord(), BytedToken: 'validation-na-one' },
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <AssetValidationDialog
+          project='default'
+          scope={{}}
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+        />
+      </QueryClientProvider>
+    )
+    await user.type(screen.getByLabelText('Name'), 'Alice')
+    await user.click(screen.getByRole('button', { name: 'Specify a channel' }))
+    expect(
+      await screen.findByText(
+        result === 'empty'
+          ? 'No material channel is available for human verification'
+          : 'Could not load channels'
+      )
+    ).toBeVisible()
+    expect(
+      screen.getByRole('button', { name: 'Start verification' })
+    ).toBeEnabled()
+    await user.click(screen.getByRole('button', { name: 'Start verification' }))
+    expect(post.mock.calls[0][1]).not.toHaveProperty('ChannelId')
+  }
+)
+
+test('a rate-limited session response keeps a neutral cooldown instead of reporting failed person verification', async () => {
   const user = userEvent.setup()
-  vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
-  const post = vi.spyOn(api, 'post')
+  vi.mocked(api.get).mockResolvedValue({
+    data: { success: true, data: [{ Id: 7, Name: 'Portrait channel' }] },
+  })
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        ...validationRecord(),
+        BytedToken: 'validation-na-one',
+        Status: 'failed',
+        CanPoll: false,
+        CanContinue: false,
+        NextPollAt: Math.floor(Date.now() / 1000) + 60,
+        Error: {
+          Code: 'Throttling',
+          Message: 'Human verification is busy; retry shortly',
+        },
+      },
+    },
+  })
   render(
     <QueryClientProvider client={client}>
       <AssetValidationDialog
@@ -3587,13 +3761,206 @@ test('an empty channel list explains why verification cannot start', async () =>
     </QueryClientProvider>
   )
   await user.type(screen.getByLabelText('Name'), 'Alice')
+  await user.click(screen.getByRole('button', { name: 'Start verification' }))
+  expect(await screen.findByText('Waiting to retry')).toBeVisible()
+  expect(screen.getByText(/Try again after/)).toBeVisible()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.queryByText('Verification failed')).not.toBeInTheDocument()
   expect(
-    await screen.findByText(
-      'No material channel is available for human verification'
-    )
-  ).toBeVisible()
+    screen.queryByRole('button', { name: 'Check verification' })
+  ).not.toBeInTheDocument()
+})
+
+test('a removed manual channel blocks creation until the administrator switches back to automatic selection', async () => {
+  const user = userEvent.setup()
+  useAuthStore.getState().auth.setUser({
+    id: 1,
+    username: 'admin',
+    role: ROLE.ADMIN,
+    permissions: { admin_permissions: { channel: { read: true } } },
+  })
+  vi.mocked(api.get).mockResolvedValue({
+    data: { success: true, data: [{ Id: 9, Name: 'Second channel' }] },
+  })
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...validationRecord(), BytedToken: 'validation-na-one' },
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await user.type(screen.getByLabelText('Name'), 'Alice')
+  await user.click(screen.getByRole('button', { name: 'Specify a channel' }))
+  await user.selectOptions(
+    await screen.findByLabelText('Verification channel'),
+    '9'
+  )
+  vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
+  await act(async () => {
+    await client.invalidateQueries({ queryKey: ['assets'] })
+  })
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'This verification channel is no longer available. Choose another channel or use automatic selection.'
+  )
   expect(
     screen.getByRole('button', { name: 'Start verification' })
   ).toBeDisabled()
   expect(post).not.toHaveBeenCalled()
+  await user.selectOptions(screen.getByLabelText('Verification channel'), '0')
+  await user.click(screen.getByRole('button', { name: 'Start verification' }))
+  expect(post.mock.calls[0][1]).not.toHaveProperty('ChannelId')
 })
+
+test.each([
+  {
+    role: ROLE.USER,
+    code: 'ValidationConfigurationRequired',
+    settings: false,
+    guidance: false,
+  },
+  {
+    role: ROLE.ADMIN,
+    code: 'ValidationConfigurationRequired',
+    settings: false,
+    guidance: true,
+  },
+  {
+    role: ROLE.SUPER_ADMIN,
+    code: 'ValidationConfigurationRequired',
+    settings: true,
+    guidance: false,
+  },
+  {
+    role: ROLE.SUPER_ADMIN,
+    code: 'UpstreamError',
+    settings: false,
+    guidance: false,
+  },
+])(
+  'configuration error $code gives role $role only the permitted settings action',
+  async ({ role, code, settings, guidance }) => {
+    const user = userEvent.setup()
+    useAuthStore.getState().auth.setUser({ id: 1, username: 'caller', role })
+    vi.spyOn(api, 'post').mockRejectedValue({
+      response: {
+        status: 503,
+        data: {
+          success: false,
+          code,
+          message: 'The verification service is unavailable',
+        },
+      },
+    })
+    const root = createRootRoute()
+    const route = createRoute({
+      getParentRoute: () => root,
+      path: '/verify',
+      component: () => (
+        <AssetValidationDialog
+          project='default'
+          scope={{}}
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+        />
+      ),
+    })
+    const site = createRoute({
+      getParentRoute: () => root,
+      path: '/system-settings/site/$section',
+    })
+    const router = createRouter({
+      routeTree: root.addChildren([route, site]),
+      history: createMemoryHistory({ initialEntries: ['/verify'] }),
+    })
+    await router.load()
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>
+    )
+    await user.type(await screen.findByLabelText('Name'), 'Alice')
+    await user.click(screen.getByRole('button', { name: 'Start verification' }))
+    expect(
+      await screen.findByText('The verification service is unavailable')
+    ).toBeVisible()
+    if (settings) {
+      expect(
+        screen.getByRole('button', { name: 'Open site settings' })
+      ).toHaveAttribute('href', '/system-settings/site/system-info')
+    } else {
+      expect(
+        screen.queryByRole('button', { name: 'Open site settings' })
+      ).not.toBeInTheDocument()
+    }
+    const assistance = screen.queryByText(
+      'Ask a super administrator to check the server address in site settings.'
+    )
+    if (guidance) expect(assistance).toBeVisible()
+    else expect(assistance).not.toBeInTheDocument()
+    expect(api.get).not.toHaveBeenCalled()
+  }
+)
+
+test.each([2, 60])(
+  'a rate-limited creation changes its label automatically when its $0 second cooldown ends',
+  async (cooldownSeconds) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-11-02T00:00:00Z'))
+    const record = validationRecord({
+      Status: 'failed',
+      CanContinue: false,
+      CanPoll: false,
+      NextPollAt: Date.now() / 1000 + cooldownSeconds,
+      Error: {
+        Code: 'Throttling',
+        Message: 'Human verification is busy; retry shortly',
+      },
+    })
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        success: true,
+        data: { ...record, BytedToken: record.SessionId },
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <AssetValidationDialog
+          project='default'
+          scope={{}}
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+        />
+      </QueryClientProvider>
+    )
+    fireEvent.change(screen.getByLabelText('Name'), {
+      target: { value: 'Alice' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Start verification' }))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(screen.getByText('Waiting to retry')).toBeVisible()
+    expect(screen.getByText(/Try again after/)).toBeVisible()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(cooldownSeconds * 1000)
+    })
+    expect(screen.getByText('Verification could not start')).toBeVisible()
+    expect(screen.queryByText('Waiting to retry')).not.toBeInTheDocument()
+    if (cooldownSeconds < 10) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync((10 - cooldownSeconds) * 1000)
+      })
+    }
+    expect(screen.queryByText(/Try again after/)).not.toBeInTheDocument()
+    expect(post).toHaveBeenCalledTimes(1)
+  }
+)

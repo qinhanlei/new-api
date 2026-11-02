@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
 import { nanoid } from 'nanoid'
 import { QRCodeSVG } from 'qrcode.react'
 import { useEffect, useId, useRef, useState } from 'react'
@@ -48,11 +49,19 @@ import { Label } from '@/components/ui/label'
 import { NativeSelect } from '@/components/ui/native-select'
 import { toIntlLocale } from '@/i18n/languages'
 import {
+  ADMIN_PERMISSION_ACTIONS,
+  ADMIN_PERMISSION_RESOURCES,
+  hasPermission,
+} from '@/lib/admin-permissions'
+import { ROLE } from '@/lib/roles'
+import {
   getServerErrorMessage,
   getServerErrorStatus,
+  getServerErrorSources,
   isServerErrorCancelled,
   translateServerText,
 } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
 
 import {
   assetQueryKeys,
@@ -83,8 +92,17 @@ export function AssetValidationDialog(props: {
   const { t, i18n } = useTranslation()
   const client = useQueryClient()
   const id = useId()
+  const currentUser = useAuthStore((state) => state.auth.user)
+  const canReadChannels =
+    (currentUser?.role ?? 0) >= ROLE.ADMIN &&
+    hasPermission(
+      currentUser,
+      ADMIN_PERMISSION_RESOURCES.CHANNEL,
+      ADMIN_PERMISSION_ACTIONS.READ
+    )
   const [activeView, setSession] = useState<AssetValidationView | null>(null)
   const [selectedChannel, setSelectedChannel] = useState(0)
+  const [channelOptionsOpen, setChannelOptionsOpen] = useState(false)
   const [now, setNow] = useState(Date.now)
   const [polling, setPolling] = useState({
     nextAt: 0,
@@ -146,13 +164,15 @@ export function AssetValidationDialog(props: {
     ],
     queryFn: ({ signal }) =>
       getAssetValidationChannels(props.project, props.scope, signal),
-    enabled: !session,
+    enabled: canReadChannels && channelOptionsOpen && !session,
     meta: { errorToast: false },
   })
-  const channelId =
-    channels.data?.length === 1 ? channels.data[0].Id : selectedChannel
+  const channelId = canReadChannels ? selectedChannel : 0
+  const channelOption = channels.data?.find((item) => item.Id === channelId)
+  const selectedChannelName = channelOption?.Name
   const channelAvailable =
-    channels.data?.some((item) => item.Id === channelId) === true
+    channelId === 0 ||
+    (channels.isSuccess && !channels.isFetching && Boolean(channelOption))
   function receiveSession(result: AssetValidationView, expectedId?: string) {
     void client.invalidateQueries({
       queryKey: [...assetQueryKeys.all, 'validation'],
@@ -209,7 +229,7 @@ export function AssetValidationDialog(props: {
         {
           ProjectName: props.project,
           Name: values.name,
-          ChannelId: channelId,
+          ...(channelId > 0 ? { ChannelId: channelId } : {}),
           IdempotencyKey: request.current.key,
         },
         props.scope
@@ -297,6 +317,7 @@ export function AssetValidationDialog(props: {
     !polling.blocked &&
     (now < polling.until || (canCheckExpiry && now >= expiresAt))
   const cooldown = nextCheckAt > now
+  const sessionThrottled = session?.Error?.Code === 'Throttling'
 
   useEffect(() => {
     const timestamp = Date.now()
@@ -393,14 +414,17 @@ export function AssetValidationDialog(props: {
   const sessionError = session?.Error
     ? translateServerText(t, session.Error.Message)
     : ''
+  const configurationError =
+    session?.Error?.Code === 'ValidationConfigurationRequired' ||
+    getServerErrorSources(error).some(
+      (source) => source.code === 'ValidationConfigurationRequired'
+    )
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   return (
     <Dialog
       open
       title={t('Verify a person')}
-      description={t(
-        'Each group belongs to one person and stays on its verification channel.'
-      )}
+      description={t('Each group belongs to one person.')}
       onOpenChange={(open) => !open && !create.isPending && props.onClose()}
       footer={
         <>
@@ -432,6 +456,9 @@ export function AssetValidationDialog(props: {
                 status={status ?? session.Status}
                 needsReview={session.NeedsReview}
                 bindingPending={session.BindingPending}
+                throttleUntil={
+                  sessionThrottled ? (session.NextPollAt || 0) * 1000 : 0
+                }
               />
             </div>
             {link && (
@@ -482,12 +509,17 @@ export function AssetValidationDialog(props: {
             <dl className='grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-sm'>
               <dt className='text-muted-foreground'>{t('Project')}</dt>
               <dd className='break-words'>{props.project}</dd>
-              <dt className='text-muted-foreground'>
-                {t('Verification channel')}
-              </dt>
-              <dd className='break-words'>
-                {session.ChannelName || session.ChannelId}
-              </dd>
+              {canReadChannels &&
+                Boolean(session.ChannelName || session.ChannelId) && (
+                  <>
+                    <dt className='text-muted-foreground'>
+                      {t('Verification channel')}
+                    </dt>
+                    <dd className='break-words'>
+                      {session.ChannelName || session.ChannelId}
+                    </dd>
+                  </>
+                )}
               <dt className='text-muted-foreground'>{t('Last checked')}</dt>
               <dd>
                 {session.LastCheckedAt
@@ -550,9 +582,11 @@ export function AssetValidationDialog(props: {
               )}
             {sessionError && !check.error && (
               <p
-                role={status === 'failed' ? 'alert' : 'status'}
+                role={
+                  status === 'failed' && !sessionThrottled ? 'alert' : 'status'
+                }
                 className={
-                  status === 'failed'
+                  status === 'failed' && !sessionThrottled
                     ? 'text-destructive text-sm break-words'
                     : 'text-muted-foreground text-sm break-words'
                 }
@@ -573,7 +607,7 @@ export function AssetValidationDialog(props: {
                   )}
                 </p>
               )}
-            {session.Error && (
+            {canReadChannels && session.Error && (
               <Collapsible className='text-muted-foreground text-xs'>
                 <CollapsibleTrigger
                   render={<Button variant='ghost' size='sm' />}
@@ -582,6 +616,7 @@ export function AssetValidationDialog(props: {
                 </CollapsibleTrigger>
                 <CollapsibleContent>
                   <p className='mt-2 break-all'>{session.Error.Code}</p>
+                  <p className='mt-2 break-words'>{sessionError}</p>
                 </CollapsibleContent>
               </Collapsible>
             )}
@@ -643,43 +678,71 @@ export function AssetValidationDialog(props: {
               {t('Project')}:{' '}
               <span className='text-foreground'>{props.project}</span>
             </p>
-            <div className='space-y-2'>
-              <Label htmlFor={`${id}-channel`}>
-                {t('Verification channel')}
-              </Label>
-              <NativeSelect
-                id={`${id}-channel`}
-                className='w-full'
-                value={channelId || ''}
-                disabled={
-                  channels.isPending ||
-                  create.isPending ||
-                  channels.data?.length === 1
-                }
-                onChange={(event) =>
-                  setSelectedChannel(Number(event.target.value))
-                }
+            {canReadChannels && (
+              <Collapsible
+                open={channelOptionsOpen}
+                onOpenChange={setChannelOptionsOpen}
               >
-                <option value=''>{t('Select a channel')}</option>
-                {channels.data?.map((channel) => (
-                  <option key={channel.Id} value={channel.Id}>
-                    {channel.Name}
-                  </option>
-                ))}
-              </NativeSelect>
-              {channels.isPending && <LoadingState />}
-              {channels.isError && (
-                <ErrorState
-                  description={getServerErrorMessage(channels.error)}
-                  onRetry={() => void channels.refetch()}
-                />
-              )}
-              {channels.isSuccess && !channels.data.length && (
-                <p role='status' className='text-muted-foreground text-sm'>
-                  {t('No material channel is available for human verification')}
-                </p>
-              )}
-            </div>
+                <CollapsibleTrigger
+                  disabled={create.isPending}
+                  render={<Button variant='ghost' size='sm' />}
+                >
+                  {channelId > 0
+                    ? `${t('Verification channel')}: ${selectedChannelName || t('Channel {{id}}', { id: channelId })}`
+                    : t('Specify a channel')}
+                </CollapsibleTrigger>
+                <CollapsibleContent className='space-y-2 pt-2'>
+                  <Label htmlFor={`${id}-channel`}>
+                    {t('Verification channel')}
+                  </Label>
+                  <NativeSelect
+                    id={`${id}-channel`}
+                    className='w-full'
+                    value={channelId}
+                    disabled={create.isPending}
+                    onChange={(event) =>
+                      setSelectedChannel(Number(event.target.value))
+                    }
+                  >
+                    <option value={0}>{t('Automatic selection')}</option>
+                    {channelId > 0 && !channelOption && (
+                      <option value={channelId} disabled>
+                        {t('Channel {{id}}', { id: channelId })}
+                      </option>
+                    )}
+                    {channels.data?.map((channel) => (
+                      <option key={channel.Id} value={channel.Id}>
+                        {channel.Name}
+                      </option>
+                    ))}
+                  </NativeSelect>
+                  {channels.isPending && <LoadingState />}
+                  {channels.isError && (
+                    <ErrorState
+                      className='min-h-0 py-4'
+                      description={getServerErrorMessage(channels.error)}
+                      onRetry={() => void channels.refetch()}
+                    />
+                  )}
+                  {channels.isSuccess && !channels.data.length && (
+                    <p role='status' className='text-muted-foreground text-sm'>
+                      {t(
+                        'No material channel is available for human verification'
+                      )}
+                    </p>
+                  )}
+                  {channelId > 0 &&
+                    !channelAvailable &&
+                    !channels.isFetching && (
+                      <p role='alert' className='text-destructive text-sm'>
+                        {t(
+                          'This verification channel is no longer available. Choose another channel or use automatic selection.'
+                        )}
+                      </p>
+                    )}
+                </CollapsibleContent>
+              </Collapsible>
+            )}
             <Form {...form}>
               <form
                 id={id}
@@ -712,7 +775,6 @@ export function AssetValidationDialog(props: {
                   type='submit'
                   disabled={
                     !channelAvailable ||
-                    channels.isFetching ||
                     create.isPending ||
                     check.isPending ||
                     cooldown
@@ -738,6 +800,27 @@ export function AssetValidationDialog(props: {
             {getServerErrorStatus(error) === 429
               ? t('Too many requests. Please wait before trying again.')
               : getServerErrorMessage(error)}
+          </p>
+        )}
+        {configurationError && currentUser?.role === ROLE.SUPER_ADMIN && (
+          <Button
+            variant='link'
+            className='h-auto p-0'
+            render={
+              <Link
+                to='/system-settings/site/$section'
+                params={{ section: 'system-info' }}
+              />
+            }
+          >
+            {t('Open site settings')}
+          </Button>
+        )}
+        {configurationError && currentUser?.role === ROLE.ADMIN && (
+          <p role='status' className='text-muted-foreground text-sm'>
+            {t(
+              'Ask a super administrator to check the server address in site settings.'
+            )}
           </p>
         )}
         {cooldown && (

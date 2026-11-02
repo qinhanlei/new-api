@@ -59,7 +59,7 @@ export interface AssetValidationSummary {
     | 'expired'
     | 'unknown'
   GroupId?: string
-  ChannelId: number
+  ChannelId?: number
   ExpiresAt: number
   CanPoll: boolean
   CanContinue: boolean

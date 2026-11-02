@@ -26,7 +26,15 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import {
+  ADMIN_PERMISSION_ACTIONS,
+  ADMIN_PERMISSION_RESOURCES,
+  hasPermission,
+} from '@/lib/admin-permissions'
+import { ROLE } from '@/lib/roles'
+import { translateServerText } from '@/lib/server-error-message'
 import { formatDateTimeObject } from '@/lib/time'
+import { useAuthStore } from '@/stores/auth-store'
 
 import type { AssetValidationSummary } from '../types'
 import { AssetValidationStatus } from './asset-validation-status'
@@ -86,6 +94,14 @@ export function AssetValidationRecordDetail(props: {
 }) {
   const { t } = useTranslation()
   const record = props.record
+  const currentUser = useAuthStore((state) => state.auth.user)
+  const canReadChannels =
+    (currentUser?.role ?? 0) >= ROLE.ADMIN &&
+    hasPermission(
+      currentUser,
+      ADMIN_PERMISSION_RESOURCES.CHANNEL,
+      ADMIN_PERMISSION_ACTIONS.READ
+    )
   const completed = Boolean(record.GroupId)
   const ended =
     !completed &&
@@ -122,6 +138,11 @@ export function AssetValidationRecordDetail(props: {
             status={completed ? 'created' : record.Status}
             needsReview={record.NeedsReview}
             bindingPending={record.BindingPending}
+            throttleUntil={
+              record.Error?.Code === 'Throttling'
+                ? (record.NextPollAt || 0) * 1000
+                : 0
+            }
           />
           {record.ArchivedAt > 0 && (
             <Badge variant='outline'>{t('Archived')}</Badge>
@@ -143,13 +164,15 @@ export function AssetValidationRecordDetail(props: {
           <dt className='text-muted-foreground'>{t('Project')}</dt>
           <dd className='break-words'>{record.ProjectName || props.project}</dd>
         </div>
-        <div className='min-w-0'>
-          <dt className='text-muted-foreground'>{t('Channel')}</dt>
-          <dd className='break-words'>
-            {record.ChannelName ||
-              t('Channel {{id}}', { id: record.ChannelId })}
-          </dd>
-        </div>
+        {canReadChannels && Boolean(record.ChannelName || record.ChannelId) && (
+          <div className='min-w-0'>
+            <dt className='text-muted-foreground'>{t('Channel')}</dt>
+            <dd className='break-words'>
+              {record.ChannelName ||
+                t('Channel {{id}}', { id: record.ChannelId })}
+            </dd>
+          </div>
+        )}
         <div>
           <dt className='text-muted-foreground'>{t('Created At')}</dt>
           <dd>
@@ -200,14 +223,21 @@ export function AssetValidationRecordDetail(props: {
           </div>
         )}
       </dl>
-      {record.Error && (
+      {record.Error && !canReadChannels && (
+        <p role='status' className='text-sm break-words'>
+          {translateServerText(t, record.Error.Message)}
+        </p>
+      )}
+      {record.Error && canReadChannels && (
         <Collapsible>
           <CollapsibleTrigger render={<Button variant='ghost' size='sm' />}>
             {t('Diagnostics')}
           </CollapsibleTrigger>
           <CollapsibleContent className='space-y-2 pt-2 text-sm'>
             <p className='font-mono break-all'>{record.Error.Code}</p>
-            <p className='break-words'>{t(record.Error.Message)}</p>
+            <p className='break-words'>
+              {translateServerText(t, record.Error.Message)}
+            </p>
           </CollapsibleContent>
         </Collapsible>
       )}

@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -24,6 +25,7 @@ func ResolveAssetActor(c *gin.Context) (dto.AssetActor, error) {
 		return actor, err
 	}
 	actor.InitiatorID = actor.UserID
+	actor.CanReadChannels = CanReadAssetChannels(c)
 	pin, pinned, _ := GetChannelConstraints(c).ResolvedPin()
 	if pinned {
 		if slices.Contains(actor.ChannelIDs, pin.ChannelId) {
@@ -33,6 +35,24 @@ func ResolveAssetActor(c *gin.Context) (dto.AssetActor, error) {
 		}
 	}
 	return actor, nil
+}
+
+// CanReadAssetChannels uses the authenticated initiator, never an asset owner
+// selected by an administrator. Relay API tokens have no dashboard PAT scopes.
+func CanReadAssetChannels(c *gin.Context) bool {
+	userID, role := c.GetInt("id"), c.GetInt("role")
+	if c.GetInt("token_id") > 0 {
+		var user model.User
+		if err := model.DB.WithContext(c.Request.Context()).Select("id", "role", "status").First(&user, userID).Error; err != nil || user.Status != common.UserStatusEnabled {
+			return false
+		}
+		role = user.Role
+	}
+	if userID <= 0 || role < common.RoleAdminUser || !authz.Can(userID, role, authz.ChannelRead) {
+		return false
+	}
+	return !c.GetBool("use_access_token") || c.GetInt("access_token_id") == 0 ||
+		AccessTokenScopeGranted(c.GetStringSlice("access_token_scopes"), AccessTokenScopeOf(authz.ChannelRead))
 }
 
 // AssetActorForUser also serves administrative actions on an explicitly

@@ -131,6 +131,11 @@ export function AssetValidationRecordList(props: {
               status={record.GroupId ? 'created' : record.Status}
               needsReview={record.NeedsReview}
               bindingPending={record.BindingPending}
+              throttleUntil={
+                record.Error?.Code === 'Throttling'
+                  ? (record.NextPollAt || 0) * 1000
+                  : 0
+              }
             />
             {record.ArchivedAt > 0 && (
               <Badge variant='outline'>{t('Archived')}</Badge>

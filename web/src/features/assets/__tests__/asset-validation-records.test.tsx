@@ -18,7 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
+  act,
   fireEvent,
+  isInaccessible,
   render,
   screen,
   waitFor,
@@ -29,6 +31,8 @@ import { toast } from 'sonner'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { api } from '@/lib/api'
+import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { AssetValidationRecordsDrawer } from '../components/asset-validation-records'
 import type { AssetValidationSummary } from '../types'
@@ -114,7 +118,11 @@ beforeEach(() => {
   })
 })
 
-afterEach(() => client.clear())
+afterEach(() => {
+  client.clear()
+  vi.useRealTimers()
+  useAuthStore.getState().auth.reset()
+})
 
 test('completed records open the exact group without querying the verification result', async () => {
   const user = userEvent.setup()
@@ -129,6 +137,12 @@ test('completed records open the exact group without querying the verification r
 
 test('expired uncertain records expose read-only details and no invalid continue action', async () => {
   const user = userEvent.setup()
+  useAuthStore.getState().auth.setUser({
+    id: 1,
+    username: 'admin',
+    role: ROLE.ADMIN,
+    permissions: { admin_permissions: { channel: { read: true } } },
+  })
   const post = vi.spyOn(api, 'post')
   renderRecords()
   await user.click(
@@ -489,4 +503,159 @@ test('mobile selection disables records that cannot be managed in bulk', async (
       screen.getByRole('checkbox', { name: 'Select all' })
     ).toHaveAttribute('aria-disabled', 'true')
   )
+})
+
+test.each([ROLE.USER, ROLE.ADMIN])(
+  'verification details hide channel information and diagnostics without channel read permission for role %s',
+  async (role) => {
+    const user = userEvent.setup()
+    useAuthStore.getState().auth.setUser({
+      id: 1,
+      username: 'caller',
+      role,
+      permissions: { admin_permissions: { channel: { read: false } } },
+    })
+    renderRecords()
+    await user.click(
+      await screen.findByRole('button', {
+        name: 'View details: Needs investigation',
+      })
+    )
+    expect(
+      await screen.findByRole('heading', { name: 'Needs investigation' })
+    ).toBeVisible()
+    expect(screen.queryByText('Portrait channel')).not.toBeInTheDocument()
+    expect(screen.queryByText('Channel')).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Diagnostics' })
+    ).not.toBeInTheDocument()
+    expect(screen.getByText('No confirmed result is available')).toBeVisible()
+  }
+)
+
+test.each([
+  {
+    status: 'failed' as const,
+    nextPollDelay: -60,
+    bindingPending: false,
+    label: 'Verification could not start',
+  },
+  {
+    status: 'expired' as const,
+    nextPollDelay: 60,
+    bindingPending: false,
+    label: 'Verification link expired',
+  },
+  {
+    status: 'unknown' as const,
+    nextPollDelay: 60,
+    bindingPending: true,
+    label: 'Linking person group',
+  },
+])(
+  'a $status record uses $label instead of an obsolete or lower-priority throttle state',
+  async ({ status, nextPollDelay, bindingPending, label }) => {
+    records = [
+      {
+        ...completed,
+        SessionId: 'record-limited',
+        Name: 'Limited attempt',
+        GroupId: undefined,
+        Status: status,
+        ExpiresAt:
+          status === 'expired' || bindingPending
+            ? 1
+            : Math.floor(Date.now() / 1000) + 1800,
+        BindingPending: bindingPending,
+        NextPollAt: Math.floor(Date.now() / 1000) + nextPollDelay,
+        Error: {
+          Code: 'Throttling',
+          Message: 'Human verification is busy; retry shortly',
+        },
+      },
+    ]
+    renderRecords()
+    expect(
+      await within(screen.getByRole('table')).findByText(label)
+    ).toBeVisible()
+    expect(screen.queryByText('Waiting to retry')).not.toBeInTheDocument()
+  }
+)
+
+test('an open verification record updates after its cooldown without refreshing the record', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-02T00:00:00Z'))
+  records = [
+    {
+      ...completed,
+      SessionId: 'record-limited',
+      Name: 'Limited attempt',
+      Status: 'failed',
+      GroupId: undefined,
+      ExpiresAt: Date.now() / 1000 + 1800,
+      NextPollAt: Date.now() / 1000 + 60,
+      Error: {
+        Code: 'Throttling',
+        Message: 'Human verification is busy; retry shortly',
+      },
+    },
+  ]
+  renderRecords()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  expect(
+    within(screen.getByRole('table')).getByText('Waiting to retry')
+  ).toBeVisible()
+  fireEvent.click(
+    screen.getByRole('button', { name: 'View details: Limited attempt' })
+  )
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  expect(screen.getByRole('heading', { name: 'Limited attempt' })).toBeVisible()
+  const requestCount = vi.mocked(api.get).mock.calls.length
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000)
+  })
+  expect(
+    screen
+      .getAllByText('Verification could not start')
+      .filter((label) => !isInaccessible(label))
+  ).toHaveLength(1)
+  for (const label of screen.queryAllByText('Waiting to retry')) {
+    expect(label).not.toBeVisible()
+  }
+  expect(api.get).toHaveBeenCalledTimes(requestCount)
+})
+
+test('a verification list updates its throttle label when unchanged records remain cached', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-11-02T00:00:00Z'))
+  records = [
+    {
+      ...completed,
+      SessionId: 'record-limited',
+      Name: 'Limited attempt',
+      Status: 'failed',
+      GroupId: undefined,
+      ExpiresAt: Date.now() / 1000 + 1800,
+      NextPollAt: Date.now() / 1000 + 60,
+      Error: {
+        Code: 'Throttling',
+        Message: 'Human verification is busy; retry shortly',
+      },
+    },
+  ]
+  renderRecords()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  const table = screen.getByRole('table')
+  expect(within(table).getByText('Waiting to retry')).toBeVisible()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000)
+  })
+  expect(within(table).getByText('Verification could not start')).toBeVisible()
+  expect(within(table).queryByText('Waiting to retry')).not.toBeInTheDocument()
 })

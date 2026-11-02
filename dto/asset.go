@@ -13,6 +13,7 @@ type AssetActor struct {
 	UserAuthVersion int64
 	SessionVersion  int64
 	ReadOnly        bool
+	CanReadChannels bool
 }
 
 type AssetStorageFields struct {

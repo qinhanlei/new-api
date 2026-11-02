@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
@@ -15,7 +16,9 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -38,7 +41,7 @@ func assetValidationFixture(t *testing.T) (dto.AssetActor, dto.AssetValidationCr
 	require.NoError(t, err)
 	_, err = jsplugin.DefaultRegistry.Register(string(source), jsplugin.Options{})
 	require.NoError(t, err)
-	require.NoError(t, model.DB.Create(&model.User{Id: 1, Username: "validation-owner", Group: "default", Status: common.UserStatusEnabled, AuthVersion: 1}).Error)
+	require.NoError(t, model.DB.Create(&model.User{Id: 1, Username: "validation-owner", Role: common.RoleCommonUser, Group: "default", Status: common.UserStatusEnabled, AuthVersion: 1}).Error)
 	require.NoError(t, model.DB.Create(&model.Token{Id: 1, UserId: 1, Key: "validation-inference-key", Status: common.TokenStatusEnabled, ExpiredTime: -1}).Error)
 	for _, id := range []int{1, 2} {
 		require.NoError(t, model.DB.Create(&model.Ability{ChannelId: id, Model: "doubao-seedance-2-0-260128", Group: "default", Enabled: true}).Error)
@@ -48,7 +51,247 @@ func assetValidationFixture(t *testing.T) (dto.AssetActor, dto.AssetValidationCr
 		require.NoError(t, model.SaveAssetChannelConfig(t.Context(), id, config))
 	}
 	return dto.AssetActor{UserID: 1, InitiatorID: 1, TokenID: 1, ChannelIDs: []int{1, 2}},
-		dto.AssetValidationCreate{Name: "Portrait owner", ProjectName: "default", ChannelID: 1, IdempotencyKey: "fixture-request-1"}
+		dto.AssetValidationCreate{Name: "Portrait owner", ProjectName: "default", IdempotencyKey: "fixture-request-1"}
+}
+
+func TestAssetValidationOrdinaryUserCannotChooseChannel(t *testing.T) {
+	actor, input := assetValidationFixture(t)
+	calls := assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
+	input.ChannelID = 1
+	_, err := CreateAssetValidationSession(t.Context(), actor, input)
+	var failure *AssetError
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, http.StatusForbidden, failure.HTTPStatus)
+	assert.Empty(t, *calls, "a denied manual selection must not contact the provider")
+	_, err = ListAssetValidationChannels(t.Context(), actor)
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, http.StatusForbidden, failure.HTTPStatus)
+}
+
+func TestAssetValidationChannelPermissionsUseInitiatorAndCredential(t *testing.T) {
+	assetValidationFixture(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.CasbinRule{}, &model.AuthzRole{}))
+	previousMaster := common.IsMasterNode
+	common.IsMasterNode = true
+	t.Cleanup(func() {
+		common.IsMasterNode = previousMaster
+		require.NoError(t, model.DB.Migrator().DropTable(&model.CasbinRule{}, &model.AuthzRole{}))
+	})
+	require.NoError(t, authz.Init(model.DB))
+	for _, tc := range []struct {
+		name   string
+		role   int
+		pat    bool
+		relay  bool
+		scopes []string
+		allow  bool
+	}{
+		{name: "ordinary session", role: common.RoleCommonUser},
+		{name: "administrator session", role: common.RoleAdminUser, allow: true},
+		{name: "administrator PAT missing channel scope", role: common.RoleAdminUser, pat: true, scopes: []string{"asset:read", "asset:write"}},
+		{name: "administrator scoped PAT", role: common.RoleAdminUser, pat: true, scopes: []string{"asset:write", "channel:read"}, allow: true},
+		{name: "ordinary PAT cannot elevate with channel scope", role: common.RoleCommonUser, pat: true, scopes: []string{"channel:read"}},
+		{name: "administrator relay token", role: common.RoleAdminUser, relay: true, allow: true},
+		{name: "ordinary relay token", role: common.RoleCommonUser, relay: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 1).Update("role", tc.role).Error)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+			c.Set("id", 1)
+			c.Set("role", tc.role)
+			if tc.pat {
+				c.Set("use_access_token", true)
+				c.Set("access_token_id", 7)
+				c.Set("access_token_scopes", tc.scopes)
+			}
+			if tc.relay {
+				c.Set("token_id", 1)
+				c.Set("role", 0) // TokenAuth supplies identity, not a dashboard role.
+			}
+			assert.Equal(t, tc.allow, CanReadAssetChannels(c))
+			if tc.relay {
+				actor, err := ResolveAssetActor(c)
+				require.NoError(t, err)
+				assert.Equal(t, tc.allow, actor.CanReadChannels)
+			}
+		})
+	}
+	require.NoError(t, authz.SetUserPermissions(1, authz.PermissionsMap{"channel": {"read": false}}))
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+	c.Set("id", 1)
+	c.Set("role", common.RoleAdminUser)
+	assert.False(t, CanReadAssetChannels(c), "an administrator's explicit channel denial still applies")
+}
+
+func TestAssetValidationAutomaticAndManualChannelSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		manual    int
+		canRead   bool
+		pin       int
+		invalidAK bool
+		want      int
+	}{
+		{name: "automatic first eligible", want: 1},
+		{name: "automatic skips invalid authentication", invalidAK: true, want: 2},
+		{name: "administrator chooses eligible channel", manual: 2, canRead: true, want: 2},
+		{name: "administrator relay pin", pin: 2, canRead: true, want: 2},
+		{name: "manual choice conflicts with relay pin", manual: 1, pin: 2, canRead: true},
+		{name: "manual choice outside owner eligibility", manual: 3, canRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actor, input := assetValidationFixture(t)
+			actor.CanReadChannels, input.ChannelID = tc.canRead, tc.manual
+			if tc.pin != 0 {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+				c.Set("id", 1)
+				c.Set("token_id", 1)
+				require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 1).Update("role", common.RoleRootUser).Error)
+				GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: tc.pin, Source: dto.PinSourceToken, Rank: dto.PinRankToken, RetryMode: dto.PinRetrySingleAttempt})
+				var err error
+				actor, err = ResolveAssetActor(c)
+				require.NoError(t, err)
+			}
+			if tc.invalidAK {
+				config, err := model.LoadAssetChannelConfig(t.Context(), 1)
+				require.NoError(t, err)
+				config.AccessKey = ""
+				require.NoError(t, model.SaveAssetChannelConfig(t.Context(), 1, config))
+			}
+			calls := assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
+			view, err := CreateAssetValidationSession(t.Context(), actor, input)
+			if tc.want == 0 {
+				var failure *AssetError
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, http.StatusForbidden, failure.HTTPStatus)
+				assert.Equal(t, "ValidationChannelUnavailable", failure.Code)
+				assert.Empty(t, *calls)
+				return
+			}
+			require.NoError(t, err)
+			row, err := model.GetAssetValidationSession(t.Context(), 1, 1, view.BytedToken, "default")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, row.ChannelID)
+			repeated, err := CreateAssetValidationSession(t.Context(), actor, input)
+			require.NoError(t, err)
+			assert.Equal(t, view.BytedToken, repeated.BytedToken)
+			assert.Equal(t, 1, (*calls)["CreateVisualValidateSession"])
+		})
+	}
+}
+
+func TestAssetValidationExistingManualRequestStillContinues(t *testing.T) {
+	actor, input := assetValidationFixture(t)
+	actor.CanReadChannels, input.ChannelID = true, 1
+	calls := assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
+	created, err := CreateAssetValidationSession(t.Context(), actor, input)
+	require.NoError(t, err)
+	actor.CanReadChannels = false
+	replayed, err := CreateAssetValidationSession(t.Context(), actor, input)
+	require.NoError(t, err)
+	assert.Equal(t, created.BytedToken, replayed.BytedToken)
+	assert.Zero(t, replayed.ChannelID)
+	input.ChannelID = 2
+	_, err = CreateAssetValidationSession(t.Context(), actor, input)
+	assert.ErrorIs(t, err, model.ErrAssetConflict)
+	input.IdempotencyKey = "new-manual-request"
+	_, err = CreateAssetValidationSession(t.Context(), actor, input)
+	var failure *AssetError
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, http.StatusForbidden, failure.HTTPStatus)
+	assert.Equal(t, 1, (*calls)["CreateVisualValidateSession"])
+	allowAssetValidationPoll(t, created.BytedToken)
+	completed, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
+	require.NoError(t, err)
+	assert.Equal(t, model.AssetValidationCreated, completed.Status)
+	assert.NotEmpty(t, completed.GroupID)
+}
+
+func TestAssetValidationDiagnosticsRequireChannelPermission(t *testing.T) {
+	for _, tc := range []struct {
+		name, action, publicCode string
+		status                   int
+	}{
+		{"creation rejected", "CreateVisualValidateSession", "ValidationCreateFailed", http.StatusBadRequest},
+		{"creation uncertain", "CreateVisualValidateSession", "ValidationResultUnknown", http.StatusBadGateway},
+		{"result temporarily unavailable", "GetVisualValidateResult", "ValidationCheckUnavailable", http.StatusBadRequest},
+		{"creation throttled", "CreateVisualValidateSession", "Throttling", http.StatusTooManyRequests},
+		{"result throttled", "GetVisualValidateResult", "Throttling", http.StatusTooManyRequests},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actor, input := assetValidationFixture(t)
+			const detail = "Provider detail: account warehouse-alpha"
+			calls := assetValidationUpstream(t, "", func(action string, _ map[string]any) (int, any) {
+				if action == tc.action {
+					return tc.status, map[string]any{"ResponseMetadata": map[string]any{"Error": dto.AssetFailure{Code: "ProviderDiagnostic", Message: detail}}}
+				}
+				return 0, nil
+			})
+			transport := httpClient.Transport
+			httpClient.Transport = assetRoundTripper(func(request *http.Request) (*http.Response, error) {
+				response, err := transport.RoundTrip(request)
+				if response != nil && response.StatusCode == http.StatusTooManyRequests {
+					response.Header.Set("Retry-After", "120")
+				}
+				return response, err
+			})
+			before := time.Now().Unix()
+			view, err := CreateAssetValidationSession(t.Context(), actor, input)
+			require.NoError(t, err)
+			if tc.action == "GetVisualValidateResult" {
+				allowAssetValidationPoll(t, view.BytedToken)
+				view, err = GetAssetValidationResult(t.Context(), actor, view.BytedToken, "default")
+				require.NoError(t, err)
+				assert.Equal(t, model.AssetValidationPending, view.Status)
+				assert.True(t, view.CanPoll)
+			}
+			require.NotNil(t, view.Error)
+			assert.Equal(t, tc.publicCode, view.Error.Code)
+			assert.NotContains(t, view.Error.Message, detail)
+			encoded, err := common.Marshal(view)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), "ChannelId")
+			assert.NotContains(t, string(encoded), "ChannelName")
+			if tc.status == http.StatusTooManyRequests {
+				assert.Equal(t, "Human verification is busy; retry shortly", view.Error.Message)
+				assert.GreaterOrEqual(t, view.NextPollAt, before+120)
+				assert.LessOrEqual(t, view.NextPollAt, time.Now().Unix()+120)
+			}
+			row, err := model.GetAssetValidationSession(t.Context(), 1, 1, view.BytedToken, "default")
+			require.NoError(t, err)
+			assert.Equal(t, detail, row.ErrorMessage)
+			assert.Equal(t, view.NextPollAt, row.NextPollAt)
+			public, err := GetAssetValidationRecord(t.Context(), actor, view.BytedToken, "default")
+			require.NoError(t, err)
+			require.NotNil(t, public.Error)
+			assert.Equal(t, view.Error, public.Error)
+			encoded, err = common.Marshal(public)
+			require.NoError(t, err)
+			for _, private := range []string{"ChannelId", "ChannelName", detail} {
+				assert.NotContains(t, string(encoded), private)
+			}
+			actor.CanReadChannels = true
+			admin, err := GetAssetValidationRecord(t.Context(), actor, view.BytedToken, "default")
+			require.NoError(t, err)
+			assert.Equal(t, 1, admin.ChannelID)
+			assert.Equal(t, "channel-1", admin.ChannelName)
+			require.NotNil(t, admin.Error)
+			assert.Equal(t, detail, admin.Error.Message)
+			actor.CanReadChannels = false
+			var again dto.AssetValidationView
+			if tc.action == "CreateVisualValidateSession" {
+				again, err = CreateAssetValidationSession(t.Context(), actor, input)
+			} else {
+				again, err = GetAssetValidationResult(t.Context(), actor, view.BytedToken, "default")
+			}
+			require.NoError(t, err)
+			assert.Equal(t, view, again)
+			assert.Equal(t, 1, (*calls)[tc.action], "read-only history and early retries must not repeat an upstream operation")
+		})
+	}
 }
 
 func assetValidationBearerChannel(t *testing.T, id int, endpoint, key string) {
@@ -348,6 +591,7 @@ func TestAssetValidationExpiryAndIsolation(t *testing.T) {
 
 func TestAssetValidationRateAndLeaseFences(t *testing.T) {
 	actor, input := assetValidationFixture(t)
+	actor.CanReadChannels = true
 	calls := assetValidationUpstream(t, "", func(string, map[string]any) (int, any) { return 0, nil })
 	// A window persisted by the AK/SK-only release must still limit new requests.
 	legacyWindow := model.AssetValidationRateWindow{ScopeHash: "05f02e64ca5ead190c8f7ed676a136552fbd47d1766b339f9d298301a4efdbdd", NextCallAt: time.Now().Add(time.Minute).UnixMilli()}
@@ -410,6 +654,7 @@ func TestAssetValidationBearerRateScope(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			actor, input := assetValidationFixture(t)
+			actor.CanReadChannels = true
 			assetValidationBearerChannel(t, 1, "https://upstream.example/materials", "channel-key")
 			assetValidationBearerChannel(t, 2, tc.endpoint, tc.key)
 			assetValidationUpstream(t, "channel-key", func(string, map[string]any) (int, any) { return 0, nil })
@@ -448,6 +693,7 @@ func TestAssetValidationRejectsInvalidChannelAuthentication(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			actor, input := assetValidationFixture(t)
+			actor.CanReadChannels, input.ChannelID = true, 1
 			config, err := model.LoadAssetChannelConfig(t.Context(), 1)
 			require.NoError(t, err)
 			config.AuthType, config.AccessKey, config.SecretKey = tc.authType, tc.accessKey, tc.secretKey
@@ -456,8 +702,8 @@ func TestAssetValidationRejectsInvalidChannelAuthentication(t *testing.T) {
 			_, err = CreateAssetValidationSession(t.Context(), actor, input)
 			var failure *AssetError
 			require.ErrorAs(t, err, &failure)
-			assert.Equal(t, "NoAvailableChannel", failure.Code)
-			assert.Equal(t, "No material channel is available for human verification", failure.Message)
+			assert.Equal(t, "ValidationChannelUnavailable", failure.Code)
+			assert.Equal(t, "The selected channel is unavailable for human verification.", failure.Message)
 			assert.Empty(t, *calls)
 		})
 	}
@@ -660,6 +906,7 @@ func TestAssetValidationRejectsMismatchedUpstreamGroup(t *testing.T) {
 
 func TestAssetValidationRedactsPendingErrors(t *testing.T) {
 	actor, input := assetValidationFixture(t)
+	actor.CanReadChannels = true
 	state := ""
 	assetValidationUpstream(t, "", func(action string, payload map[string]any) (int, any) {
 		if action == "CreateVisualValidateSession" {
@@ -674,6 +921,7 @@ func TestAssetValidationRedactsPendingErrors(t *testing.T) {
 	})
 	created, err := CreateAssetValidationSession(t.Context(), actor, input)
 	require.NoError(t, err)
+	system_setting.ServerAddress = "https://new-gateway.example"
 	allowAssetValidationPoll(t, created.BytedToken)
 	result, err := GetAssetValidationResult(t.Context(), actor, created.BytedToken, "default")
 	require.NoError(t, err)
@@ -769,6 +1017,7 @@ func TestAssetValidationPersistsPollingBackoff(t *testing.T) {
 	for _, status := range []int{http.StatusTooManyRequests, http.StatusBadRequest, http.StatusBadGateway, http.StatusOK} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			actor, input := assetValidationFixture(t)
+			actor.CanReadChannels = true
 			failing := true
 			calls := assetValidationUpstream(t, "", func(action string, _ map[string]any) (int, any) {
 				if action == "GetVisualValidateResult" && failing {
@@ -793,7 +1042,9 @@ func TestAssetValidationPersistsPollingBackoff(t *testing.T) {
 				assert.Equal(t, "pending", view.Status)
 				assert.True(t, view.CanPoll)
 				require.NotNil(t, view.Error)
-				if status == http.StatusOK {
+				if status == http.StatusTooManyRequests {
+					assert.Equal(t, "Throttling", view.Error.Code)
+				} else if status == http.StatusOK {
 					assert.Equal(t, "UpstreamInvalidResponse", view.Error.Code, "a temporarily invalid response remains recoverable")
 				} else {
 					assert.Equal(t, "InvalidParameter", view.Error.Code)
@@ -894,6 +1145,7 @@ func TestAssetValidationHistoryDistinguishesAnotherCredential(t *testing.T) {
 
 func TestAssetValidationChannelsRespectCurrentEligibility(t *testing.T) {
 	actor, _ := assetValidationFixture(t)
+	actor.CanReadChannels = true
 	channels, err := ListAssetValidationChannels(t.Context(), actor)
 	require.NoError(t, err)
 	assert.Equal(t, []dto.AssetValidationChannel{{ID: 1, Name: "channel-1"}, {ID: 2, Name: "channel-2"}}, channels)

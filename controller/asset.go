@@ -163,6 +163,7 @@ func assetManagementActor(c *gin.Context, action string) (dto.AssetActor, bool) 
 	}
 	actor.AllUsers = allUsers
 	actor.InitiatorID = c.GetInt("id")
+	actor.CanReadChannels = service.CanReadAssetChannels(c)
 	actor.AccessTokenID = c.GetInt("access_token_id")
 	if c.GetBool("use_access_token") && actor.AccessTokenID > 0 {
 		permissions := c.GetStringSlice("access_token_scopes")
