@@ -51,6 +51,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Label } from '@/components/ui/label'
 import { NativeSelect } from '@/components/ui/native-select'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { toIntlLocale } from '@/i18n/languages'
 import { formatNumber } from '@/lib/format'
@@ -294,31 +295,6 @@ export function AssetBrowser({
         <SectionPageLayout.Title>{t('Asset library')}</SectionPageLayout.Title>
         <SectionPageLayout.Actions>
           {settingsActions}
-          {groupType === 'LivenessFace' && !scope.allUsers && (
-            <>
-              <Button variant='outline' onClick={() => setShowRecords(true)}>
-                <History className='size-4' aria-hidden='true' />
-                {t('Verification records')}
-                {recordsCount.data && recordsCount.data.PendingCount > 0 && (
-                  <span aria-label={t('Pending verification records')}>
-                    {formatNumber(
-                      recordsCount.data.PendingCount,
-                      toIntlLocale(i18n.resolvedLanguage || i18n.language)
-                    )}
-                  </span>
-                )}
-              </Button>
-              <Button
-                variant='outline'
-                onClick={() => {
-                  setValidationRecord(undefined)
-                  setValidating(true)
-                }}
-              >
-                {t('Verify a person')}
-              </Button>
-            </>
-          )}
           <Button
             disabled={!group || scope.allUsers || frozen}
             onClick={() => group && setAdding({ group, scope: { ...scope } })}
@@ -326,6 +302,25 @@ export function AssetBrowser({
             <Plus className='size-4' />
             {t('Add asset')}
           </Button>
+          <Tabs
+            value={groupType}
+            onValueChange={(value) => {
+              if (value !== 'AIGC' && value !== 'LivenessFace') return
+              setGroupType(value)
+              setGroupId('')
+              setAdding(null)
+              setGroupDialog(null)
+              setValidating(false)
+              setShowRecords(false)
+              setValidationRecord(undefined)
+              setDeleting(null)
+            }}
+          >
+            <TabsList aria-label={t('Library type')}>
+              <TabsTrigger value='AIGC'>{t('Virtual')}</TabsTrigger>
+              <TabsTrigger value='LivenessFace'>{t('Real people')}</TabsTrigger>
+            </TabsList>
+          </Tabs>
         </SectionPageLayout.Actions>
         <SectionPageLayout.Content>
           <div className='flex h-full min-h-0 flex-col gap-3'>
@@ -361,26 +356,6 @@ export function AssetBrowser({
                   additionalSearch: (
                     <>
                       {filterControls}
-                      <Label className='sr-only' htmlFor={`${id}-type`}>
-                        {t('Library type')}
-                      </Label>
-                      <NativeSelect
-                        id={`${id}-type`}
-                        value={groupType}
-                        onChange={(event) => {
-                          setGroupType(event.target.value as AssetGroupType)
-                          setGroupId('')
-                          setAdding(null)
-                          setGroupDialog(null)
-                          setValidating(false)
-                          setShowRecords(false)
-                          setValidationRecord(undefined)
-                          setDeleting(null)
-                        }}
-                      >
-                        <option value='AIGC'>{t('Virtual people')}</option>
-                        <option value='LivenessFace'>{t('Real people')}</option>
-                      </NativeSelect>
                       <div className='flex min-w-0 items-center gap-2'>
                         <Label className='sr-only' htmlFor={id}>
                           {t('Asset group')}
@@ -438,19 +413,51 @@ export function AssetBrowser({
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 disabled={scope.allUsers}
-                                onClick={() =>
-                                  groupType === 'LivenessFace'
-                                    ? setValidating(true)
-                                    : setGroupDialog({
-                                        project,
-                                        scope: { ...scope },
-                                      })
-                                }
+                                onClick={() => {
+                                  if (groupType === 'LivenessFace') {
+                                    setValidationRecord(undefined)
+                                    setValidating(true)
+                                  } else {
+                                    setGroupDialog({
+                                      project,
+                                      scope: { ...scope },
+                                    })
+                                  }
+                                }}
                               >
                                 {groupType === 'LivenessFace'
                                   ? t('Verify a person')
                                   : t('Create asset group')}
                               </DropdownMenuItem>
+                              {groupType === 'LivenessFace' &&
+                                !scope.allUsers && (
+                                  <DropdownMenuItem
+                                    onClick={() => setShowRecords(true)}
+                                  >
+                                    <History
+                                      className='size-4'
+                                      aria-hidden='true'
+                                    />
+                                    {t('Verification records')}
+                                    {recordsCount.data &&
+                                      recordsCount.data.PendingCount > 0 && (
+                                        <span
+                                          className='ml-auto'
+                                          aria-label={t(
+                                            'Pending verification records'
+                                          )}
+                                        >
+                                          {formatNumber(
+                                            recordsCount.data.PendingCount,
+                                            toIntlLocale(
+                                              i18n.resolvedLanguage ||
+                                                i18n.language
+                                            )
+                                          )}
+                                        </span>
+                                      )}
+                                  </DropdownMenuItem>
+                                )}
                               <DropdownMenuItem
                                 disabled={!group || scope.allUsers || frozen}
                                 onClick={() =>

@@ -44,6 +44,78 @@ let client: QueryClient
 
 afterEach(() => client?.clear())
 
+test('an empty human library keeps verification and pending records available in the group menu', async () => {
+  const user = userEvent.setup()
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        Items: [],
+        TotalCount: 0,
+        PendingCount: 2,
+        Page: 1,
+        PageSize: 20,
+      },
+    },
+  })
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: { Items: [], TotalCount: 0 } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetBrowser project='default' scope={{}} admin={false} />
+    </QueryClientProvider>
+  )
+  await user.click(screen.getByRole('tab', { name: 'Real people' }))
+  await user.click(screen.getByRole('button', { name: 'Group actions' }))
+  const records = await screen.findByRole('menuitem', {
+    name: /Verification records/,
+  })
+  expect(
+    within(records).getByLabelText('Pending verification records')
+  ).toHaveTextContent('2')
+  await user.click(screen.getByRole('menuitem', { name: 'Verify a person' }))
+  const verification = await screen.findByRole('dialog', {
+    name: 'Verify a person',
+  })
+  expect(within(verification).getByLabelText('Name')).toBeVisible()
+  await user.keyboard('{Escape}')
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  await user.click(screen.getByRole('button', { name: 'Group actions' }))
+  await user.click(
+    screen.getByRole('menuitem', { name: /Verification records/ })
+  )
+  expect(
+    await screen.findByRole('dialog', { name: 'Verification records' })
+  ).toBeVisible()
+})
+
+test('the all-users human library cannot start verification or open another owner records', async () => {
+  const user = userEvent.setup()
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const get = vi.spyOn(api, 'get')
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: { Items: [], TotalCount: 0 } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetBrowser project='default' scope={{ allUsers: true }} admin />
+    </QueryClientProvider>
+  )
+  await user.click(screen.getByRole('tab', { name: 'Real people' }))
+  await user.click(screen.getByRole('button', { name: 'Group actions' }))
+  expect(
+    screen.getByRole('menuitem', { name: 'Verify a person' })
+  ).toHaveAttribute('aria-disabled', 'true')
+  expect(
+    screen.queryByRole('menuitem', { name: /Verification records/ })
+  ).not.toBeInTheDocument()
+  expect(get).not.toHaveBeenCalled()
+})
+
 test('a selected person removed during refresh shows an error instead of another person', async () => {
   const user = userEvent.setup()
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -83,12 +155,10 @@ test('a selected person removed during refresh shows an error instead of another
     </QueryClientProvider>
   )
   await screen.findByRole('option', { name: first.Name })
-  await user.selectOptions(
-    screen.getByRole('combobox', { name: 'Library type' }),
-    'LivenessFace'
-  )
-  expect(screen.getByRole('combobox', { name: 'Library type' })).toHaveValue(
-    'LivenessFace'
+  await user.click(screen.getByRole('tab', { name: 'Real people' }))
+  expect(screen.getByRole('tab', { name: 'Real people' })).toHaveAttribute(
+    'aria-selected',
+    'true'
   )
   await screen.findByRole('option', { name: selected.Name })
   await user.selectOptions(
@@ -179,15 +249,14 @@ test.each([false, true])(
       </QueryClientProvider>
     )
     await screen.findByRole('option', { name: first.Name })
-    await user.selectOptions(
-      screen.getByRole('combobox', { name: 'Library type' }),
-      'LivenessFace'
+    await user.click(screen.getByRole('tab', { name: 'Real people' }))
+    expect(screen.getByRole('tab', { name: 'Real people' })).toHaveAttribute(
+      'aria-selected',
+      'true'
     )
-    expect(screen.getByRole('combobox', { name: 'Library type' })).toHaveValue(
-      'LivenessFace'
-    )
+    await user.click(screen.getByRole('button', { name: 'Group actions' }))
     await user.click(
-      await screen.findByRole('button', { name: 'Verification records' })
+      await screen.findByRole('menuitem', { name: 'Verification records' })
     )
     await user.click(await screen.findByRole('button', { name: 'View group' }))
     if (unavailable) {

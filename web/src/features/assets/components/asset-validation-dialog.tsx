@@ -102,7 +102,6 @@ export function AssetValidationDialog(props: {
     )
   const [activeView, setSession] = useState<AssetValidationView | null>(null)
   const [selectedChannel, setSelectedChannel] = useState(0)
-  const [channelOptionsOpen, setChannelOptionsOpen] = useState(false)
   const [now, setNow] = useState(Date.now)
   const [polling, setPolling] = useState({
     nextAt: 0,
@@ -164,12 +163,11 @@ export function AssetValidationDialog(props: {
     ],
     queryFn: ({ signal }) =>
       getAssetValidationChannels(props.project, props.scope, signal),
-    enabled: canReadChannels && channelOptionsOpen && !session,
+    enabled: canReadChannels && !session,
     meta: { errorToast: false },
   })
   const channelId = canReadChannels ? selectedChannel : 0
   const channelOption = channels.data?.find((item) => item.Id === channelId)
-  const selectedChannelName = channelOption?.Name
   const channelAvailable =
     channelId === 0 ||
     (channels.isSuccess && !channels.isFetching && Boolean(channelOption))
@@ -679,69 +677,56 @@ export function AssetValidationDialog(props: {
               <span className='text-foreground'>{props.project}</span>
             </p>
             {canReadChannels && (
-              <Collapsible
-                open={channelOptionsOpen}
-                onOpenChange={setChannelOptionsOpen}
-              >
-                <CollapsibleTrigger
+              <div className='space-y-2'>
+                <Label htmlFor={`${id}-channel`}>
+                  {t('Verification channel')}
+                </Label>
+                <NativeSelect
+                  id={`${id}-channel`}
+                  className='w-full'
+                  value={channelId}
                   disabled={create.isPending}
-                  render={<Button variant='ghost' size='sm' />}
+                  onChange={(event) =>
+                    setSelectedChannel(Number(event.target.value))
+                  }
                 >
-                  {channelId > 0
-                    ? `${t('Verification channel')}: ${selectedChannelName || t('Channel {{id}}', { id: channelId })}`
-                    : t('Specify a channel')}
-                </CollapsibleTrigger>
-                <CollapsibleContent className='space-y-2 pt-2'>
-                  <Label htmlFor={`${id}-channel`}>
-                    {t('Verification channel')}
-                  </Label>
-                  <NativeSelect
-                    id={`${id}-channel`}
-                    className='w-full'
-                    value={channelId}
-                    disabled={create.isPending}
-                    onChange={(event) =>
-                      setSelectedChannel(Number(event.target.value))
-                    }
-                  >
-                    <option value={0}>{t('Automatic selection')}</option>
-                    {channelId > 0 && !channelOption && (
-                      <option value={channelId} disabled>
-                        {t('Channel {{id}}', { id: channelId })}
-                      </option>
-                    )}
-                    {channels.data?.map((channel) => (
-                      <option key={channel.Id} value={channel.Id}>
-                        {channel.Name}
-                      </option>
-                    ))}
-                  </NativeSelect>
-                  {channels.isPending && <LoadingState />}
-                  {channels.isError && (
-                    <ErrorState
-                      className='min-h-0 py-4'
-                      description={getServerErrorMessage(channels.error)}
-                      onRetry={() => void channels.refetch()}
-                    />
+                  <option value={0}>{t('Automatic selection')}</option>
+                  {channelId > 0 && !channelOption && (
+                    <option value={channelId} disabled>
+                      {t('Channel {{id}}', { id: channelId })}
+                    </option>
                   )}
-                  {channels.isSuccess && !channels.data.length && (
-                    <p role='status' className='text-muted-foreground text-sm'>
-                      {t(
-                        'No material channel is available for human verification'
-                      )}
-                    </p>
-                  )}
-                  {channelId > 0 &&
-                    !channelAvailable &&
-                    !channels.isFetching && (
-                      <p role='alert' className='text-destructive text-sm'>
-                        {t(
-                          'This verification channel is no longer available. Choose another channel or use automatic selection.'
-                        )}
-                      </p>
+                  {channels.data?.map((channel) => (
+                    <option key={channel.Id} value={channel.Id}>
+                      {channel.Name}
+                    </option>
+                  ))}
+                </NativeSelect>
+                {channels.isPending && (
+                  <LoadingState className='min-h-0 py-2' />
+                )}
+                {channels.isError && (
+                  <ErrorState
+                    className='min-h-0 py-4'
+                    description={getServerErrorMessage(channels.error)}
+                    onRetry={() => void channels.refetch()}
+                  />
+                )}
+                {channels.isSuccess && !channels.data.length && (
+                  <p role='status' className='text-muted-foreground text-sm'>
+                    {t(
+                      'No material channel is available for human verification'
                     )}
-                </CollapsibleContent>
-              </Collapsible>
+                  </p>
+                )}
+                {channelId > 0 && !channelAvailable && !channels.isFetching && (
+                  <p role='alert' className='text-destructive text-sm'>
+                    {t(
+                      'This verification channel is no longer available. Choose another channel or use automatic selection.'
+                    )}
+                  </p>
+                )}
+              </div>
             )}
             <Form {...form}>
               <form

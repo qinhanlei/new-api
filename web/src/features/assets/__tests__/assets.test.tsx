@@ -1810,8 +1810,16 @@ test('switching library types isolates group filters, asset queries and mutation
             Items:
               action === 'ListAssetGroups'
                 ? [filter?.GroupType === 'LivenessFace' ? human : group]
-                : [],
-            TotalCount: 0,
+                : [
+                    {
+                      ...replicaAsset,
+                      GroupId:
+                        filter?.GroupType === 'LivenessFace'
+                          ? human.Id
+                          : group.Id,
+                    },
+                  ],
+            TotalCount: 1,
           },
         },
       }
@@ -1822,14 +1830,37 @@ test('switching library types isolates group filters, asset queries and mutation
     </QueryClientProvider>
   )
   await screen.findByRole('option', { name: 'Avatars' })
-  await user.selectOptions(
-    screen.getByLabelText('Library type'),
-    'LivenessFace'
+  const types = screen.getByRole('tablist', { name: 'Library type' })
+  expect(within(types).getByRole('tab', { name: 'Virtual' })).toHaveAttribute(
+    'aria-selected',
+    'true'
   )
+  expect(
+    screen.queryByRole('combobox', { name: 'Library type' })
+  ).not.toBeInTheDocument()
+  const selectedRow = await screen.findByRole('row', { name: /Avatar/ })
+  await user.click(within(selectedRow).getByRole('checkbox'))
+  expect(within(selectedRow).getByRole('checkbox')).toBeChecked()
+  await user.click(within(types).getByRole('tab', { name: 'Virtual' }))
+  await user.keyboard('{ArrowRight}{Enter}')
+  expect(
+    within(types).getByRole('tab', { name: 'Real people' })
+  ).toHaveAttribute('aria-selected', 'true')
   await screen.findByRole('option', { name: 'Person' })
+  expect(
+    within(await screen.findByRole('row', { name: /Avatar/ })).getByRole(
+      'checkbox'
+    )
+  ).not.toBeChecked()
   expect(screen.getByLabelText('Asset group')).toHaveValue('group-person')
   expect(
     screen.queryByRole('option', { name: 'Avatars' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: 'Verify a person' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: 'Verification records' })
   ).not.toBeInTheDocument()
   await waitFor(() =>
     expect(post).toHaveBeenCalledWith(
@@ -1871,10 +1902,15 @@ test('switching library types isolates group filters, asset queries and mutation
     screen.queryByRole('menuitem', { name: 'Create asset group' })
   ).not.toBeInTheDocument()
   await user.keyboard('{Escape}')
-  await user.selectOptions(screen.getByLabelText('Library type'), 'AIGC')
+  await user.click(screen.getByRole('tab', { name: 'Virtual' }))
   expect(await screen.findByRole('option', { name: 'Avatars' })).toBeVisible()
   expect(screen.getByLabelText('Asset group')).toHaveValue(group.Id)
   expect(screen.getByPlaceholderText('Filter by name...')).toHaveValue('')
+  expect(
+    within(await screen.findByRole('row', { name: /Avatar/ })).getByRole(
+      'checkbox'
+    )
+  ).not.toBeChecked()
 })
 
 test.each([true, false])(
@@ -2167,10 +2203,7 @@ test.each([
         <AssetBrowser project='default' scope={{}} admin={false} />
       </QueryClientProvider>
     )
-    await user.selectOptions(
-      screen.getByLabelText('Library type'),
-      'LivenessFace'
-    )
+    await user.click(screen.getByRole('tab', { name: 'Real people' }))
     expect(
       await screen.findByText(
         'UpstreamDenied: Provider authorization is active'
@@ -2231,10 +2264,7 @@ test('accepted human deletion stays visible as pending and does not report compl
       <AssetBrowser project='default' scope={{}} admin={false} />
     </QueryClientProvider>
   )
-  await user.selectOptions(
-    screen.getByLabelText('Library type'),
-    'LivenessFace'
-  )
+  await user.click(screen.getByRole('tab', { name: 'Real people' }))
   await screen.findByRole('option', { name: 'Avatars' })
   await user.click(screen.getByRole('button', { name: 'Group actions' }))
   await user.click(screen.getByRole('menuitem', { name: 'Delete group' }))
@@ -2571,10 +2601,7 @@ test('cancelling a blocked human deletion uses its owner and unfreezes the group
       <AssetBrowser project='default' scope={{ userId: 23 }} admin />
     </QueryClientProvider>
   )
-  await user.selectOptions(
-    screen.getByLabelText('Library type'),
-    'LivenessFace'
-  )
+  await user.click(screen.getByRole('tab', { name: 'Real people' }))
   await user.click(
     await screen.findByRole('button', { name: 'Cancel deletion' })
   )
@@ -2624,10 +2651,7 @@ test.each(['removed', 'delete_pending'] as const)(
         <AssetBrowser project='default' scope={{}} admin={false} />
       </QueryClientProvider>
     )
-    await user.selectOptions(
-      screen.getByLabelText('Library type'),
-      'LivenessFace'
-    )
+    await user.click(screen.getByRole('tab', { name: 'Real people' }))
     await screen.findByRole('option', { name: 'Avatars' })
     await user.click(screen.getByRole('button', { name: 'Add asset' }))
     expect(screen.getByRole('dialog')).toBeInTheDocument()
@@ -2678,10 +2702,7 @@ test('background group refresh never retargets an open delete confirmation', asy
       <AssetBrowser project='default' scope={{}} admin={false} />
     </QueryClientProvider>
   )
-  await user.selectOptions(
-    screen.getByLabelText('Library type'),
-    'LivenessFace'
-  )
+  await user.click(screen.getByRole('tab', { name: 'Real people' }))
   await screen.findByRole('option', { name: 'Avatars' })
   await user.click(screen.getByRole('button', { name: 'Group actions' }))
   await user.click(screen.getByRole('menuitem', { name: 'Delete group' }))
@@ -3569,7 +3590,7 @@ test.each([
   }
 )
 
-test('an authorized administrator starts automatic verification without loading channel options', async () => {
+test('an authorized administrator immediately sees channels and defaults to automatic verification', async () => {
   const user = userEvent.setup()
   vi.mocked(api.get).mockResolvedValue({
     data: { success: true, data: [{ Id: 7, Name: 'Portrait channel' }] },
@@ -3597,15 +3618,26 @@ test('an authorized administrator starts automatic verification without loading 
     </QueryClientProvider>
   )
   expect(
-    screen.getByRole('button', { name: 'Specify a channel' })
-  ).toHaveAttribute('aria-expanded', 'false')
+    screen.getByRole('combobox', { name: 'Verification channel' })
+  ).toHaveValue('0')
+  expect(
+    screen.queryByRole('button', { name: 'Specify a channel' })
+  ).not.toBeInTheDocument()
+  expect(
+    await screen.findByRole('option', { name: 'Portrait channel' })
+  ).toBeVisible()
   await user.type(screen.getByLabelText('Name'), 'Alice')
   await user.click(screen.getByRole('button', { name: 'Start verification' }))
-  expect(api.get).not.toHaveBeenCalled()
+  expect(api.get).toHaveBeenCalledWith(
+    '/api/assets/validation/channels',
+    expect.objectContaining({
+      params: { project_name: 'default', user_id: undefined },
+    })
+  )
   expect(post.mock.calls[0][1]).not.toHaveProperty('ChannelId')
 })
 
-test('an authorized administrator can explicitly choose a channel after opening the optional control', async () => {
+test('an authorized administrator can explicitly choose an immediately visible channel', async () => {
   const user = userEvent.setup()
   useAuthStore.getState().auth.setUser({
     id: 1,
@@ -3643,8 +3675,7 @@ test('an authorized administrator can explicitly choose a channel after opening 
     </QueryClientProvider>
   )
   await user.type(screen.getByLabelText('Name'), 'Alice')
-  expect(api.get).not.toHaveBeenCalled()
-  await user.click(screen.getByRole('button', { name: 'Specify a channel' }))
+  await screen.findByRole('option', { name: 'Second channel' })
   await user.selectOptions(
     await screen.findByLabelText('Verification channel'),
     '9'
@@ -3655,6 +3686,54 @@ test('an authorized administrator can explicitly choose a channel after opening 
     expect.objectContaining({ ChannelId: 9, ProjectName: 'studio' }),
     expect.anything()
   )
+})
+
+test('loading channel options does not prevent an administrator from starting automatic verification', async () => {
+  const user = userEvent.setup()
+  useAuthStore.getState().auth.setUser({
+    id: 1,
+    username: 'admin',
+    role: ROLE.ADMIN,
+    permissions: { admin_permissions: { channel: { read: true } } },
+  })
+  let finish!: (value: Awaited<ReturnType<typeof api.get>>) => void
+  vi.mocked(api.get).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve
+      })
+  )
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...validationRecord(), BytedToken: 'validation-na-one' },
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetValidationDialog
+        project='default'
+        scope={{}}
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  expect(
+    screen.getByRole('combobox', { name: 'Verification channel' })
+  ).toHaveValue('0')
+  await user.type(screen.getByLabelText('Name'), 'Alice')
+  await user.click(screen.getByRole('button', { name: 'Start verification' }))
+  await waitFor(() => expect(post).toHaveBeenCalledOnce())
+  expect(post.mock.calls[0][1]).not.toHaveProperty('ChannelId')
+  await act(async () =>
+    finish({
+      data: { success: true, data: [{ Id: 7, Name: 'Portrait channel' }] },
+    })
+  )
+  expect(
+    screen.queryByRole('combobox', { name: 'Verification channel' })
+  ).not.toBeInTheDocument()
 })
 
 test('a manual result check shows progress and an explicit waiting result', async () => {
@@ -3796,7 +3875,7 @@ test.each(['empty', 'error'])(
       </QueryClientProvider>
     )
     await user.type(screen.getByLabelText('Name'), 'Alice')
-    await user.click(screen.getByRole('button', { name: 'Specify a channel' }))
+
     expect(
       await screen.findByText(
         result === 'empty'
@@ -3883,7 +3962,7 @@ test('a removed manual channel blocks creation until the administrator switches 
     </QueryClientProvider>
   )
   await user.type(screen.getByLabelText('Name'), 'Alice')
-  await user.click(screen.getByRole('button', { name: 'Specify a channel' }))
+
   await user.selectOptions(
     await screen.findByLabelText('Verification channel'),
     '9'
@@ -3934,6 +4013,7 @@ test.each([
   async ({ role, code, settings, guidance }) => {
     const user = userEvent.setup()
     useAuthStore.getState().auth.setUser({ id: 1, username: 'caller', role })
+    vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
     vi.spyOn(api, 'post').mockRejectedValue({
       response: {
         status: 503,
@@ -3990,7 +4070,14 @@ test.each([
     )
     if (guidance) expect(assistance).toBeVisible()
     else expect(assistance).not.toBeInTheDocument()
-    expect(api.get).not.toHaveBeenCalled()
+    if (role === ROLE.SUPER_ADMIN) {
+      expect(api.get).toHaveBeenCalledWith(
+        '/api/assets/validation/channels',
+        expect.anything()
+      )
+    } else {
+      expect(api.get).not.toHaveBeenCalled()
+    }
   }
 )
 
