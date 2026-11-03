@@ -71,6 +71,7 @@ export function AssetChannelSettingsDialog(props: { onClose: () => void }) {
       title={t('Channel settings')}
       description={channel ? `${channel.name} (#${channel.id})` : undefined}
       descriptionClassName='break-words'
+      contentClassName={channel ? undefined : 'sm:max-w-3xl'}
       initialFocus={channel !== null || position === null}
       footer={
         <Button variant='outline' onClick={props.onClose}>
@@ -84,8 +85,8 @@ export function AssetChannelSettingsDialog(props: { onClose: () => void }) {
         </Button>
       ) : (
         <AssetChannelList
-          onEdit={(selected, scrollTop) => {
-            setPosition({ channelId: selected.id, scrollTop })
+          onEdit={(selected, position) => {
+            setPosition(position)
             setChannel(selected)
           }}
           search={search}

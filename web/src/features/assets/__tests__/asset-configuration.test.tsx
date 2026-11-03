@@ -152,10 +152,37 @@ beforeEach(() => {
           (item.name.toLowerCase().includes(keyword.toLowerCase()) ||
             String(item.id) === keyword)
       )
-      return { data: { success: true, data: { items, total: items.length } } }
+      const pagination = options?.params as
+        | { p?: number; page_size?: number }
+        | undefined
+      const page = pagination?.p ?? 1
+      const pageSize = pagination?.page_size ?? 20
+      return {
+        data: {
+          success: true,
+          data: {
+            items: items.slice((page - 1) * pageSize, page * pageSize),
+            total: items.length,
+          },
+        },
+      }
     }
     const id = Number(String(url).split('/')[3])
-    return { data: { success: true, data: channelConfigs[id] } }
+    return {
+      data: {
+        success: true,
+        data: channelConfigs[id] ?? {
+          channel_id: id,
+          enabled: false,
+          endpoint: '',
+          project_name: 'default',
+          auth_type: 'bearer',
+          access_key: '',
+          has_secret: false,
+          revision: 0,
+        },
+      },
+    }
   })
   vi.spyOn(api, 'post').mockImplementation(async (url, body) => {
     if (url === '/api/verify') {
@@ -821,7 +848,7 @@ test('storage load failures can be retried and a pending reload can be closed', 
   )
 })
 
-test('editing a listed channel loads only its settings and saving returns to the list', async () => {
+test('editing a listed channel and saving updates its configuration and enabled states', async () => {
   const user = userEvent.setup()
   const close = vi.fn()
   const put = vi.spyOn(api, 'put').mockResolvedValue({
@@ -840,7 +867,7 @@ test('editing a listed channel loads only its settings and saving returns to the
   })
   expect(screen.getByRole('table')).toBeVisible()
   expect(screen.queryByLabelText('Channel')).not.toBeInTheDocument()
-  expect(api.get).not.toHaveBeenCalledWith(
+  expect(api.get).toHaveBeenCalledWith(
     '/api/channel/7/assets',
     expect.anything()
   )
@@ -856,7 +883,7 @@ test('editing a listed channel loads only its settings and saving returns to the
   ).not.toBeInTheDocument()
   expect(screen.queryByLabelText('Access key')).not.toBeInTheDocument()
   expect(screen.queryByLabelText('Secret key')).not.toBeInTheDocument()
-  expect(api.get).not.toHaveBeenCalledWith(
+  expect(api.get).toHaveBeenCalledWith(
     '/api/channel/8/assets',
     expect.anything()
   )
@@ -885,6 +912,122 @@ test('editing a listed channel loads only its settings and saving returns to the
     await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
   ).toBeVisible()
   expect(screen.queryByLabelText('Asset API endpoint')).not.toBeInTheDocument()
+  const saved = screen.getByRole('row', { name: /Video channel/ })
+  expect(within(saved).getByText('Configured')).toBeVisible()
+  expect(within(saved).getByText('Enabled')).toBeVisible()
+})
+
+test('channel rows distinguish unsaved, saved disabled and saved enabled asset settings', async () => {
+  channels.push({ ...channel, id: 9, name: 'Saved disabled channel' })
+  channelConfigs[9] = { ...channelConfigs[7], channel_id: 9, revision: 1 }
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  expect(
+    await screen.findByRole('columnheader', { name: 'Configuration' })
+  ).toBeVisible()
+  expect(
+    screen.getByRole('columnheader', { name: 'Asset library status' })
+  ).toBeVisible()
+  const unsaved = screen.getByRole('row', { name: /Video channel/ })
+  expect(await within(unsaved).findByText('Not configured')).toBeVisible()
+  expect(within(unsaved).getByText('Disabled')).toBeVisible()
+  const enabled = screen.getByRole('row', { name: /Second channel/ })
+  expect(await within(enabled).findByText('Configured')).toBeVisible()
+  expect(within(enabled).getByText('Enabled')).toBeVisible()
+  const disabled = screen.getByRole('row', { name: /Saved disabled channel/ })
+  expect(await within(disabled).findByText('Configured')).toBeVisible()
+  expect(within(disabled).getByText('Disabled')).toBeVisible()
+  expect(api.post).not.toHaveBeenCalled()
+})
+
+test('a pending or failed channel configuration does not appear unconfigured and can be retried independently', async () => {
+  const user = userEvent.setup()
+  const get = vi.mocked(api.get).getMockImplementation()
+  if (!get) throw new Error('Channel request fixture is missing')
+  let finish!: (value: Awaited<ReturnType<typeof api.get>>) => void
+  vi.mocked(api.get).mockImplementation((url, options) => {
+    if (url === '/api/channel/7/assets') {
+      return new Promise((resolve) => {
+        finish = resolve
+      })
+    }
+    return get(url, options)
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  const pending = await screen.findByRole('row', { name: /Video channel/ })
+  expect(within(pending).getAllByText('Loading...')).toHaveLength(2)
+  expect(within(pending).queryByText('Not configured')).not.toBeInTheDocument()
+  expect(
+    await within(
+      screen.getByRole('row', { name: /Second channel/ })
+    ).findByText('Enabled')
+  ).toBeVisible()
+  await act(async () =>
+    finish({ data: { success: false, message: 'Configuration unavailable' } })
+  )
+  expect(await within(pending).findAllByText('Failed to load')).toHaveLength(2)
+  expect(
+    screen.getByText('Video channel (#7): Configuration unavailable')
+  ).toBeVisible()
+  expect(within(pending).queryByText('Disabled')).not.toBeInTheDocument()
+  vi.mocked(api.get).mockImplementation(get)
+  await user.click(screen.getByRole('button', { name: 'Retry' }))
+  expect(await within(pending).findByText('Not configured')).toBeVisible()
+  expect(within(pending).getByText('Disabled')).toBeVisible()
+  expect(
+    vi
+      .mocked(api.get)
+      .mock.calls.filter(([url]) => url === '/api/channel/8/assets')
+  ).toHaveLength(1)
+})
+
+test('a late configuration read cannot overwrite newly saved channel status', async () => {
+  const user = userEvent.setup()
+  const get = vi.mocked(api.get).getMockImplementation()
+  if (!get) throw new Error('Channel request fixture is missing')
+  let reads = 0
+  let finish: ((value: Awaited<ReturnType<typeof api.get>>) => void) | undefined
+  vi.mocked(api.get).mockImplementation((url, options) => {
+    if (url === '/api/channel/7/assets' && ++reads === 2) {
+      return new Promise((resolve) => {
+        finish = resolve
+      })
+    }
+    return get(url, options)
+  })
+  vi.spyOn(api, 'put').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...channelConfigs[7], enabled: true, revision: 1 },
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByText('Not configured')
+  await user.click(
+    screen.getByRole('button', { name: 'Edit Video channel (#7)' })
+  )
+  await waitFor(() => expect(finish).toBeTypeOf('function'))
+  await user.click(screen.getByRole('switch', { name: 'Enable asset library' }))
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  const saved = await screen.findByRole('row', { name: /Video channel/ })
+  expect(within(saved).getByText('Enabled')).toBeVisible()
+  await act(async () =>
+    finish?.({ data: { success: true, data: channelConfigs[7] } })
+  )
+  expect(within(saved).getByText('Configured')).toBeVisible()
+  expect(within(saved).getByText('Enabled')).toBeVisible()
+  expect(within(saved).queryByText('Disabled')).not.toBeInTheDocument()
 })
 
 test('enabling AK/SK requires credentials and preserves them across keyboard toggles before saving', async () => {
@@ -1105,7 +1248,7 @@ test('invalid channel size limit associates its validation error with the input'
   expect(put).not.toHaveBeenCalled()
 })
 
-test('channel settings can search by name or ID without fetching each result configuration', async () => {
+test('channel settings search keeps the matching configuration status and reuses its cache', async () => {
   const user = userEvent.setup()
   render(
     <QueryClientProvider client={client}>
@@ -1132,13 +1275,56 @@ test('channel settings can search by name or ID without fetching each result con
       params: expect.objectContaining({ keyword: '8', p: 1, page_size: 20 }),
     })
   )
+  expect(
+    within(screen.getByRole('row', { name: /Second channel/ })).getByText(
+      'Enabled'
+    )
+  ).toBeVisible()
+  expect(
+    vi
+      .mocked(api.get)
+      .mock.calls.filter(([url]) => url === '/api/channel/8/assets')
+  ).toHaveLength(1)
+})
+
+test('channel configuration status requests are limited to the current page', async () => {
+  const user = userEvent.setup()
+  channels = Array.from({ length: 21 }, (_, index) => ({
+    ...channel,
+    id: index + 1,
+    name: `Channel ${index + 1}`,
+  }))
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  await screen.findByRole('button', { name: 'Edit Channel 20 (#20)' })
+  await waitFor(() =>
+    expect(
+      vi
+        .mocked(api.get)
+        .mock.calls.filter(([url]) => /\/\d+\/assets$/.test(String(url)))
+    ).toHaveLength(20)
+  )
   expect(api.get).not.toHaveBeenCalledWith(
-    '/api/channel/8/assets',
+    '/api/channel/21/assets',
+    expect.anything()
+  )
+  await user.click(screen.getByRole('button', { name: 'Next page' }))
+  const last = await screen.findByRole('row', { name: /Channel 21/ })
+  expect(await within(last).findByText('Not configured')).toBeVisible()
+  expect(within(last).getByText('Disabled')).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: 'Edit Channel 1 (#1)' })
+  ).not.toBeInTheDocument()
+  expect(api.get).toHaveBeenCalledWith(
+    '/api/channel/21/assets',
     expect.anything()
   )
 })
 
-test('returning to search results preserves the draft and applied keyword', async () => {
+test('returning to search results preserves the draft, applied keyword and both scroll positions', async () => {
   const user = userEvent.setup()
   channels = [channel, otherChannel, { ...channel, id: 9, name: 'Unrelated' }]
   channelConfigs[7] = {
@@ -1167,6 +1353,9 @@ test('returning to search results preserves the draft and applied keyword', asyn
     screen.getByRole('searchbox', { name: 'Search channels' }),
     '-draft'
   )
+  const list = screen.getByRole('region', { name: 'Channels' })
+  list.scrollTop = 120
+  list.scrollLeft = 240
   await user.click(
     await screen.findByRole('button', { name: 'Edit Video channel (#7)' })
   )
@@ -1184,6 +1373,12 @@ test('returning to search results preserves the draft and applied keyword', asyn
   expect(
     screen.getByRole('button', { name: 'Edit Video channel (#7)' })
   ).toBeInTheDocument()
+  const restoredList = screen.getByRole('region', { name: 'Channels' })
+  expect(restoredList.scrollTop).toBe(120)
+  expect(restoredList.scrollLeft).toBe(240)
+  expect(
+    screen.getByRole('button', { name: 'Edit Video channel (#7)' })
+  ).toHaveFocus()
   await user.click(
     await screen.findByRole('button', { name: 'Edit Second channel (#8)' })
   )

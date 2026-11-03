@@ -90,7 +90,11 @@ export function ChannelAssetsForm(props: {
     gcTime: 0,
     mutationFn: (values: AssetChannelUpdate) =>
       saveAssetChannel(channel.id, values),
-    onSuccess: (saved) => {
+    onSuccess: async (saved) => {
+      await client.cancelQueries({
+        queryKey: assetQueryKeys.channel(channel.id),
+        exact: true,
+      })
       client.setQueryData(assetQueryKeys.channel(channel.id), saved)
       void client.invalidateQueries({ queryKey: assetQueryKeys.config })
       toast.success(t('Saved successfully'))

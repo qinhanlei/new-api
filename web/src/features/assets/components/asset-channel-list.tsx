@@ -16,7 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery } from '@tanstack/react-query'
+import {
+  useQueries,
+  useQuery,
+  type UseQueryResult,
+} from '@tanstack/react-query'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import { useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -24,6 +28,7 @@ import { useTranslation } from 'react-i18next'
 import { StaticDataTable } from '@/components/data-table'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
+import { StatusBadge } from '@/components/status-badge'
 import { TableId } from '@/components/table-id'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -34,6 +39,9 @@ import {
   requireServerSuccess,
 } from '@/lib/server-error-message'
 
+import { assetQueryKeys, getAssetChannel } from '../api'
+import type { AssetChannelConfig } from '../types'
+
 export type AssetChannelSearch = {
   draft: string
   keyword: string
@@ -43,10 +51,11 @@ export type AssetChannelSearch = {
 export type AssetChannelListPosition = {
   channelId: number
   scrollTop: number
+  scrollLeft: number
 }
 
 export function AssetChannelList(props: {
-  onEdit: (channel: Channel, scrollTop: number) => void
+  onEdit: (channel: Channel, position: AssetChannelListPosition) => void
   search: AssetChannelSearch
   onSearchChange: (search: AssetChannelSearch) => void
   position: AssetChannelListPosition | null
@@ -70,11 +79,27 @@ export function AssetChannelList(props: {
     meta: { errorToast: false },
   })
   const items = query.data?.items ?? []
+  const configs = useQueries({
+    queries: items.map((item) => ({
+      queryKey: assetQueryKeys.channel(item.id),
+      queryFn: ({ signal }: { signal: AbortSignal }) =>
+        getAssetChannel(item.id, signal),
+      enabled: query.isSuccess,
+      staleTime: 30_000,
+      retry: false,
+      refetchOnWindowFocus: false,
+      meta: { errorToast: false },
+    })),
+  })
+  const failedConfigs = configs.flatMap((config, index) =>
+    config.isError ? [{ channel: items[index], query: config }] : []
+  )
   useEffect(() => {
     if (!props.position || restored.current || query.isFetching) return
     restored.current = true
     if (container.current) {
       container.current.scrollTop = props.position.scrollTop
+      container.current.scrollLeft = props.position.scrollLeft
     }
     const target = editButton.current ?? searchInput.current
     target?.focus({ preventScroll: true })
@@ -113,14 +138,14 @@ export function AssetChannelList(props: {
         <StaticDataTable
           data={items}
           getRowKey={(item) => item.id}
-          className='max-h-[50dvh] overflow-y-auto'
+          className='max-h-[50dvh] overflow-auto'
           containerProps={{
             ref: container,
             role: 'region',
             'aria-label': t('Channels'),
           }}
           tableProps={{ withContainer: false }}
-          tableClassName='table-fixed'
+          tableClassName='min-w-[40rem] table-fixed'
           headerRowClassName='bg-background sticky top-0 z-10'
           emptyContent={t('No Channels Found')}
           columns={[
@@ -132,8 +157,27 @@ export function AssetChannelList(props: {
             {
               id: 'id',
               header: t('ID'),
-              className: 'w-20',
+              className: 'w-16',
               cell: (item) => <TableId value={item.id} />,
+            },
+            {
+              id: 'configuration',
+              header: t('Configuration'),
+              className: 'w-36 whitespace-normal',
+              cell: (_item, index) => (
+                <AssetChannelState
+                  query={configs[index]}
+                  kind='configuration'
+                />
+              ),
+            },
+            {
+              id: 'enabled',
+              header: t('Asset library status'),
+              className: 'w-32 whitespace-normal',
+              cell: (_item, index) => (
+                <AssetChannelState query={configs[index]} kind='enabled' />
+              ),
             },
             {
               id: 'actions',
@@ -154,7 +198,11 @@ export function AssetChannelList(props: {
                     title: `${item.name} (#${item.id})`,
                   })}
                   onClick={() =>
-                    props.onEdit(item, container.current?.scrollTop ?? 0)
+                    props.onEdit(item, {
+                      channelId: item.id,
+                      scrollTop: container.current?.scrollTop ?? 0,
+                      scrollLeft: container.current?.scrollLeft ?? 0,
+                    })
                   }
                 >
                   <span className='min-w-0 break-words'>{t('Edit')}</span>
@@ -162,6 +210,21 @@ export function AssetChannelList(props: {
               ),
             },
           ]}
+        />
+      )}
+      {query.isSuccess && failedConfigs.length > 0 && (
+        <ErrorState
+          className='min-h-0 p-3'
+          title={t('Failed to load')}
+          description={failedConfigs
+            .map(
+              ({ channel, query: config }) =>
+                `${channel.name} (#${channel.id}): ${getServerErrorMessage(config.error)}`
+            )
+            .join('\n')}
+          onRetry={() => {
+            for (const config of failedConfigs) void config.query.refetch()
+          }}
         />
       )}
       {((query.data?.total ?? 0) > 20 || page > 1) && (
@@ -198,5 +261,45 @@ export function AssetChannelList(props: {
         />
       )}
     </div>
+  )
+}
+
+function AssetChannelState(props: {
+  query: UseQueryResult<AssetChannelConfig>
+  kind: 'configuration' | 'enabled'
+}) {
+  const { t } = useTranslation()
+  if (props.query.isPending) {
+    return <LoadingState inline size='sm' message={t('Loading...')} />
+  }
+  if (props.query.isError) {
+    return (
+      <StatusBadge
+        label={t('Failed to load')}
+        variant='danger'
+        copyable={false}
+      />
+    )
+  }
+  let active: boolean
+  let label: string
+  if (props.kind === 'configuration') {
+    active = props.query.data.revision > 0
+    label = active ? t('Configured') : t('Not configured')
+  } else {
+    active = props.query.data.enabled
+    label = active ? t('Enabled') : t('Disabled')
+  }
+  return (
+    <StatusBadge
+      label={label}
+      variant={active ? 'success' : 'neutral'}
+      copyable={false}
+      title={
+        props.kind === 'configuration' && active
+          ? t('Asset settings have been saved.')
+          : undefined
+      }
+    />
   )
 }
