@@ -914,7 +914,48 @@ test('editing a listed channel and saving updates its configuration and enabled 
   expect(screen.queryByLabelText('Asset API endpoint')).not.toBeInTheDocument()
   const saved = screen.getByRole('row', { name: /Video channel/ })
   expect(within(saved).getByText('Configured')).toBeVisible()
-  expect(within(saved).getByText('Enabled')).toBeVisible()
+  expect(
+    within(within(saved).getAllByRole('cell')[4]).getByText('Enabled')
+  ).toBeVisible()
+})
+
+test('channel rows show channel status independently of asset configuration and enablement', async () => {
+  channels = [
+    { ...channel, status: 1 },
+    { ...otherChannel, status: 2 },
+    { ...channel, id: 9, name: 'Auto disabled channel', status: 3 },
+    { ...channel, id: 10, name: 'Unknown status channel', status: 99 },
+  ]
+  channelConfigs[9] = { ...channelConfigs[8], channel_id: 9 }
+  render(
+    <QueryClientProvider client={client}>
+      <AssetChannelSettingsDialog onClose={vi.fn()} />
+    </QueryClientProvider>
+  )
+  expect(
+    await screen.findByRole('columnheader', { name: 'Channel status' })
+  ).toBeVisible()
+  expect(
+    screen.getAllByRole('columnheader').map((header) => header.textContent)
+  ).toEqual([
+    'Channel',
+    'ID',
+    'Channel status',
+    'Configuration',
+    'Asset library status',
+    'Actions',
+  ])
+  for (const [name, status, assetStatus] of [
+    ['Video channel', 'Enabled', 'Disabled'],
+    ['Second channel', 'Disabled', 'Enabled'],
+    ['Auto disabled channel', 'Auto Disabled', 'Enabled'],
+    ['Unknown status channel', 'Unknown', 'Disabled'],
+  ]) {
+    const row = screen.getByRole('row', { name: new RegExp(name) })
+    const cells = within(row).getAllByRole('cell')
+    expect(within(cells[2]).getByText(status)).toBeVisible()
+    expect(await within(cells[4]).findByText(assetStatus)).toBeVisible()
+  }
 })
 
 test('channel rows distinguish unsaved, saved disabled and saved enabled asset settings', async () => {
@@ -936,7 +977,9 @@ test('channel rows distinguish unsaved, saved disabled and saved enabled asset s
   expect(within(unsaved).getByText('Disabled')).toBeVisible()
   const enabled = screen.getByRole('row', { name: /Second channel/ })
   expect(await within(enabled).findByText('Configured')).toBeVisible()
-  expect(within(enabled).getByText('Enabled')).toBeVisible()
+  expect(
+    within(within(enabled).getAllByRole('cell')[4]).getByText('Enabled')
+  ).toBeVisible()
   const disabled = screen.getByRole('row', { name: /Saved disabled channel/ })
   expect(await within(disabled).findByText('Configured')).toBeVisible()
   expect(within(disabled).getByText('Disabled')).toBeVisible()
@@ -963,16 +1006,24 @@ test('a pending or failed channel configuration does not appear unconfigured and
   )
   const pending = await screen.findByRole('row', { name: /Video channel/ })
   expect(within(pending).getAllByText('Loading...')).toHaveLength(2)
+  expect(
+    within(within(pending).getAllByRole('cell')[2]).getByText('Enabled')
+  ).toBeVisible()
   expect(within(pending).queryByText('Not configured')).not.toBeInTheDocument()
   expect(
     await within(
-      screen.getByRole('row', { name: /Second channel/ })
+      within(screen.getByRole('row', { name: /Second channel/ })).getAllByRole(
+        'cell'
+      )[4]
     ).findByText('Enabled')
   ).toBeVisible()
   await act(async () =>
     finish({ data: { success: false, message: 'Configuration unavailable' } })
   )
   expect(await within(pending).findAllByText('Failed to load')).toHaveLength(2)
+  expect(
+    within(within(pending).getAllByRole('cell')[2]).getByText('Enabled')
+  ).toBeVisible()
   expect(
     screen.getByText('Video channel (#7): Configuration unavailable')
   ).toBeVisible()
@@ -1021,12 +1072,16 @@ test('a late configuration read cannot overwrite newly saved channel status', as
   await user.click(screen.getByRole('switch', { name: 'Enable asset library' }))
   await user.click(screen.getByRole('button', { name: 'Save' }))
   const saved = await screen.findByRole('row', { name: /Video channel/ })
-  expect(within(saved).getByText('Enabled')).toBeVisible()
+  expect(
+    within(within(saved).getAllByRole('cell')[4]).getByText('Enabled')
+  ).toBeVisible()
   await act(async () =>
     finish?.({ data: { success: true, data: channelConfigs[7] } })
   )
   expect(within(saved).getByText('Configured')).toBeVisible()
-  expect(within(saved).getByText('Enabled')).toBeVisible()
+  expect(
+    within(within(saved).getAllByRole('cell')[4]).getByText('Enabled')
+  ).toBeVisible()
   expect(within(saved).queryByText('Disabled')).not.toBeInTheDocument()
 })
 
@@ -1276,9 +1331,11 @@ test('channel settings search keeps the matching configuration status and reuses
     })
   )
   expect(
-    within(screen.getByRole('row', { name: /Second channel/ })).getByText(
-      'Enabled'
-    )
+    within(
+      within(screen.getByRole('row', { name: /Second channel/ })).getAllByRole(
+        'cell'
+      )[4]
+    ).getByText('Enabled')
   ).toBeVisible()
   expect(
     vi

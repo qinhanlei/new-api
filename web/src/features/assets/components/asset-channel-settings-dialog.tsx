@@ -72,7 +72,7 @@ export function AssetChannelSettingsDialog(props: { onClose: () => void }) {
       title={t('Channel settings')}
       description={channel ? `${channel.name} (#${channel.id})` : undefined}
       descriptionClassName='break-words'
-      contentClassName={channel ? undefined : 'sm:max-w-3xl'}
+      contentClassName={channel ? undefined : 'sm:max-w-4xl'}
       initialFocus={channel !== null || position === null}
       footer={
         <Button variant='outline' onClick={props.onClose}>

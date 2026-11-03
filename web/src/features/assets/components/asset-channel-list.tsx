@@ -33,6 +33,7 @@ import { TableId } from '@/components/table-id'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { getChannels, searchChannels } from '@/features/channels/api'
+import { getChannelStatusBadge } from '@/features/channels/lib/channel-utils'
 import type { Channel } from '@/features/channels/types'
 import {
   getServerErrorMessage,
@@ -145,7 +146,7 @@ export function AssetChannelList(props: {
             'aria-label': t('Channels'),
           }}
           tableProps={{ withContainer: false }}
-          tableClassName='min-w-[40rem] table-fixed'
+          tableClassName='min-w-[48rem] table-fixed'
           headerRowClassName='bg-background sticky top-0 z-10'
           emptyContent={t('No Channels Found')}
           columns={[
@@ -159,6 +160,21 @@ export function AssetChannelList(props: {
               header: t('ID'),
               className: 'w-16',
               cell: (item) => <TableId value={item.id} />,
+            },
+            {
+              id: 'status',
+              header: t('Channel status'),
+              className: 'w-32 whitespace-normal',
+              cell: (item) => {
+                const status = getChannelStatusBadge(item.status)
+                return (
+                  <StatusBadge
+                    label={t(status.label)}
+                    variant={status.variant}
+                    copyable={false}
+                  />
+                )
+              },
             },
             {
               id: 'configuration',
