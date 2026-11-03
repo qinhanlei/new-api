@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
+import { ArrowLeft } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -80,7 +81,8 @@ export function AssetChannelSettingsDialog(props: { onClose: () => void }) {
       }
     >
       {channel ? (
-        <Button variant='ghost' onClick={() => setChannel(null)}>
+        <Button variant='outline' onClick={() => setChannel(null)}>
+          <ArrowLeft className='size-4' aria-hidden='true' />
           {t('Back to list')}
         </Button>
       ) : (

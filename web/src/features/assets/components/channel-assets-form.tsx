@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { ArrowLeft } from 'lucide-react'
 import { useId, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -165,10 +166,11 @@ export function ChannelAssetsForm(props: {
       >
         <div className='space-y-4'>
           <Button
-            variant='ghost'
+            variant='outline'
             onClick={() => requestChange('list')}
             disabled={busy}
           >
+            <ArrowLeft className='size-4' aria-hidden='true' />
             {t('Back to list')}
           </Button>
           <Form {...form}>
