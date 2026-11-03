@@ -294,7 +294,6 @@ export function AssetBrowser({
       <SectionPageLayout fixedContent>
         <SectionPageLayout.Title>{t('Asset library')}</SectionPageLayout.Title>
         <SectionPageLayout.Actions>
-          {settingsActions}
           <Button
             disabled={!group || scope.allUsers || frozen}
             onClick={() => group && setAdding({ group, scope: { ...scope } })}
@@ -321,6 +320,7 @@ export function AssetBrowser({
               <TabsTrigger value='LivenessFace'>{t('Real people')}</TabsTrigger>
             </TabsList>
           </Tabs>
+          {settingsActions}
         </SectionPageLayout.Actions>
         <SectionPageLayout.Content>
           <div className='flex h-full min-h-0 flex-col gap-3'>
