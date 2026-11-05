@@ -38,7 +38,6 @@ import {
   useDataTable,
   type DataTablePageProps,
 } from '@/components/data-table'
-import { Dialog } from '@/components/dialog'
 import { ErrorState } from '@/components/error-state'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -59,6 +58,7 @@ import {
   AssetBatchDeleteDialog,
   type AssetBatchDeleteTarget,
 } from './asset-batch-delete-dialog'
+import { AssetPreviewDialog } from './asset-preview-dialog'
 import { AssetReplicasDialog } from './asset-replicas-dialog'
 import { AssetStatus } from './asset-status'
 import { AssetThumbnail } from './asset-thumbnail'
@@ -98,7 +98,6 @@ export function AssetListTable({
   const listRegion = useRef<HTMLDivElement>(null)
   const [replicas, setReplicas] = useState<Asset | null>(null)
   const [preview, setPreview] = useState<Asset | null>(null)
-  const isImagePreview = preview?.AssetType === 'Image'
   const frozen = Boolean(group?.Status && group.Status !== 'active')
   const canDelete = Boolean(group) && !scope.allUsers && !frozen
   const ownerId = scope.userId
@@ -535,50 +534,11 @@ export function AssetListTable({
         />
       )}
       {preview && (
-        <Dialog
-          open
-          onOpenChange={(open) => !open && setPreview(null)}
-          title={preview.Name}
-          contentHeight={isImagePreview ? '100%' : 'auto'}
-          contentClassName={
-            isImagePreview
-              ? 'h-[var(--dialog-available-height,calc(100dvh-2rem))] sm:max-w-[calc(100%-2rem)]'
-              : undefined
-          }
-          titleClassName={isImagePreview ? 'truncate pr-8' : undefined}
-          bodyClassName={
-            isImagePreview
-              ? 'flex h-full items-center justify-center py-0'
-              : undefined
-          }
-        >
-          {preview.AssetType === 'Image' && (
-            <img
-              src={preview.URL}
-              alt={preview.Name}
-              className='size-full object-contain'
-              referrerPolicy='no-referrer'
-            />
-          )}
-          {preview.AssetType === 'Video' && (
-            <video
-              src={preview.URL}
-              controls
-              preload='metadata'
-              aria-label={preview.Name}
-              className='max-h-[65vh] w-full'
-            />
-          )}
-          {preview.AssetType === 'Audio' && (
-            <audio
-              src={preview.URL}
-              controls
-              preload='metadata'
-              aria-label={preview.Name}
-              className='w-full'
-            />
-          )}
-        </Dialog>
+        <AssetPreviewDialog
+          key={preview.Id}
+          asset={preview}
+          onClose={() => setPreview(null)}
+        />
       )}
     </div>
   )

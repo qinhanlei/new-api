@@ -136,26 +136,29 @@ test('loaded thumbnails retain their URL through polling and open the current fu
   ).toHaveAttribute('src', items[0].URL)
 })
 
-test('image previews fill the available viewport while containing the whole image', async () => {
+test('image preview panels fit their image and keep titles from expanding their width', async () => {
   const user = userEvent.setup()
   renderList()
   await user.click(
     await screen.findByRole('button', { name: 'Preview Portrait' })
   )
   const dialog = screen.getByRole('dialog', { name: 'Portrait' })
-  expect(dialog).toHaveClass(
-    'h-[var(--dialog-available-height,calc(100dvh-2rem))]',
-    'sm:max-w-[calc(100%-2rem)]'
+  expect(dialog).toHaveClass('w-max')
+  expect(dialog).not.toHaveClass(
+    'h-[var(--dialog-available-height,calc(100dvh-2rem))]'
   )
-  expect(dialog).toHaveStyle('--dialog-content-height: 100%')
+  expect(dialog).toHaveStyle('--dialog-content-height: auto')
   expect(within(dialog).getByRole('img', { name: 'Portrait' })).toHaveClass(
-    'size-full',
+    'h-auto',
     'object-contain'
   )
   expect(within(dialog).getByRole('heading', { name: 'Portrait' })).toHaveClass(
     'truncate',
     'pr-8'
   )
+  expect(
+    within(dialog).getByRole('heading', { name: 'Portrait' }).parentElement
+  ).toHaveClass('[contain:inline-size]')
   await user.keyboard('{Escape}')
   await waitFor(() =>
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
