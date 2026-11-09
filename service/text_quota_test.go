@@ -1318,8 +1318,8 @@ func TestCalculateTextToolCallSurchargeGeneralizedBuiltInTools(t *testing.T) {
 		},
 	}
 	summary := &textQuotaSummary{
-		ModelName:  "o1",
-		GroupRatio: 1,
+		ModelName:   "o1",
+		BillingRate: 1,
 	}
 
 	surcharge := calculateTextToolCallSurcharge(ctx, relayInfo, summary)
@@ -1353,8 +1353,8 @@ func TestCalculateTextToolCallSurchargeKeepsSearchPreviewFallbackWithCustomFunct
 		},
 	}
 	summary := &textQuotaSummary{
-		ModelName:  relayInfo.OriginModelName,
-		GroupRatio: 1,
+		ModelName:   relayInfo.OriginModelName,
+		BillingRate: 1,
 	}
 
 	surcharge := calculateTextToolCallSurcharge(ctx, relayInfo, summary)
@@ -1378,8 +1378,8 @@ func TestCalculateTextToolCallSurchargeDoesNotInferSearchForResponses(t *testing
 		},
 	}
 	summary := &textQuotaSummary{
-		ModelName:  relayInfo.OriginModelName,
-		GroupRatio: 1,
+		ModelName:   relayInfo.OriginModelName,
+		BillingRate: 1,
 	}
 
 	surcharge := calculateTextToolCallSurcharge(ctx, relayInfo, summary)
@@ -1404,7 +1404,7 @@ func TestCalculateTextToolCallSurchargeClampsCallCount(t *testing.T) {
 				},
 			},
 		}
-		summary := &textQuotaSummary{ModelName: relayInfo.OriginModelName, GroupRatio: 1}
+		summary := &textQuotaSummary{ModelName: relayInfo.OriginModelName, BillingRate: 1}
 
 		surcharge := calculateTextToolCallSurcharge(ctx, relayInfo, summary)
 
@@ -1525,7 +1525,7 @@ func TestCalculateTextToolCallSurchargeGeminiGoogleSearch(t *testing.T) {
 			},
 		},
 	}
-	summary := &textQuotaSummary{ModelName: "gemini-3.7-flash", GroupRatio: 1}
+	summary := &textQuotaSummary{ModelName: "gemini-3.7-flash", BillingRate: 1}
 
 	surcharge := calculateTextToolCallSurcharge(ctx, relayInfo, summary)
 	expected := decimal.NewFromFloat(14.0 / 1000).Mul(decimal.NewFromFloat(common.QuotaPerUnit))
@@ -1553,7 +1553,7 @@ func TestCalculateTextToolCallSurchargeGeminiFunctionCall(t *testing.T) {
 			},
 		},
 	}
-	summary := &textQuotaSummary{ModelName: "gemini-2.5-flash", GroupRatio: 1}
+	summary := &textQuotaSummary{ModelName: "gemini-2.5-flash", BillingRate: 1}
 
 	surcharge := calculateTextToolCallSurcharge(ctx, relayInfo, summary)
 	expected := decimal.NewFromFloat(5.0 * 2 / 1000).Mul(decimal.NewFromFloat(common.QuotaPerUnit))
@@ -1583,7 +1583,7 @@ func TestCalculateTextToolCallSurchargeImageGenerationDefaultPrice(t *testing.T)
 			},
 		},
 	}
-	summary := &textQuotaSummary{ModelName: "gpt-5.1", GroupRatio: 1.5}
+	summary := &textQuotaSummary{ModelName: "gpt-5.1", BillingRate: 1.5}
 
 	surcharge := calculateTextToolCallSurcharge(ctx, relayInfo, summary)
 	expected := decimal.NewFromFloat(150.0).
@@ -1614,7 +1614,7 @@ func TestCalculateTextToolCallSurchargeImageGenerationExplicitZeroDisables(t *te
 			},
 		},
 	}
-	summary := &textQuotaSummary{ModelName: "gpt-5.1", GroupRatio: 1}
+	summary := &textQuotaSummary{ModelName: "gpt-5.1", BillingRate: 1}
 
 	surcharge := calculateTextToolCallSurcharge(ctx, relayInfo, summary)
 	assert.True(t, surcharge.IsZero())

@@ -1,17 +1,21 @@
 package service
 
 import (
+	"context"
 	"math"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
@@ -344,7 +348,7 @@ func (s *recordingBillingSettler) ReserveBeforeSubmit(targetQuota int) error {
 	return s.Reserve(targetQuota)
 }
 
-func TestPrepareTieredBillingForSelectedGroupUpdatesReservation(t *testing.T) {
+func TestPrepareBillingForSelectedGroupUpdatesReservation(t *testing.T) {
 	const expr = `tier("base", p)`
 	billing := &recordingBillingSettler{preConsumedQuota: 50_000}
 	relayInfo := &relaycommon.RelayInfo{
@@ -364,7 +368,7 @@ func TestPrepareTieredBillingForSelectedGroupUpdatesReservation(t *testing.T) {
 		},
 	}
 
-	require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, relayInfo))
+	require.Nil(t, PrepareBillingForSelectedGroup(nil, relayInfo))
 	require.Equal(t, []int{100_000}, billing.reserveTargets)
 	assert.Equal(t, 100_000, billing.preConsumedQuota)
 	assert.Equal(t, 100_000, relayInfo.FinalPreConsumedQuota)
@@ -372,7 +376,7 @@ func TestPrepareTieredBillingForSelectedGroupUpdatesReservation(t *testing.T) {
 	assert.Equal(t, 100_000, relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
 }
 
-func TestPrepareTieredBillingForSelectedGroupStartsBillingAfterFreeGroup(t *testing.T) {
+func TestPrepareBillingForSelectedGroupStartsBillingAfterFreeGroup(t *testing.T) {
 	truncate(t)
 	gin.SetMode(gin.TestMode)
 
@@ -403,7 +407,7 @@ func TestPrepareTieredBillingForSelectedGroupStartsBillingAfterFreeGroup(t *test
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
-	require.Nil(t, PrepareTieredBillingForSelectedGroup(ctx, relayInfo))
+	require.Nil(t, PrepareBillingForSelectedGroup(ctx, relayInfo))
 	require.NotNil(t, relayInfo.Billing)
 	assert.False(t, relayInfo.PriceData.FreeModel, "FreeModel must be cleared after switching to a paid group")
 	assert.Equal(t, 100_000, relayInfo.FinalPreConsumedQuota)
@@ -415,7 +419,7 @@ func TestPrepareTieredBillingForSelectedGroupStartsBillingAfterFreeGroup(t *test
 	assert.Equal(t, 400_000, userQuota)
 }
 
-func TestPrepareTieredBillingForSelectedGroupPaidToFreeKeepsFreeModelFalse(t *testing.T) {
+func TestPrepareBillingForSelectedGroupPaidToFreeKeepsFreeModelFalse(t *testing.T) {
 	const expr = `tier("base", p)`
 	billing := &recordingBillingSettler{preConsumedQuota: 50_000}
 	relayInfo := &relaycommon.RelayInfo{
@@ -435,7 +439,7 @@ func TestPrepareTieredBillingForSelectedGroupPaidToFreeKeepsFreeModelFalse(t *te
 		},
 	}
 
-	require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, relayInfo))
+	require.Nil(t, PrepareBillingForSelectedGroup(nil, relayInfo))
 
 	// Pre-consume did happen under the paid group, so FreeModel stays false;
 	// settlement already yields 0 for GroupRatio == 0 and the session refunds.
@@ -444,7 +448,7 @@ func TestPrepareTieredBillingForSelectedGroupPaidToFreeKeepsFreeModelFalse(t *te
 	assert.Equal(t, 50_000, relayInfo.FinalPreConsumedQuota)
 }
 
-func TestPrepareTieredBillingForSelectedGroupTopUpArrearsAllowsNegativeBalance(t *testing.T) {
+func TestPrepareBillingForSelectedGroupTopUpArrearsAllowsNegativeBalance(t *testing.T) {
 	truncate(t)
 
 	const userID = 701
@@ -479,7 +483,7 @@ func TestPrepareTieredBillingForSelectedGroupTopUpArrearsAllowsNegativeBalance(t
 	}
 	relayInfo.Billing = session
 
-	require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, relayInfo))
+	require.Nil(t, PrepareBillingForSelectedGroup(nil, relayInfo))
 
 	// Full reservation recorded; wallet charged the full delta into arrears.
 	assert.Equal(t, 100_000, session.GetPreConsumedQuota())
@@ -552,7 +556,7 @@ func TestTryTieredSettleUsesFinalGroupAfterRetry(t *testing.T) {
 				},
 			}
 
-			require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, relayInfo))
+			require.Nil(t, PrepareBillingForSelectedGroup(nil, relayInfo))
 			ok, quota, result := TryTieredSettle(relayInfo, billingexpr.TokenParams{P: 1_000_000})
 
 			require.True(t, ok)
@@ -1173,6 +1177,336 @@ func TestSamePriceCacheReadsRemainInInput(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, previousCost, cost, "folding cache reads into input must preserve the charge")
 			assert.Equal(t, separateParams.Len, params.Len, "tier conditions keep the full context length")
+		})
+	}
+}
+
+func TestBillingRatesApplyOnceToTextAndToolCharges(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousQuotaPerUnit := common.QuotaPerUnit
+	common.QuotaPerUnit = testQuotaPerUnit
+	operation_setting.SetToolPriceForTest(dto.BuildInToolImageGeneration, 10)
+	t.Cleanup(func() {
+		common.QuotaPerUnit = previousQuotaPerUnit
+		operation_setting.DeleteToolPriceForTest(dto.BuildInToolImageGeneration)
+	})
+
+	for _, tc := range []struct {
+		name   string
+		source string
+		rate   float64
+		group  float64
+		want   int
+	}{
+		{name: "user rate replaces group", source: "user", rate: 0.6, group: 0.9, want: 3720},
+		{name: "global model rate replaces group", source: "model", rate: 0.8, group: 0.9, want: 4960},
+		{name: "paid user in free group", source: "user", rate: 0.6, group: 0, want: 3720},
+		{name: "explicit free includes tools", source: "user", rate: 0, group: 0.9, want: 0},
+		{name: "explicit full price", source: "user", rate: 1, group: 0.9, want: 6200},
+		{name: "inherited group", source: "group", rate: 0.9, group: 0.9, want: 5580},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			rate := &types.BillingRateSnapshot{Rate: tc.rate, Source: tc.source, Version: 3, ModelName: "rate-test"}
+			info := &relaycommon.RelayInfo{
+				OriginModelName: "rate-test",
+				ChannelMeta:     &relaycommon.ChannelMeta{},
+				StartTime:       time.Now(),
+				PriceData: types.PriceData{
+					ModelRatio: 1, CompletionRatio: 2,
+					GroupRatioInfo: types.GroupRatioInfo{GroupRatio: tc.group},
+					BillingRate:    rate,
+				},
+				ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{
+					BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+						dto.BuildInToolImageGeneration: {CallCount: 1},
+					},
+				},
+			}
+			usage := &dto.Usage{PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100}
+			summary := calculateTextQuotaSummary(ctx, info, usage)
+			assert.Equal(t, tc.want, summary.Quota)
+
+			const expr = `tier("base", p * 2 + c * 4)`
+			info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
+				BillingMode: "tiered_expr", ExprString: expr, ExprHash: billingexpr.ExprHashString(expr),
+				QuotaPerUnit: testQuotaPerUnit, GroupRatio: tc.group, BillingRate: rate,
+			}
+			ok, quota, result := TryTieredSettle(info, billingexpr.TokenParams{P: 1000, C: 100, Len: 1000})
+			require.True(t, ok)
+			require.NotNil(t, result)
+			assert.Equal(t, tc.want, composeTieredTextQuota(info, summary, quota, result))
+
+			other := GenerateTextOtherInfo(ctx, info, 1, tc.group, 2, 0, 1, 0, -1)
+			var logged map[string]any
+			require.NoError(t, common.UnmarshalJsonStr(other.JSONString(), &logged))
+			assert.Equal(t, tc.group, logged["group_ratio"], "routing metadata must not be relabeled as a user rate")
+			assert.Equal(t, map[string]any{"rate": tc.rate, "source": tc.source, "version": float64(3), "model_name": "rate-test"}, logged["billing_rate"])
+		})
+	}
+}
+
+func TestBillingRateMinimumQuotaPreservesExplicitZero(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	for _, tc := range []struct {
+		rate float64
+		want int
+	}{{rate: 0, want: 0}, {rate: 0.000001, want: 1}} {
+		info := &relaycommon.RelayInfo{OriginModelName: "rate-test", PriceData: types.PriceData{
+			ModelRatio: 1, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+			BillingRate: &types.BillingRateSnapshot{Rate: tc.rate, Source: "user", ModelName: "rate-test"},
+		}}
+		summary := calculateTextQuotaSummary(ctx, info, &dto.Usage{PromptTokens: 1, TotalTokens: 1})
+		assert.Equal(t, tc.want, summary.Quota)
+	}
+}
+
+func TestBillingRateRetryReservesEffectiveRate(t *testing.T) {
+	previousFreePreConsume := operation_setting.GetQuotaSetting().EnableFreeModelPreConsume
+	operation_setting.GetQuotaSetting().EnableFreeModelPreConsume = false
+	t.Cleanup(func() { operation_setting.GetQuotaSetting().EnableFreeModelPreConsume = previousFreePreConsume })
+	for _, tc := range []struct {
+		name   string
+		tiered bool
+		source string
+		rate   float64
+		group  float64
+		want   int
+	}{
+		{name: "ratio paid user free group", source: "user", rate: 0.6, group: 0, want: 300},
+		{name: "expression paid user free group", tiered: true, source: "user", rate: 0.6, group: 0, want: 300},
+		{name: "ratio explicit free", source: "user", rate: 0, group: 0.9},
+		{name: "expression explicit free", tiered: true, source: "user", rate: 0, group: 0.9},
+		{name: "ratio free to paid group fallback", source: "group", rate: 0, group: 0.8, want: 400},
+		{name: "expression free to paid group fallback", tiered: true, source: "group", rate: 0, group: 0.8, want: 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			truncate(t)
+			seedUser(t, 703, 1000)
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			info := &relaycommon.RelayInfo{
+				UserId: 703, IsPlayground: true, ForcePreConsume: true, OriginModelName: "rate-test",
+				UserSetting: dto.UserSetting{BillingPreference: "wallet_only"},
+				PriceData: types.PriceData{
+					ModelRatio: 1, FreeModel: true, QuotaBeforeBillingRate: 500,
+					BillingRate: &types.BillingRateSnapshot{Rate: tc.rate, Source: tc.source, ModelName: "rate-test"},
+				},
+			}
+			if tc.tiered {
+				info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
+					BillingMode: "tiered_expr", GroupRatio: 0,
+					EstimatedQuotaBeforeGroup: 500, EstimatedQuotaAfterGroup: common.QuotaRound(500 * tc.rate), BillingRate: info.PriceData.BillingRate,
+				}
+			}
+			info.PriceData.SetGroupRatioInfo(types.GroupRatioInfo{GroupRatio: tc.group})
+			require.Nil(t, PrepareBillingForSelectedGroup(ctx, info))
+			assert.Equal(t, tc.want, info.PriceData.QuotaToPreConsume)
+			assert.Equal(t, tc.want == 0, info.PriceData.FreeModel)
+			if tc.want > 0 {
+				require.NotNil(t, info.Billing)
+				assert.Equal(t, tc.want, info.Billing.GetPreConsumedQuota())
+			} else {
+				assert.Nil(t, info.Billing)
+			}
+			userQuota, err := model.GetUserQuota(703, false)
+			require.NoError(t, err)
+			assert.Equal(t, 1000-tc.want, userQuota)
+		})
+	}
+}
+
+func TestTaskBillingRateSurvivesPersistenceAndLaterPriceChanges(t *testing.T) {
+	previousRatios := ratio_setting.ModelRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"test-model":99}`))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousRatios)) })
+	for _, tc := range []struct {
+		name   string
+		source string
+		rate   float64
+		want   int
+	}{
+		{name: "user override", source: "user", rate: 0.6, want: 120},
+		{name: "frozen rule miss", source: "group", rate: 0.8, want: 160},
+		{name: "explicit free", source: "user", rate: 0, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			truncate(t)
+			seedUser(t, 704, 10000)
+			seedToken(t, 704, 704, "rate-task-token", 10000)
+			seedChannel(t, 704)
+			seedChargedAccounting(t, 704, 704, 704, 100, 1)
+			task := makeTask(704, 704, 100, 704, BillingSourceWallet, 0)
+			task.PrivateData.BillingContext.ModelRatio = 2
+			task.PrivateData.BillingContext.GroupRatio = 0.9
+			task.PrivateData.BillingContext.BillingRate = &types.BillingRateSnapshot{
+				Rate: tc.rate, Source: tc.source, Version: 7, ModelName: "test-model",
+			}
+			require.NoError(t, model.DB.Create(task).Error)
+			var restored model.Task
+			require.NoError(t, model.DB.First(&restored, task.ID).Error)
+			require.NotNil(t, restored.PrivateData.BillingContext.BillingRate)
+			require.True(t, RecalculateTaskQuotaByTokens(context.Background(), &restored, 100))
+			assert.Equal(t, tc.want, restored.Quota)
+			quota, err := model.GetUserQuota(704, false)
+			require.NoError(t, err)
+			assert.Equal(t, 10100-tc.want, quota)
+			require.True(t, RecalculateTaskQuotaByTokens(context.Background(), &restored, 100))
+			quota, err = model.GetUserQuota(704, false)
+			require.NoError(t, err)
+			assert.Equal(t, 10100-tc.want, quota, "repeated completion cannot charge twice")
+			require.True(t, RefundTaskQuota(context.Background(), &restored, "upstream failed"))
+			require.True(t, RefundTaskQuota(context.Background(), &restored, "duplicate callback"))
+			quota, err = model.GetUserQuota(704, false)
+			require.NoError(t, err)
+			assert.Equal(t, 10100, quota)
+		})
+	}
+}
+
+func TestRealtimeBillingRateReservesCumulativeUsageAndSettlesOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		subscription bool
+		tiered       bool
+		insufficient bool
+	}{
+		{name: "wallet"},
+		{name: "subscription", subscription: true},
+		{name: "wallet expression", tiered: true},
+		{name: "subscription expression", subscription: true, tiered: true},
+		{name: "wallet balance exhausted", insufficient: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			truncate(t)
+			const userID, tokenID, channelID = 705, 705, 705
+			initialBalance := 10000
+			if tc.insufficient {
+				initialBalance = 100
+			}
+			walletBalance := initialBalance - 30
+			if tc.subscription {
+				walletBalance = 0
+			}
+			seedUser(t, userID, walletBalance)
+			seedToken(t, tokenID, userID, "realtime-rate-token", 9970)
+			seedChannel(t, channelID)
+			rate := &types.BillingRateSnapshot{Rate: 0.6, Source: "user", Version: 4, ModelName: "rate-realtime-test"}
+			info := &relaycommon.RelayInfo{
+				UserId: userID, TokenId: tokenID, TokenKey: "realtime-rate-token",
+				ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
+				OriginModelName: "rate-realtime-test", StartTime: time.Now(), IsStream: true,
+				UserQuota: initialBalance, FinalPreConsumedQuota: 30,
+				PriceData: types.PriceData{
+					ModelRatio: 1, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.9}, BillingRate: rate,
+				},
+			}
+			var funding FundingSource = &WalletFunding{userId: userID, consumed: 30}
+			if tc.subscription {
+				seedSubscription(t, 705, userID, 10000, 30)
+				funding = &SubscriptionFunding{
+					userId: userID, subscriptionId: 705, preConsumed: 30,
+					AmountTotal: 10000, AmountUsedAfter: 30,
+				}
+				info.BillingSource = BillingSourceSubscription
+				info.SubscriptionId = 705
+			} else {
+				info.BillingSource = BillingSourceWallet
+			}
+			info.Billing = &BillingSession{relayInfo: info, funding: funding, preConsumedQuota: 30, tokenConsumed: 30}
+			if tc.tiered {
+				const expr = `tier("base", p * 2)`
+				info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
+					BillingMode: "tiered_expr", ExprString: expr, ExprHash: billingexpr.ExprHashString(expr),
+					QuotaPerUnit: testQuotaPerUnit, GroupRatio: 0.9, BillingRate: rate,
+				}
+			}
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+			usage := &dto.RealtimeUsage{InputTokens: 100, TotalTokens: 100}
+			usage.InputTokenDetails.TextTokens = 100
+			require.NoError(t, PreWssConsumeQuota(ctx, info, usage))
+			assert.Equal(t, 60, info.FinalPreConsumedQuota)
+			usage.InputTokens, usage.TotalTokens, usage.InputTokenDetails.TextTokens = 300, 300, 300
+			err := PreWssConsumeQuota(ctx, info, usage)
+			if tc.insufficient {
+				require.Error(t, err)
+				assert.Equal(t, 60, info.FinalPreConsumedQuota, "failed reservation must not change its accounting")
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, 180, info.FinalPreConsumedQuota)
+			}
+			PostWssConsumeQuota(ctx, info, info.OriginModelName, usage, nil)
+			require.NoError(t, info.Billing.Settle(180), "settlement retries cannot charge again")
+
+			var user model.User
+			require.NoError(t, model.DB.First(&user, userID).Error)
+			if tc.subscription {
+				assert.Zero(t, user.Quota, "subscription usage must not debit the wallet")
+				var subscription model.UserSubscription
+				require.NoError(t, model.DB.First(&subscription, 705).Error)
+				assert.Equal(t, int64(180), subscription.AmountUsed)
+			} else {
+				assert.Equal(t, initialBalance-180, user.Quota, "failed segment reservation still settles usage already received")
+			}
+			assert.Equal(t, 180, user.UsedQuota)
+			var token model.Token
+			require.NoError(t, model.DB.First(&token, tokenID).Error)
+			assert.Equal(t, 9820, token.RemainQuota)
+			var log model.Log
+			require.NoError(t, model.LOG_DB.Where("user_id = ?", userID).Last(&log).Error)
+			assert.Equal(t, 180, log.Quota)
+			var other map[string]any
+			require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+			assert.Equal(t, 0.9, other["group_ratio"])
+			require.IsType(t, map[string]any{}, other["billing_rate"])
+			assert.Equal(t, 0.6, other["billing_rate"].(map[string]any)["rate"])
+		})
+	}
+}
+
+func TestBillingRateImageReservationUsesFinalQuantity(t *testing.T) {
+	previousQuotaPerUnit := common.QuotaPerUnit
+	common.QuotaPerUnit = testQuotaPerUnit
+	t.Cleanup(func() { common.QuotaPerUnit = previousQuotaPerUnit })
+	for _, tc := range []struct {
+		name   string
+		tiered bool
+		rate   float64
+	}{
+		{name: "legacy", rate: 0.6},
+		{name: "expression", tiered: true, rate: 0.6},
+		{name: "free legacy"},
+		{name: "free expression", tiered: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rate := &types.BillingRateSnapshot{Rate: tc.rate, Source: "user", Version: 2, ModelName: "rate-image"}
+			billing := &recordingBillingSettler{}
+			info := &relaycommon.RelayInfo{Billing: billing, PriceData: types.PriceData{
+				UsePrice: true, ModelPrice: 0.01,
+				GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.9}, BillingRate: rate,
+			}}
+			if tc.tiered {
+				const expr = `tier("image", fixed(0.01)) * image_count`
+				count := 1
+				info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
+					BillingMode: "tiered_expr", ExprString: expr, ExprHash: billingexpr.ExprHashString(expr),
+					GroupRatio: 0.9, BillingRate: rate, QuotaPerUnit: testQuotaPerUnit, EstimatedImageCount: &count,
+				}
+			}
+			require.Nil(t, PrepareImageBillingForRequest(nil, info, 2))
+			want := 6000
+			if tc.rate == 0 {
+				want = 0
+			}
+			assert.Equal(t, want, info.PriceData.QuotaToPreConsume)
+			assert.Equal(t, want, billing.GetPreConsumedQuota())
+			if tc.tiered {
+				assert.Equal(t, 2, *info.TieredBillingSnapshot.EstimatedImageCount)
+				assert.Equal(t, want, info.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
+				assert.Equal(t, 0.9, info.TieredBillingSnapshot.GroupRatio)
+			}
 		})
 	}
 }

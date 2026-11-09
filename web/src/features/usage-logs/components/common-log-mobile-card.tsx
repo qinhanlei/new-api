@@ -35,6 +35,7 @@ import type { UsageLog } from '../data/schema'
 import { formatModelName, logTokenName, parseLogOther } from '../lib/format'
 import {
   getLogTypeConfig,
+  getLogBillingRate,
   isDisplayableLogType,
   isTimingLogType,
 } from '../lib/utils'
@@ -72,10 +73,8 @@ export function CommonLogMobileCard<TData>(props: {
   const model = formatModelName(log)
   const config = getLogTypeConfig(log.type)
   const group = log.group || other?.group || ''
-  const groupRatio =
-    other?.user_group_ratio != null && other.user_group_ratio !== -1
-      ? other.user_group_ratio
-      : other?.group_ratio
+  const billingRate = getLogBillingRate(other)
+  const groupRatio = billingRate.rate
   const fields: Record<FieldName, LogField> = {
     model: {
       label: t('Model'),
@@ -279,11 +278,11 @@ export function CommonLogMobileCard<TData>(props: {
             )
           })}
           {groupRatio != null &&
-            groupRatio !== 1 &&
+            (groupRatio !== 1 || other?.billing_rate) &&
             Number.isFinite(groupRatio) &&
             props.cells.has('token_name') && (
               <div className='text-muted-foreground col-span-2 [overflow-wrap:anywhere]'>
-                {t('Group Ratio')}: {groupRatio}×
+                {t(billingRate.label)}: {groupRatio}×
               </div>
             )}
         </div>

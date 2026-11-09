@@ -4,11 +4,15 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/types"
 
@@ -18,6 +22,44 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestBillingRateUnavailableStopsMidjourneySubmission(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	previousDB := model.DB
+	model.DB = nil
+	t.Cleanup(func() { model.DB = previousDB })
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	for _, tc := range []struct{ path, body string }{
+		{"/mj/submit/imagine", `{"prompt":"a tree"}`},
+		{"/mj/insight-face/swap", `{"sourceBase64":"source","targetBase64":"target"}`},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			ctx.Request.Header.Set("Accept-Language", "en")
+			common.SetContextKey(ctx, constant.ContextKeyChannelType, constant.ChannelTypeMidjourney)
+			common.SetContextKey(ctx, constant.ContextKeyChannelBaseUrl, upstream.URL)
+			common.SetContextKey(ctx, constant.ContextKeyOriginalModel, "mj_imagine")
+			common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+			common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "default")
+			RelayMidjourney(ctx)
+			assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), "Billing rates are temporarily unavailable")
+			assert.NotContains(t, recorder.Body.String(), "HTTPStatus")
+			assert.Zero(t, upstreamCalls.Load())
+		})
+	}
+	var upstreamResponse dto.MidjourneyResponse
+	require.NoError(t, common.Unmarshal([]byte(`{"code":4,"HTTPStatus":418,"http_status":418}`), &upstreamResponse))
+	assert.Zero(t, upstreamResponse.HTTPStatus, "upstream JSON cannot select the local error status")
+}
 
 func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -32,7 +74,7 @@ func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing
 	sqlDB, err := database.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Log{}))
+	require.NoError(t, database.AutoMigrate(&model.BillingRateRule{}, &model.User{}, &model.Log{}))
 	model.DB, model.LOG_DB = database, database
 	common.RedisEnabled = false
 	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)

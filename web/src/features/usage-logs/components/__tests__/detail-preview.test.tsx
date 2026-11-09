@@ -112,7 +112,7 @@ beforeEach(async () => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   client.setQueryData(['status'], {}, { updatedAt: Date.now() + 60_000 })
   client.setQueryData(
-    ['pricing'],
+    ['pricing', 0],
     { data: [], vendors: [] },
     { updatedAt: Date.now() + 60_000 }
   )
@@ -379,7 +379,7 @@ test.each([
 ])(
   'task expression $tier shows its recorded unit price',
   ({ expression, tier, expected }) => {
-    client.setQueryData(['pricing'], {
+    client.setQueryData(['pricing', 0], {
       data: [
         {
           model_name: 'wan2.5-i2v-preview',
@@ -408,7 +408,7 @@ test.each([
 )
 
 test('task log prices use localized unit labels from pricing metadata', async () => {
-  client.setQueryData(['pricing'], {
+  client.setQueryData(['pricing', 0], {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -437,7 +437,7 @@ test('task log prices use localized unit labels from pricing metadata', async ()
 })
 
 test('task log prices select the executing provider’s schema', () => {
-  client.setQueryData(['pricing'], {
+  client.setQueryData(['pricing', 0], {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -476,7 +476,7 @@ test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
   'task pricing with %s preserves the saved tier without guessing prices',
   (scenario) => {
     if (scenario !== 'missing schema') {
-      client.setQueryData(['pricing'], {
+      client.setQueryData(['pricing', 0], {
         data: [
           {
             model_name: 'wan2.5-i2v-preview',
@@ -499,5 +499,19 @@ test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
     expect(preview.textContent).toBe(
       `Dynamic Pricing · ${scenario === 'unknown tier' ? 'old' : 'music'}`
     )
+  }
+)
+
+test.each([0, 0.6, 1, 0.000001])(
+  'shows the final user rate %s instead of the superseded group rate',
+  (rate) => {
+    const preview = renderPreview({
+      model_price: 0,
+      group_ratio: 0.9,
+      user_group_ratio: 0.8,
+      billing_rate: { rate, source: 'user', version: 4, model_name: 'model-a' },
+    })
+    expect(preview).toHaveTextContent(`User model rate ${rate}x`)
+    expect(preview).not.toHaveTextContent('Group Ratio')
   }
 )

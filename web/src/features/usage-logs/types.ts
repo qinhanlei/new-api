@@ -196,6 +196,7 @@ export interface LogOtherData {
   model_ratio?: number
   completion_ratio?: number
   model_price?: number
+  billing_rate?: import('@/features/billing-rates/types').BillingRateSnapshot
   group_ratio?: number
   user_group_ratio?: number
   cache_ratio?: number

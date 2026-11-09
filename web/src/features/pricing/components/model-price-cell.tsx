@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ModelRateLabel } from '@/features/billing-rates/billing-rate-label'
 import { getCurrencyLabel } from '@/lib/currency'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
@@ -43,11 +44,25 @@ export type ModelPriceCellOptions = {
   selectedGroup?: string
 }
 
-export function ModelPriceCell(props: {
+type ModelPriceCellProps = {
   model: PricingModel
   options?: ModelPriceCellOptions
   showExpression?: boolean
-}) {
+}
+
+export function ModelPriceCell(props: ModelPriceCellProps) {
+  return (
+    <span className='block min-w-0'>
+      <ModelPriceValues {...props} />
+      <ModelRateLabel
+        model={props.model}
+        selectedGroup={props.options?.selectedGroup}
+      />
+    </span>
+  )
+}
+
+function ModelPriceValues(props: ModelPriceCellProps) {
   const { t, i18n } = useTranslation()
   const currency = useSystemConfigStore((state) => state.config.currency)
   const currencyLabel =

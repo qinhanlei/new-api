@@ -43,7 +43,7 @@ func PrepareImageBillingForRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 		if trace.BillingUnit != billingexpr.BillingUnitRequest && snap.PreConsumeMultiplier != 0 {
 			beforeGroup *= snap.PreConsumeMultiplier
 		}
-		quota, err = billingexpr.QuotaRoundStrict(beforeGroup * info.PriceData.GroupRatioInfo.GroupRatio)
+		quota, err = billingexpr.QuotaRoundStrict(beforeGroup * info.PriceData.EffectiveBillingRate())
 		if err == nil {
 			snap.EstimatedImageCount = trace.ImageCount
 			snap.EstimatedQuotaBeforeGroup = beforeGroup
@@ -52,6 +52,7 @@ func PrepareImageBillingForRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 			snap.EstimatedBillingUnit = trace.BillingUnit
 			snap.EstimatedFixedPrice = trace.FixedPrice
 			snap.GroupRatio = info.PriceData.GroupRatioInfo.GroupRatio
+			snap.BillingRate = info.PriceData.BillingRate
 		}
 	} else {
 		quantity := 1
@@ -65,7 +66,7 @@ func PrepareImageBillingForRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 		if info.PriceData.UsePrice {
 			base = info.PriceData.ModelPrice * common.QuotaPerUnit
 		}
-		quota, err = common.QuotaFromFloatStrict(info.PriceData.ApplyOtherRatiosToFloat(base * info.PriceData.GroupRatioInfo.GroupRatio))
+		quota, err = common.QuotaFromFloatStrict(info.PriceData.ApplyOtherRatiosToFloat(base * info.PriceData.EffectiveBillingRate()))
 	}
 	if err != nil {
 		return types.NewErrorWithStatusCode(err, types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())

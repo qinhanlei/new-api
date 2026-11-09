@@ -19,6 +19,8 @@ For commercial licensing, please contact support@quantumnous.com
 /**
  * Utility functions for usage logs feature
  */
+import { billingRateSourceKey } from '@/features/billing-rates/rates'
+
 import {
   getAllLogs,
   getUserLogs,
@@ -33,6 +35,7 @@ import {
   TIMING_LOG_TYPES,
 } from '../constants'
 import type {
+  LogOtherData,
   GetLogsParams,
   GetLogsResponse,
   FetchLogsConfig,
@@ -285,4 +288,19 @@ export async function fetchLogsByCategory(
   return isAdmin
     ? await getAllTaskLogs(paramsWithFilter as GetTaskLogsParams)
     : await getUserTaskLogs(paramsWithFilter as GetTaskLogsParams)
+}
+
+/** Stored billing snapshots are authoritative; old logs retain their group fallback. */
+export function getLogBillingRate(other: LogOtherData | null) {
+  if (other?.billing_rate) {
+    return {
+      rate: other.billing_rate.rate,
+      label: billingRateSourceKey(other.billing_rate.source),
+    }
+  }
+  const special = other?.user_group_ratio
+  if (special != null && Number.isFinite(special) && special !== -1) {
+    return { rate: special, label: 'User Exclusive Ratio' }
+  }
+  return { rate: other?.group_ratio, label: 'Group Ratio' }
 }

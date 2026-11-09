@@ -2,11 +2,13 @@ package controller
 
 import (
 	"maps"
+	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
@@ -36,21 +38,26 @@ func filterPricingByUsableGroups(pricing []model.Pricing, usableGroup map[string
 }
 
 func GetPricing(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
 	pricing := model.GetPricing()
 	userId, exists := c.Get("id")
+	currentUserID := 0
 	usableGroup := map[string]string{}
 	groupRatio := map[string]float64{}
 	maps.Copy(groupRatio, ratio_setting.GetGroupRatioCopy())
 	var group string
 	if exists {
-		user, err := model.GetUserCache(userId.(int))
-		if err == nil {
-			group = user.Group
-			for g := range groupRatio {
-				ratio, ok := ratio_setting.GetGroupGroupRatio(group, g)
-				if ok {
-					groupRatio[g] = ratio
-				}
+		currentUserID = userId.(int)
+		user, err := model.GetUserCache(currentUserID)
+		if err != nil {
+			common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Unable to load billing rates"))
+			return
+		}
+		group = user.Group
+		for g := range groupRatio {
+			ratio, ok := ratio_setting.GetGroupGroupRatio(group, g)
+			if ok {
+				groupRatio[g] = ratio
 			}
 		}
 	}
@@ -63,10 +70,39 @@ func GetPricing(c *gin.Context) {
 			delete(groupRatio, group)
 		}
 	}
+	modelNames := make([]string, 0, len(pricing))
+	for _, item := range pricing {
+		modelNames = append(modelNames, model.ResolveBillingModelName(item.ModelName))
+	}
+	rates, err := model.LoadBillingRateRules(currentUserID, modelNames)
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Unable to load billing rates"))
+		return
+	}
+	// The model pricing cache is shared across users. Project each response into
+	// fresh values instead of attaching private rates to cached model entries.
+	type pricingWithBillingRates struct {
+		model.Pricing
+		BillingModelName string                                `json:"billing_model_name"`
+		EffectiveRates   map[string]*types.BillingRateSnapshot `json:"effective_rates"`
+	}
+	personalPricing := make([]pricingWithBillingRates, 0, len(pricing))
+	for index, item := range pricing {
+		entry := pricingWithBillingRates{Pricing: item, BillingModelName: modelNames[index], EffectiveRates: make(map[string]*types.BillingRateSnapshot, len(groupRatio))}
+		for name, ratio := range groupRatio {
+			groupInfo := types.GroupRatioInfo{GroupRatio: ratio}
+			if special, ok := ratio_setting.GetGroupGroupRatio(group, name); exists && ok {
+				groupInfo.HasSpecialRatio = true
+				groupInfo.GroupSpecialRatio = special
+			}
+			entry.EffectiveRates[name] = rates.Resolve(entry.BillingModelName, groupInfo)
+		}
+		personalPricing = append(personalPricing, entry)
+	}
 
 	c.JSON(200, gin.H{
 		"success":            true,
-		"data":               pricing,
+		"data":               personalPricing,
 		"vendors":            model.GetVendors(),
 		"group_ratio":        groupRatio,
 		"usable_group":       usableGroup,

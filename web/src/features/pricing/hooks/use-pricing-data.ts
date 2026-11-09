@@ -16,20 +16,31 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery } from '@tanstack/react-query'
-import { useMemo } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useEffect, useMemo } from 'react'
 
 import { useStatus } from '@/hooks/use-status'
 import { requireServerSuccess } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getPricing } from '../api'
 
 export function usePricingData(enabled = true) {
   const { status } = useStatus()
+  const userId = useAuthStore((state) => state.auth.user?.id ?? 0)
+  const client = useQueryClient()
+  useEffect(() => {
+    client.removeQueries({
+      queryKey: ['pricing'],
+      predicate: (query) => query.queryKey[1] !== userId,
+    })
+  }, [client, userId])
 
   const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ['pricing'],
-    queryFn: async () => requireServerSuccess(await getPricing()),
+    queryKey: ['pricing', userId],
+    queryFn: async ({ signal }) =>
+      requireServerSuccess(await getPricing(signal)),
+    gcTime: 0,
     staleTime: 5 * 60 * 1000,
     enabled,
   })

@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
@@ -185,26 +186,44 @@ func refreshTieredBillingGroup(relayInfo *relaycommon.RelayInfo) (*billingexpr.B
 	}
 
 	groupRatio := relayInfo.PriceData.GroupRatioInfo.GroupRatio
-	if snap.GroupRatio == groupRatio {
+	rate := relayInfo.PriceData.EffectiveBillingRate()
+	if snap.GroupRatio == groupRatio && snap.EffectiveBillingRate() == rate {
+		snap.BillingRate = relayInfo.PriceData.BillingRate
 		return snap, nil
 	}
 
-	estimatedQuotaAfterGroup := snap.EstimatedQuotaBeforeGroup * groupRatio
+	estimatedQuotaAfterGroup := snap.EstimatedQuotaBeforeGroup * rate
 	estimatedQuota, err := billingexpr.QuotaRoundStrict(estimatedQuotaAfterGroup)
 	if err != nil {
 		return nil, err
 	}
 	snap.GroupRatio = groupRatio
+	snap.BillingRate = relayInfo.PriceData.BillingRate
 	snap.EstimatedQuotaAfterGroup = estimatedQuota
 	return snap, nil
 }
 
-// PrepareTieredBillingForSelectedGroup refreshes routing-dependent billing
+// PrepareBillingForSelectedGroup refreshes routing-dependent billing
 // state before an upstream attempt. An existing session reserves any higher
 // estimate before sending. If the initial group was free and skipped
 // pre-consume, switching to a paid group creates the session at that point.
-func PrepareTieredBillingForSelectedGroup(c *gin.Context, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+func PrepareBillingForSelectedGroup(c *gin.Context, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+	if relayInfo == nil {
+		return nil
+	}
 	snap, err := refreshTieredBillingGroup(relayInfo)
+	var quota int
+	free := relayInfo.PriceData.EffectiveBillingRate() == 0
+	if snap != nil {
+		quota = snap.EstimatedQuotaAfterGroup
+	} else if err == nil && relayInfo.PriceData.BillingRate != nil {
+		price := &relayInfo.PriceData
+		quota, err = common.QuotaFromFloatStrict(price.ApplyOtherRatiosToFloat(price.QuotaBeforeBillingRate * price.EffectiveBillingRate()))
+		free = free || price.UsePrice && price.ModelPrice == 0 || !price.UsePrice && price.ModelRatio == 0
+	} else if err == nil {
+		// Historical callers have no unrounded reservation to refresh.
+		return nil
+	}
 	if err != nil {
 		return types.NewErrorWithStatusCode(
 			err,
@@ -213,13 +232,15 @@ func PrepareTieredBillingForSelectedGroup(c *gin.Context, relayInfo *relaycommon
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
-	if snap == nil {
-		return nil
-	}
-	if snap.GroupRatio == 0 {
+	relayInfo.PriceData.QuotaToPreConsume = quota
+	freePreConsume := operation_setting.GetQuotaSetting().EnableFreeModelPreConsume
+	if free && (snap != nil || !freePreConsume) {
 		// Paid-to-free keeps FreeModel as-is: FreeModel means "pre-consume was
 		// skipped", which is not true once a session exists, and settlement
-		// already yields 0 for a zero group ratio.
+		// already yields 0 for a zero effective rate.
+		if relayInfo.Billing == nil && !freePreConsume {
+			relayInfo.PriceData.FreeModel = true
+		}
 		return nil
 	}
 
@@ -228,9 +249,15 @@ func PrepareTieredBillingForSelectedGroup(c *gin.Context, relayInfo *relaycommon
 	relayInfo.PriceData.FreeModel = false
 
 	if relayInfo.Billing == nil {
-		return PreConsumeBilling(c, snap.EstimatedQuotaAfterGroup, relayInfo)
+		return PreConsumeBilling(c, quota, relayInfo)
 	}
-	if err := relayInfo.Billing.Reserve(snap.EstimatedQuotaAfterGroup); err != nil {
+	if relayInfo.PriceData.BillingRate.IsOverride() {
+		err = relayInfo.Billing.ReserveBeforeSubmit(quota)
+	} else {
+		// Preserve the existing group-retry arrears policy for inherited rates.
+		err = relayInfo.Billing.Reserve(quota)
+	}
+	if err != nil {
 		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 	}
 	relayInfo.FinalPreConsumedQuota = relayInfo.Billing.GetPreConsumedQuota()

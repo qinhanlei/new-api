@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -19,11 +20,111 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
+func setupBillingRateDB(t *testing.T) {
+	t.Helper()
+	previousDB := model.DB
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := database.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	require.NoError(t, database.AutoMigrate(&model.BillingRateRule{}, &model.User{}))
+	model.DB = database
+	t.Cleanup(func() {
+		model.DB = previousDB
+		require.NoError(t, sqlDB.Close())
+	})
+}
+
+func TestModelBillingRatesPreConsumeAndFreeze(t *testing.T) {
+	setupBillingRateDB(t)
+	previous := config.GlobalConfig.ExportAllConfigs()
+	previousRatio := ratio_setting.ModelRatio2JSONString()
+	previousPrice := ratio_setting.ModelPrice2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previous))
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousRatio))
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrice))
+	})
+	require.NoError(t, model.DB.Create(&model.User{Id: 42, Username: "rate-user", Group: "default"}).Error)
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"rate-text":1}`))
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"rate-call":0.002}`))
+	for _, tc := range []struct {
+		name   string
+		global *string
+		user   *string
+		group  float64
+		want   int
+		free   bool
+	}{
+		{"legacy group", nil, nil, 0.9, 900, false},
+		{"model replaces group", common.GetPointer("0.8"), nil, 0.9, 800, false},
+		{"user replaces model and group", common.GetPointer("0.8"), common.GetPointer("0.6"), 0.9, 600, false},
+		{"explicit full price", common.GetPointer("0.8"), common.GetPointer("1"), 0.9, 1000, false},
+		{"explicit free", common.GetPointer("0.8"), common.GetPointer("0"), 0.9, 0, true},
+		{"paid override of free group", common.GetPointer("0.8"), common.GetPointer("0.6"), 0, 600, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Where("id > ?", 0).Delete(&model.BillingRateRule{}).Error)
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+				"billing_setting.billing_mode":                `{"rate-expr":"tiered_expr"}`,
+				"billing_setting.billing_expr":                `{"rate-expr":"p * 2"}`,
+				"group_ratio_setting.group_ratio":             fmt.Sprintf(`{"default":%g}`, tc.group),
+				"quota_setting.pre_consume_multiplier":        "1",
+				"quota_setting.enable_free_model_pre_consume": "false",
+			}))
+			for _, name := range []string{"rate-text", "rate-call", "rate-expr"} {
+				for _, rule := range []struct {
+					owner int
+					rate  *string
+				}{{0, tc.global}, {42, tc.user}} {
+					if rule.rate != nil {
+						_, _, err := model.UpdateBillingRateRules(rule.owner, 1, []model.BillingRateChange{{ModelName: name, Rate: rule.rate}})
+						require.NoError(t, err)
+					}
+				}
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+				info := &relaycommon.RelayInfo{UserId: 42, OriginModelName: name, UserGroup: "default", UsingGroup: "default", BillingRequestInput: &billingexpr.RequestInput{}}
+				price, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, price.QuotaToPreConsume, name)
+				assert.Equal(t, tc.free, price.FreeModel, name)
+				require.NotNil(t, price.BillingRate)
+				assert.Equal(t, tc.group, price.GroupRatioInfo.GroupRatio)
+				// Rule edits affect only the next logical request, including when
+				// this request captured an absence of user and global rules.
+				version := int64(0)
+				if tc.user != nil {
+					version = 1
+				}
+				_, _, err = model.UpdateBillingRateRules(42, 1, []model.BillingRateChange{{ModelName: name, Rate: common.GetPointer("0.4"), ExpectedVersion: version}})
+				require.NoError(t, err)
+				repeated, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, repeated.QuotaToPreConsume)
+				if info.TieredBillingSnapshot != nil {
+					settled, err := billingexpr.ComputeTieredQuota(info.TieredBillingSnapshot, billingexpr.TokenParams{P: 2000, Len: 2000})
+					require.NoError(t, err)
+					assert.Equal(t, 2*tc.want, settled.ActualQuotaAfterGroup)
+				}
+				fresh := &relaycommon.RelayInfo{UserId: 42, OriginModelName: name, UserGroup: "default", UsingGroup: "default", BillingRequestInput: &billingexpr.RequestInput{}}
+				price, err = ModelPriceHelper(ctx, fresh, 1000, &types.TokenCountMeta{})
+				require.NoError(t, err)
+				assert.Equal(t, 400, price.QuotaToPreConsume)
+			}
+		})
+	}
+}
+
 func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 
 	saved := map[string]string{}
@@ -72,6 +173,7 @@ func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
 }
 
 func TestFixedPricePreConsumeAndRealtimeRejection(t *testing.T) {
+	setupBillingRateDB(t)
 	saved := map[string]string{}
 	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
 		saved[key] = value
@@ -113,6 +215,7 @@ func TestFixedPricePreConsumeAndRealtimeRejection(t *testing.T) {
 }
 
 func TestModelPriceHelperTieredInputPreConsumeMultiplier(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 
 	saved := map[string]string{}
@@ -184,6 +287,7 @@ func TestModelPriceHelperTieredInputPreConsumeMultiplier(t *testing.T) {
 }
 
 func TestModelPriceHelperTieredRejectsPreConsumeOverflow(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 
 	saved := map[string]string{}
@@ -223,6 +327,7 @@ func TestModelPriceHelperTieredRejectsPreConsumeOverflow(t *testing.T) {
 }
 
 func TestModelPriceHelperRequestBillingRatiosOnlyApplyToFixedPrice(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 	savedModelPrices := ratio_setting.ModelPrice2JSONString()
 	savedModelRatios := ratio_setting.ModelRatio2JSONString()
@@ -321,6 +426,7 @@ func TestModelPriceHelperRequestBillingRatiosOnlyApplyToFixedPrice(t *testing.T)
 // gemini-2.5-flash-thinking-* wildcard must keep the client origin as the
 // consume-log name.
 func TestModelPriceHelperUsesSuffixedOriginLikeMain(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 
 	savedRatios := ratio_setting.ModelRatio2JSONString()
@@ -381,6 +487,7 @@ func TestModelPriceHelperUsesSuffixedOriginLikeMain(t *testing.T) {
 }
 
 func TestModelPriceHelperHonorsCustomClaudeThinkingAlias(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 
 	savedRatios := ratio_setting.ModelRatio2JSONString()
@@ -418,6 +525,7 @@ func TestModelPriceHelperHonorsCustomClaudeThinkingAlias(t *testing.T) {
 }
 
 func TestModelPriceHelperCanonicalBillingLadder(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 
 	savedRatios := ratio_setting.ModelRatio2JSONString()
@@ -511,6 +619,7 @@ func TestModelPriceHelperCanonicalBillingLadder(t *testing.T) {
 }
 
 func TestModelPriceHelperMigratesLegacyGeminiWildcardToCanonical(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 
 	savedRatios := ratio_setting.ModelRatio2JSONString()
@@ -548,6 +657,7 @@ func TestModelPriceHelperMigratesLegacyGeminiWildcardToCanonical(t *testing.T) {
 }
 
 func TestModelPriceHelperModifierNameFallsBackToBase(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 
 	savedRatios := ratio_setting.ModelRatio2JSONString()
@@ -578,6 +688,7 @@ func TestModelPriceHelperModifierNameFallsBackToBase(t *testing.T) {
 }
 
 func TestModelPriceHelperExemptAtNameBillsVerbatim(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 
 	settings := model_setting.GetGlobalSettings()
@@ -615,6 +726,7 @@ func TestModelPriceHelperExemptAtNameBillsVerbatim(t *testing.T) {
 }
 
 func TestModelPriceHelperPreservesGpt51CodexMaxIdentity(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 
 	savedRatios := ratio_setting.ModelRatio2JSONString()
@@ -650,6 +762,7 @@ func TestModelPriceHelperPreservesGpt51CodexMaxIdentity(t *testing.T) {
 // expression; a name on the thinking-suffix blacklist stays opaque and needs
 // its own price.
 func TestModelPriceHelperDeepSeekThinkingTailsBillAtBase(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 	require.NoError(t, i18n.Init())
 	saved := map[string]string{}
@@ -701,6 +814,7 @@ func TestModelPriceHelperDeepSeekThinkingTailsBillAtBase(t *testing.T) {
 }
 
 func TestModelPriceHelperNativeGeminiNoThinkingDoesNotAliasBillingModel(t *testing.T) {
+	setupBillingRateDB(t)
 	gin.SetMode(gin.TestMode)
 
 	savedRatios := ratio_setting.ModelRatio2JSONString()
@@ -747,6 +861,7 @@ func TestModelPriceHelperNativeGeminiNoThinkingDoesNotAliasBillingModel(t *testi
 }
 
 func TestInputPreConsumeMultiplierLegacyAndRequestPrices(t *testing.T) {
+	setupBillingRateDB(t)
 	previous := config.GlobalConfig.ExportAllConfigs()
 	previousRatios, previousPrices := ratio_setting.ModelRatio2JSONString(), ratio_setting.ModelPrice2JSONString()
 	t.Cleanup(func() {

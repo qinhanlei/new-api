@@ -86,6 +86,7 @@ import {
 } from '../../lib/format'
 import { buildQuotaAuditOperation } from '../../lib/quota-audit-operation'
 import {
+  getLogBillingRate,
   getLogTypeConfig,
   isPerCallBilling,
   isTimingLogType,
@@ -232,14 +233,24 @@ function BillingBreakdown(props: {
     }
   }
 
-  const userGR = other.user_group_ratio
-  const isUserGR = userGR != null && Number.isFinite(userGR) && userGR !== -1
-  const effectiveGR = isUserGR ? userGR : other.group_ratio
-  if (effectiveGR != null && Number.isFinite(effectiveGR)) {
+  const billingRate = getLogBillingRate(other)
+  if (billingRate.rate != null && Number.isFinite(billingRate.rate)) {
     rows.push({
-      label: isUserGR ? t('User Exclusive Ratio') : t('Group Ratio'),
-      value: `${formatRatio(effectiveGR)}x`,
+      label: t(billingRate.label),
+      value: `${other.billing_rate ? String(billingRate.rate) : formatRatio(billingRate.rate)}x`,
     })
+  }
+  if (other.billing_rate) {
+    rows.push({
+      label: t('Billing model'),
+      value: other.billing_rate.model_name,
+    })
+    if (other.billing_rate.version > 0) {
+      rows.push({
+        label: t('Rate rule version'),
+        value: String(other.billing_rate.version),
+      })
+    }
   }
 
   if (

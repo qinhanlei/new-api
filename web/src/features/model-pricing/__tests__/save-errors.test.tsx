@@ -70,6 +70,22 @@ it.each([200, 400])(
     const notify = vi.spyOn(toast, 'error').mockReturnValue('pricing-error')
     const requests: unknown[] = []
     const adapter: AxiosAdapter = async (config) => {
+      if (config.url === '/api/option/billing_rates') {
+        return {
+          data: {
+            success: true,
+            data: {
+              rules: [],
+              global_rules: [],
+              billing_model_name: 'example',
+            },
+          },
+          status: 200,
+          statusText: 'OK',
+          headers: {},
+          config,
+        }
+      }
       if (
         config.method === 'get' &&
         ['/api/status', '/api/pricing'].includes(config.url ?? '')

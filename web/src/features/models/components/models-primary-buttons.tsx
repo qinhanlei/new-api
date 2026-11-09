@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { Plus, MoreHorizontal, List, AlertCircle } from 'lucide-react'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
@@ -28,6 +29,7 @@ import {
   DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { BillingRatesDrawer } from '@/features/billing-rates/billing-rates-drawer'
 import { useCanEditModelPricing } from '@/features/model-pricing/api'
 
 import { useModels } from './models-provider'
@@ -36,6 +38,7 @@ export function ModelsPrimaryButtons() {
   const { t } = useTranslation()
   const { setOpen, setCurrentRow } = useModels()
   const canPrice = useCanEditModelPricing()
+  const [ratesOpen, setRatesOpen] = useState(false)
 
   const handleCreateModel = () => {
     setCurrentRow(null)
@@ -68,6 +71,12 @@ export function ModelsPrimaryButtons() {
           {t('Sync pricing')}
         </Button>
       )}
+      {canPrice && (
+        <Button variant='outline' size='sm' onClick={() => setRatesOpen(true)}>
+          {t('Global model rates')}
+        </Button>
+      )}
+      <BillingRatesDrawer open={ratesOpen} onOpenChange={setRatesOpen} />
       {/* Create Model */}
       <Button onClick={handleCreateModel} size='sm'>
         <Plus className='h-4 w-4' />

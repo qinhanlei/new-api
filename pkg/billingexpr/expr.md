@@ -8,7 +8,7 @@ The expression is the billing contract between the administrator and the system.
 
 ### Core Principles
 
-1. **Expression is self-contained** — The expression string alone determines billing. No external ratio tables, no implicit completion multipliers, no hidden conversion factors. Given the same token counts and request context, the same expression always produces the same cost.
+1. **Expression is self-contained** — The expression string alone determines the base cost. No external model-ratio tables, no implicit completion multipliers, no hidden conversion factors. Given the same token counts and request context, the same expression always produces the same base cost. The host then applies the explicit commercial rate described below, independently of expression evaluation.
 
 2. **Variables are opt-in** — `p` (prompt) and `c` (completion) are the base. Cache (`cr`, `cc`, `cc1h`, `cc12h`), image (`img`), and audio (`ai`, `ao`) variables are optional. If omitted, those tokens are included in `p`/`c` and priced at their rate; an omitted long-lived cache write keeps its fixed multiple of the short write price. The system automatically detects which variables the expression uses (via AST introspection) and adjusts token normalization accordingly.
 
@@ -17,6 +17,74 @@ The expression is the billing contract between the administrator and the system.
 4. **Upstream-agnostic** — The expression doesn't need to know whether the upstream API is OpenAI-format (prompt_tokens includes cache) or Claude-format (input_tokens excludes cache). The system normalizes token counts before evaluation based on the upstream response format.
 
 5. **Version-aware** — Expressions carry a version tag (`v1:`, default when omitted). The version controls the compile environment, token normalization, and quota conversion formula, enabling future evolution without breaking existing expressions.
+
+---
+
+## Commercial billing rates
+
+Base model prices and expressions are independent of sales rates. The host
+selects exactly one effective rate, in this order:
+
+1. An explicit user-and-model rule.
+2. An explicit global model rule.
+3. The existing user-group / billing-group special ratio.
+4. The ordinary billing-group ratio (whose existing fallback is 1).
+
+Rates replace one another; they are never multiplied together. For a model
+rate of 0.8, group ratio of 0.9 and user rate of 0.6, the effective rate is 0.6.
+A missing/null rule inherits, 0 is explicitly free, 1 uses the base price, and
+values above 1 add a surcharge. Administrator inputs accept 0 through 100 with
+up to six decimal places. Existing group ratios retain their original precision.
+The rate applies to model invocation charges, including associated tool charges;
+violation penalties, top-ups and subscription purchase prices keep their rules.
+Wallet and subscription usage share the same invocation charge.
+
+`billing_rate_rules` stores global rules with `owner_user_id=0` and personal
+rules with the user's ID. `rate_ppm` stores millionths as a nullable integer;
+clearing a rule retains its version to prevent stale editors recreating it.
+The unique owner/model digest index preserves exact model identity across DB
+collations. The public billing model is resolved before lookup; upstream
+channel mapping does not replace that identity. Rule lookup failures stop the
+request before contacting upstream. Rules do not change routing, model access,
+or the existing unconfigured-price admission/default settings.
+
+Root administrators manage rules through GET/PATCH
+`/api/option/billing_rates` and `/api/user/:id/billing_rates`. PATCH accepts
+`{"changes":[{"model_name":"example","rate":"0.600000","expected_version":0}]}`;
+`rate:null` restores inheritance. A batch is atomic; stale versions return 409.
+GET/PATCH may include `?model_name=<request-model>` to obtain the authoritative
+`billing_model_name` for the single-model editor, independent of the viewer's
+accessible groups. Batch change keys remain exact billing model names.
+The model pricing editor saves global rates separately from base prices; user
+management provides a dedicated model-rate editor. Price synchronization and
+base-price resets do not rewrite these rules.
+
+Every new logical request records `BillingRateSnapshot`, including a rule miss.
+The snapshot carries the effective rate, source, selected rule version and
+billing model. Editing rules affects subsequent requests, not in-flight requests.
+Retries may refresh a group fallback but never re-query or replace a captured
+user/model override. The rate participates before quota rounding, free-model
+checks, reservation, minimum-charge checks and settlement. Realtime segments
+reserve against the same cumulative billing session that final settlement uses.
+Existing group-retry reservation policy is retained.
+
+Expression snapshots and persisted task billing contexts also carry this
+snapshot. Completion and refunds use the captured accounting state, including
+after a restart; historical tasks without the field retain the legacy path.
+The legacy field names `EstimatedQuotaBeforeGroup`/`AfterGroup` and `GroupRatio`
+remain readable, but new code calculates the final amount through
+`EffectiveBillingRate()`, keeping the actual routing group separate for audit.
+
+`/api/pricing` projects effective rates per model and accessible group for the
+current viewer without modifying the shared base-price cache. Responses are
+private/no-store; the browser cache is keyed by user identity. Consume logs
+include `billing_rate` alongside the original group metadata. Personal rules
+are never added to the public ratio synchronization export.
+
+Upgrade all request-serving nodes and task workers before configuring rules.
+For rollback, clear the new rules for future requests and complete/drain tasks
+with saved rates on compatible workers before downgrading. An old binary ignores
+the new snapshot and cannot safely settle those tasks.
 
 ---
 
@@ -364,8 +432,8 @@ Task usage billing has a deliberately different conversion rule from token
 billing:
 
 ```
-task quota = expression output in USD * QuotaPerUnit * groupRatio
-token quota = expression output in $/1M tokens / 1,000,000 * QuotaPerUnit * groupRatio
+task quota = expression output in USD * QuotaPerUnit * effectiveRate
+token quota = expression output in $/1M tokens / 1,000,000 * QuotaPerUnit * effectiveRate
 ```
 
 In other words, a task expression already returns the request's dollar cost.
@@ -525,10 +593,10 @@ This ensures that heavy cache usage doesn't cause the tier condition to incorrec
 Expression coefficients are $/1M tokens. Conversion to internal quota:
 
 ```
-quota = exprOutput / 1,000,000 * QuotaPerUnit * groupRatio
+quota = exprOutput / 1,000,000 * QuotaPerUnit * effectiveRate
 ```
 
-This matches the per-call billing pattern: `quota = modelPrice * QuotaPerUnit * groupRatio`.
+This matches the per-call billing pattern: `quota = modelPrice * QuotaPerUnit * effectiveRate`.
 
 ### Expression Versioning
 

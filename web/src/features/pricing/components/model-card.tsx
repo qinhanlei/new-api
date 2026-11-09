@@ -23,6 +23,7 @@ import { useTranslation } from 'react-i18next'
 import { CopyButton } from '@/components/copy-button'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardFooter, CardHeader } from '@/components/ui/card'
+import { ModelRateLabel } from '@/features/billing-rates/billing-rate-label'
 import { getLobeIcon } from '@/lib/lobe-icon'
 import { cn } from '@/lib/utils'
 import { useSystemConfigStore } from '@/stores/system-config-store'
@@ -342,6 +343,12 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
           )}
           <div className='grid grid-cols-[repeat(auto-fit,minmax(88px,1fr))] gap-x-3 gap-y-2'>
             {priceSummary}
+            <span className='col-span-full'>
+              <ModelRateLabel
+                model={props.model}
+                selectedGroup={props.selectedGroup}
+              />
+            </span>
           </div>
         </div>
         {(groups.length > 0 || endpoints.length > 0) && (

@@ -50,6 +50,18 @@ export function getConfiguredGroupRatio(
   return typeof ratio === 'number' && Number.isFinite(ratio) ? ratio : 1
 }
 
+/** Effective sales rates replace group pricing; explicit free rates remain zero. */
+export function getModelBillingRate(
+  model: PricingModel,
+  group: string,
+  fallback = model.group_ratio ?? {}
+): number {
+  const rate = model.effective_rates?.[group]?.rate
+  return rate != null && Number.isFinite(rate) && rate >= 0
+    ? rate
+    : getConfiguredGroupRatio(fallback, group)
+}
+
 /**
  * Resolve the group ratio used by model square summary prices.
  *
@@ -64,14 +76,13 @@ export function getDisplayGroupRatio(
   const modelEnableGroups = Array.isArray(model.enable_groups)
     ? model.enable_groups
     : []
-  const groupRatio = model.group_ratio || {}
 
   if (
     selectedGroup &&
     selectedGroup !== FILTER_ALL &&
     modelEnableGroups.includes(selectedGroup)
   ) {
-    return getConfiguredGroupRatio(groupRatio, selectedGroup)
+    return getModelBillingRate(model, selectedGroup)
   }
 
   if (modelEnableGroups.length === 0) {
@@ -81,7 +92,14 @@ export function getDisplayGroupRatio(
   let minRatio = Number.POSITIVE_INFINITY
 
   for (const group of modelEnableGroups) {
-    const ratio = groupRatio[group]
+    const effectiveRate = model.effective_rates?.[group]?.rate
+    const groupRatio = model.group_ratio?.[group]
+    // Enabled groups can include groups unavailable to this viewer. Only
+    // rates included in this response can contribute to the minimum price.
+    if (!Number.isFinite(effectiveRate) && !Number.isFinite(groupRatio)) {
+      continue
+    }
+    const ratio = getModelBillingRate(model, group)
     if (
       typeof ratio === 'number' &&
       Number.isFinite(ratio) &&

@@ -34,7 +34,7 @@ import {
   hasTaskUsageSchema,
   isUnconfiguredTaskUsageModel,
 } from './dynamic-price'
-import { isTokenBasedModel } from './model-helpers'
+import { getDisplayGroupRatio, isTokenBasedModel } from './model-helpers'
 import { calculateTokenPrice } from './price'
 
 // ----------------------------------------------------------------------------
@@ -153,11 +153,11 @@ const PRICE_SORTS: Partial<
 }
 
 /**
- * Base USD price shown on the model card: input/output per 1M tokens, request
+ * Base USD price behind the model card: input/output per 1M tokens, request
  * per call (task models use their first usage example). Undefined when the
  * model has no price of that kind.
  */
-function getSortPrice(
+function getBaseSortPrice(
   model: PricingModel,
   kind: SortPriceKind
 ): number | undefined {
@@ -191,15 +191,25 @@ function getSortPrice(
  */
 export function sortModels(
   models: PricingModel[],
-  sortBy: string
+  sortBy: string,
+  selectedGroup?: string
 ): PricingModel[] {
   const sorted = [...models]
 
   const priceSort = PRICE_SORTS[sortBy as SortOption]
   if (priceSort) {
-    // Extracting the price parses the billing expression, so compute once
+    // Expression entries and task example totals retain their base numeric
+    // values. Apply the effective rate once to sort every pricing mode by
+    // the displayed price without parsing formatted currency.
     const price = new Map(
-      sorted.map((m) => [m, getSortPrice(m, priceSort.kind)])
+      sorted.map((model) => {
+        const basePrice = getBaseSortPrice(model, priceSort.kind)
+        const effectivePrice =
+          basePrice === undefined
+            ? undefined
+            : basePrice * getDisplayGroupRatio(model, selectedGroup)
+        return [model, effectivePrice]
+      })
     )
     // Models without this kind of price stay last in both directions
     sorted.sort((a, b) => {
@@ -245,7 +255,7 @@ export function filterAndSortModels(
   result = filterByQuotaType(result, filters.quotaType)
   result = filterByEndpointType(result, filters.endpointType)
   result = filterByTag(result, filters.tag)
-  result = sortModels(result, filters.sortBy)
+  result = sortModels(result, filters.sortBy, filters.group)
 
   return result
 }

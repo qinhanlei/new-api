@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -190,6 +191,15 @@ func coverMidjourneyTaskDto(c *gin.Context, originTask *model.Midjourney) (midjo
 	return
 }
 
+func midjourneyPriceError(c *gin.Context, err error) *dto.MidjourneyResponse {
+	response := &dto.MidjourneyResponse{Code: 4, Description: err.Error()}
+	if errors.Is(err, model.ErrBillingRateUnavailable) {
+		response.HTTPStatus = http.StatusInternalServerError
+		response.Description = i18n.T(c, i18n.MsgRelayBillingRatesUnavailable)
+	}
+	return response
+}
+
 func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyResponse {
 	var swapFaceRequest dto.SwapFaceRequest
 	err := common.UnmarshalBodyReusable(c, &swapFaceRequest)
@@ -206,10 +216,7 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 
 	priceData, err := helper.ModelPriceHelperPerCall(c, info)
 	if err != nil {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: err.Error(),
-		}
+		return midjourneyPriceError(c, err)
 	}
 
 	userQuota, err := model.GetUserQuota(info.UserId, false)
@@ -529,10 +536,7 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 
 	priceData, err := helper.ModelPriceHelperPerCall(c, relayInfo)
 	if err != nil {
-		return &dto.MidjourneyResponse{
-			Code:        4,
-			Description: err.Error(),
-		}
+		return midjourneyPriceError(c, err)
 	}
 
 	userQuota, err := model.GetUserQuota(relayInfo.UserId, false)

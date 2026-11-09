@@ -47,6 +47,8 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import type { AdminUserManageAction } from '@/features/auth/secure-verification'
+import { BillingRatesDrawer } from '@/features/billing-rates/billing-rates-drawer'
+import { useCanEditModelPricing } from '@/features/model-pricing/api'
 import { UserSubscriptionsDialog } from '@/features/subscriptions/components/dialogs/user-subscriptions-dialog'
 import { handleServerError } from '@/lib/handle-server-error'
 import { AuthOperationError } from '@/lib/secure-verification'
@@ -77,6 +79,8 @@ interface DataTableRowActionsProps {
 export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const { t } = useTranslation()
   const user = row.original
+  const canEditRates = useCanEditModelPricing()
+  const [ratesOpen, setRatesOpen] = useState(false)
   const {
     setOpen,
     setCurrentRow,
@@ -275,6 +279,11 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           </DropdownMenuShortcut>
         </DropdownMenuItem>
 
+        {canEditRates && (
+          <DropdownMenuItem onClick={() => setRatesOpen(true)}>
+            {t('User model rates')}
+          </DropdownMenuItem>
+        )}
         <DropdownMenuSeparator />
 
         <DropdownMenuItem
@@ -317,6 +326,12 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         </DropdownMenuItem>
       </DataTableRowActionMenu>
 
+      <BillingRatesDrawer
+        open={ratesOpen}
+        onOpenChange={setRatesOpen}
+        userId={user.id}
+        username={user.username}
+      />
       <ConfirmDialog
         open={resetPasskeyOpen && !verificationActive}
         onOpenChange={setResetPasskeyOpen}
