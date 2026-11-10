@@ -262,6 +262,10 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	exprStr, exists := billing_setting.ResolveTaskBillingExpr(pluginKey, modelName, info.UpstreamModelName)
 	useTiered := exists || billing_setting.GetBillingMode(modelName) == billing_setting.BillingModeTieredExpr
 	if useTiered {
+		currency, currencyErr := billingexpr.ExprCurrency(exprStr)
+		if currencyErr != nil {
+			return nil, service.TaskErrorWrapperLocal(currencyErr, "model_price_error", http.StatusBadRequest)
+		}
 		provider, supported := adaptor.(channel.TaskUsageFactsProvider)
 		if billingexpr.UsesFixedPricing(exprStr) {
 			return nil, service.TaskErrorWrapper(fmt.Errorf("fixed pricing is not supported for task usage expressions"), "model_price_error", http.StatusBadRequest, common.UpstreamAddresses(c)...)
@@ -295,8 +299,8 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		groupRatioInfo := helper.HandleGroupRatio(c, info)
 		quota, clamp := common.QuotaRoundChecked(cost * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
 		noteTaskQuotaClamp(info, clamp)
-		priceData = types.PriceData{Quota: quota, QuotaToPreConsume: quota, GroupRatioInfo: groupRatioInfo}
-		info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: modelName, ExprString: exprStr, ExprHash: billingexpr.ExprHashString(exprStr), GroupRatio: groupRatioInfo.GroupRatio, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: quota, EstimatedTier: trace.MatchedTier, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(exprStr), TaskUsageBilling: true, UsageFacts: facts}
+		priceData = types.PriceData{Currency: currency, Quota: quota, QuotaToPreConsume: quota, GroupRatioInfo: groupRatioInfo}
+		info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{Currency: currency, BillingMode: billing_setting.BillingModeTieredExpr, ModelName: modelName, ExprString: exprStr, ExprHash: billingexpr.ExprHashString(exprStr), GroupRatio: groupRatioInfo.GroupRatio, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: quota, EstimatedTier: trace.MatchedTier, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(exprStr), TaskUsageBilling: true, UsageFacts: facts}
 	} else {
 		priceData, err = helper.ModelPriceHelperPerCall(c, info)
 		if err != nil {
@@ -304,6 +308,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 	}
 	info.PriceData = priceData
+	if apiErr := service.ValidateBillingCurrency(c, info); apiErr != nil {
+		return nil, service.TaskErrorFromAPIError(apiErr)
+	}
 
 	// 5. 计费估算：让适配器根据用户请求提供 OtherRatios（时长、分辨率等）
 	//    必须在 ModelPriceHelperPerCall 之后调用（它会重建 PriceData）。
@@ -335,7 +342,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 
 	// 7. 预扣费：首次尝试创建计费会话；重试时会话已存在，换到更贵的渠道要在
 	//    发起上游请求前补足预扣，余额不足就不发请求。
-	if info.Billing != nil || !info.PriceData.FreeModel {
+	if info.Billing != nil || !info.PriceData.FreeModel || service.IsCNYBilling(info) {
 		info.ForcePreConsume = true
 		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
 			return nil, service.TaskErrorFromAPIError(apiErr)
@@ -360,6 +367,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	// Any 2xx is a successful submission: task APIs commonly answer 201 Created
 	// or 202 Accepted, and parseSubmitResponse receives the exact status code.
 	if resp.StatusCode/100 != 2 {
+		service.ObserveCNYHTTPResponse(info, resp.StatusCode)
 		responseBody, _ := io.ReadAll(resp.Body)
 		return nil, service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode, common.UpstreamAddresses(c)...)
 	}
@@ -383,6 +391,10 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			settlement, facts, err := service.EvaluateTaskCompletionUsage(snap, parsed.Immediate.UsageFacts)
 			if err != nil {
 				logger.LogWarn(c, common.LogText("task immediate usage settlement failed; retaining reserved quota: %v", err))
+				if service.IsCNYBilling(info) {
+					parsed.Immediate.Status = model.TaskStatusAwaitingReview
+					parsed.Immediate.Reason = "CNY billing could not be finalized; the reservation is pending review"
+				}
 			} else {
 				finalQuota = settlement.ActualQuotaAfterGroup
 				snap.UsageFacts = facts

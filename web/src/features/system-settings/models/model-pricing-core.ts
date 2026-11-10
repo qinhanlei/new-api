@@ -36,6 +36,7 @@ import {
 import { formatBillingCondition } from '@/features/pricing/lib/billing-expression/condition-display'
 import { compileBillingExpression } from '@/features/pricing/lib/billing-expression/parser'
 import type { BillingUsageSchema } from '@/features/pricing/types'
+import { billingExpressionCurrency } from '@/lib/billing-currency'
 
 import { formatPricingNumber } from './pricing-format'
 
@@ -271,7 +272,7 @@ export function buildPreviewRows(
       { key: 'mode', label: t('Pricing'), value: t('Expression') },
       {
         key: 'expr',
-        label: `${t('Expression')} (USD)`,
+        label: `${t('Expression')} (${billingExpressionCurrency(effectiveExpr)})`,
         value: effectiveExpr || t('Empty'),
         multiline: true,
       },

@@ -14,10 +14,15 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -543,6 +548,17 @@ func openTaskDialectDatabase(t *testing.T, models ...any) (*gorm.DB, common.Data
 	return db, dialect
 }
 
+const immediateTaskSettlementPlugin = `
+export const meta={apiVersion:1,key:"generic-settlement",name:"Generic settlement",version:"1.0.0",author:{name:"Test"},models:["document-model"],fetchMode:"per_task",submitResponseTypes:["json","sse"],usageSchema:{units:{type:"number",unit:"count",description:"Document generation unit price"}}};
+export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/compile",body:ctx.requestBody,responseType:ctx.requestBody.responseType || "json"};}
+export function parseSubmitEvent(ctx,event){const body=JSON.parse(event.data);return {state:body,done:body.complete === true};}
+export function parseSubmitResponse(ctx,resp){return {taskId:"vendor-job",taskData:resp.body,immediate:{status:resp.body.status,reason:"provider rejected job"}};}
+export function extractUsage(){return {units:4};}
+export function extractUsageOnComplete(ctx,result,body){if(body.hookError)throw new Error("completion usage unavailable");return body.usage;}
+export function parseTaskResult(){throw new Error("completed submissions must not poll");}
+export function buildQueryRequest(){throw new Error("completed submissions must not poll");}
+`
+
 func TestImmediateTaskSettlementDatabase(t *testing.T) {
 	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Channel{}, &model.Task{}, &model.Log{})
 	oldDB, oldLogDB := model.DB, model.LOG_DB
@@ -559,16 +575,7 @@ func TestImmediateTaskSettlementDatabase(t *testing.T) {
 
 	const expression = `u("units") == 7 ? tier("missing", u("missing") * 1.0) : u("units") == 8 ? tier("invalid", -1.0) : u("units") > 3 ? tier("bulk", u("units") * 0.01) : tier("small", u("units") * 0.01)`
 	withTieredBillingConfig(t, map[string]string{"document-model": "tiered_expr"}, map[string]string{"document-model": expression})
-	const source = `
-export const meta={apiVersion:1,key:"generic-settlement",name:"Generic settlement",version:"1.0.0",author:{name:"Test"},models:["document-model"],fetchMode:"per_task",usageSchema:{units:{type:"number",unit:"count"}}};
-export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/compile",body:ctx.requestBody};}
-export function parseSubmitResponse(ctx,resp){return {taskId:"vendor-job",taskData:resp.body,immediate:{status:resp.body.status,reason:"provider rejected job"}};}
-export function extractUsage(){return {units:4};}
-export function extractUsageOnComplete(ctx,result,body){return body.usage;}
-export function parseTaskResult(){throw new Error("completed submissions must not poll");}
-export function buildQueryRequest(){throw new Error("completed submissions must not poll");}
-`
-	plugin, err := pluginruntime.CompilePlugin(source, pluginruntime.Options{})
+	plugin, err := pluginruntime.CompilePlugin(immediateTaskSettlementPlugin, pluginruntime.Options{})
 	require.NoError(t, err)
 	for index, tc := range []struct {
 		name, status string
@@ -652,6 +659,117 @@ export function buildQueryRequest(){throw new Error("completed submissions must 
 	}
 }
 
+func TestCNYPluginUnknownCompletionKeepsReservation(t *testing.T) {
+	const expression = `v2:CNY:u("units") * 0.01`
+	withTieredBillingConfig(t, map[string]string{"document-model": "tiered_expr"}, map[string]string{"document-model": expression})
+	plugin, err := pluginruntime.CompilePlugin(immediateTaskSettlementPlugin, pluginruntime.Options{})
+	require.NoError(t, err)
+	oldRedis, oldMemory, oldBatch, oldConsume, oldExport := common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled
+	common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = false, false, false, true, false
+	t.Cleanup(func() {
+		common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = oldRedis, oldMemory, oldBatch, oldConsume, oldExport
+	})
+	for _, tc := range []struct {
+		name, responseType, contentType, body string
+	}{
+		{"completion hook error", "json", "application/json", `{"status":"SUCCESS","hookError":true,"usage":{"units":1}}`},
+		{"SSE EOF before completion", "sse", "text/event-stream", "data: {\"status\":\"SUCCESS\",\"usage\":{\"units\":1}}\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}, &model.Log{}, &model.CNYWallet{}, &model.CNYTokenBudget{}, &model.CNYBillingRecord{})
+			oldDB, oldLogDB := model.DB, model.LOG_DB
+			oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+			model.DB, model.LOG_DB = db, db
+			common.SetDatabaseTypes(dialect, dialect)
+			t.Cleanup(func() {
+				model.DB, model.LOG_DB = oldDB, oldLogDB
+				common.SetDatabaseTypes(oldMain, oldLog)
+			})
+			require.NoError(t, db.Create(&model.User{Id: 1, Username: "cny-plugin", Status: common.UserStatusEnabled, Quota: 123456, UsedQuota: 123}).Error)
+			require.NoError(t, db.Create(&model.Token{Id: 1, UserId: 1, Key: strings.Repeat("d", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 654321, UsedQuota: 456}).Error)
+			ch := model.Channel{Id: 1, Name: "CNY plugin", Type: constant.ChannelTypeTaskPlugin, UsedQuota: 789}
+			require.NoError(t, db.Create(&ch).Error)
+			_, err := model.AdjustCNYWallet(1, 99, common.RoleRootUser, 100000, "initial", "test")
+			require.NoError(t, err)
+			_, err = model.UpdateCNYTokenBudget(1, 1, model.CNYTokenBudgetChange{Enabled: true, RemainQuota: 100000})
+			require.NoError(t, err)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/compile", strings.NewReader(`{}`))
+			c.Set("group", "default")
+			c.Set("username", "cny-plugin")
+			c.Set("task_request", map[string]any{"model": "document-model", "responseType": tc.responseType})
+			c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Plugin: plugin})
+			if tc.responseType == "sse" {
+				c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Plugin: plugin, Route: pluginruntime.Route{Method: http.MethodPost, Path: "/compile", Type: pluginruntime.RouteTypeSubmit}})
+			}
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, "document-model")
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
+			common.SetContextKey(c, constant.ContextKeyChannelId, ch.Id)
+			common.SetContextKey(c, constant.ContextKeyChannelType, ch.Type)
+			info := taskSubmissionRelayInfo(nil)
+			info.TokenId, info.RequestId = 1, "cny-plugin-request"
+			info.OriginModelName, info.UserGroup = "document-model", "default"
+			info.UserSetting.BillingPreference = "wallet_only"
+			info.LockedChannel = &ch
+
+			outcome, taskErr := executeTaskSubmission(c, info)
+
+			require.Nil(t, taskErr)
+			require.NotNil(t, outcome)
+			var task model.Task
+			require.NoError(t, db.Where("task_id = ?", info.PublicTaskID).First(&task).Error)
+			assert.Equal(t, model.TaskStatus(model.TaskStatusAwaitingReview), task.Status)
+			assert.Zero(t, task.FinishTime)
+			assert.NotEmpty(t, task.FailReason)
+			assert.Equal(t, 20000, task.Quota)
+			require.NotNil(t, task.PrivateData.BillingContext)
+			require.NotNil(t, task.PrivateData.BillingContext.TieredSnapshot)
+			assert.Equal(t, billingexpr.CurrencyCNY, task.PrivateData.BillingContext.TieredSnapshot.BillingCurrency())
+			assert.Equal(t, float64(4), task.PrivateData.BillingContext.TieredSnapshot.UsageFacts["units"])
+			record, err := model.GetCNYBillingRecord(info.RequestId)
+			require.NoError(t, err)
+			assert.Equal(t, model.CNYBillingSubmitted, record.Status)
+			assert.Equal(t, task.TaskID, record.TaskID)
+			assert.Equal(t, 20000, record.ReservedQuota)
+			assert.Zero(t, record.Quota)
+			assert.Zero(t, record.RefundQuota)
+			wallet, err := model.GetCNYWallet(1)
+			require.NoError(t, err)
+			assert.Equal(t, 80000, wallet.Quota)
+			assert.Equal(t, 20000, wallet.ReservedQuota)
+			assert.Zero(t, wallet.UsedQuota)
+			budget, err := model.GetCNYTokenBudget(1, 1)
+			require.NoError(t, err)
+			assert.Equal(t, 80000, budget.RemainQuota)
+			assert.Zero(t, budget.UsedQuota)
+			var user model.User
+			require.NoError(t, db.First(&user, 1).Error)
+			assert.Equal(t, 123456, user.Quota)
+			assert.Equal(t, 123, user.UsedQuota)
+			var token model.Token
+			require.NoError(t, db.First(&token, 1).Error)
+			assert.Equal(t, 654321, token.RemainQuota)
+			assert.Equal(t, 456, token.UsedQuota)
+			require.NoError(t, db.First(&ch, 1).Error)
+			assert.Equal(t, int64(789), ch.UsedQuota)
+			var logCount int64
+			require.NoError(t, db.Model(&model.Log{}).Count(&logCount).Error)
+			assert.Zero(t, logCount, "CNY requests must not write USD consume logs")
+			if tc.responseType == "sse" {
+				assert.Equal(t, tc.body, recorder.Body.String(), "native clients still receive the provider's partial stream")
+			} else {
+				assert.False(t, c.Writer.Written())
+			}
+		})
+	}
+}
+
 func TestAcceptedSubmitStreamNeverRetries(t *testing.T) {
 	c := taskSubmissionTestContext()
 	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "task_accepted", Source: "system"}, decideTaskRetry(c, &dto.TaskError{StatusCode: 502, LocalError: true, NoRetry: true}, 3))
@@ -689,4 +807,144 @@ func TestExecuteTaskSubmissionRefundsWhenFinalReserveFails(t *testing.T) {
 	assert.Equal(t, []string{"reserve", "refund"}, events)
 	assert.Equal(t, 1, billing.refunds)
 	assert.False(t, c.Writer.Written())
+}
+
+func TestCNYTaskSubmissionKeepsReservationUntilTerminal(t *testing.T) {
+	for _, state := range []string{"async", "success", "failure", "unknown", "insert failure"} {
+		t.Run(state, func(t *testing.T) {
+			db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}, &model.CNYWallet{}, &model.CNYTokenBudget{}, &model.CNYBillingRecord{})
+			previousDB, previousLogDB := model.DB, model.LOG_DB
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			previousRetry := common.RetryTimes
+			model.DB, model.LOG_DB = db, nil
+			common.SetDatabaseTypes(dialect, dialect)
+			common.RetryTimes = 3
+			t.Cleanup(func() {
+				model.DB, model.LOG_DB = previousDB, previousLogDB
+				common.SetDatabaseTypes(previousMain, previousLog)
+				common.RetryTimes = previousRetry
+			})
+			require.NoError(t, db.Create(&model.User{Id: 1, Username: "submit-cny", Status: common.UserStatusEnabled, Quota: 123456}).Error)
+			require.NoError(t, db.Create(&model.Token{Id: 1, UserId: 1, Key: strings.Repeat("b", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 0}).Error)
+			_, err := model.AdjustCNYWallet(1, 99, common.RoleRootUser, 100000, "initial", "test")
+			require.NoError(t, err)
+			_, err = model.UpdateCNYTokenBudget(1, 1, model.CNYTokenBudgetChange{Enabled: true, RemainQuota: 100000})
+			require.NoError(t, err)
+			c := taskSubmissionTestContext()
+			info := taskSubmissionRelayInfo(nil)
+			info.TokenId, info.RequestId = 1, "request-native"
+			info.PriceData = types.PriceData{Currency: "CNY", Quota: 10000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}
+			expr := `v2:CNY:u("tokens") * 10 / 1000000`
+			info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{Currency: "CNY", BillingMode: "tiered_expr", ExprString: expr, ExprHash: billingexpr.ExprHashString(expr), GroupRatio: 1, QuotaPerUnit: 500000, TaskUsageBilling: true, UsageFacts: map[string]any{"tokens": float64(2000)}}
+			attempts := 0
+			outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+				attempts++
+				require.Nil(t, service.PreConsumeBilling(c, 10000, info))
+				service.MarkCNYUpstreamPending(info, true)
+				if state == "unknown" {
+					return nil, service.TaskErrorWrapper(errors.New("transport lost after submit"), "do_request_failed", http.StatusBadGateway)
+				}
+				result := &relay.TaskSubmitResult{UpstreamTaskID: "upstream-id", Platform: constant.TaskPlatform("doubao"), Quota: 10000}
+				if state == "success" {
+					result.Immediate = &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}
+					result.Quota = 6000
+				}
+				if state == "failure" {
+					result.Immediate = &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "vendor rejected"}
+					result.Quota = 0
+				}
+				if state == "insert failure" {
+					require.NoError(t, db.Migrator().DropTable(&model.Task{}))
+				}
+				return result, nil
+			})
+			assert.Equal(t, 1, attempts)
+			record, err := model.GetCNYBillingRecord("request-native")
+			require.NoError(t, err)
+			wallet, err := model.GetCNYWallet(1)
+			require.NoError(t, err)
+			switch state {
+			case "async":
+				require.Nil(t, taskErr)
+				require.NotNil(t, outcome)
+				assert.Equal(t, model.CNYBillingSubmitted, record.Status)
+				assert.Zero(t, wallet.UsedQuota)
+				assert.Equal(t, 10000, wallet.ReservedQuota)
+			case "success":
+				require.Nil(t, taskErr)
+				assert.Equal(t, model.CNYBillingSettled, record.Status)
+				assert.Equal(t, 6000, wallet.UsedQuota)
+				assert.Zero(t, wallet.ReservedQuota)
+			case "failure":
+				require.Nil(t, taskErr)
+				assert.Equal(t, model.CNYBillingRefunded, record.Status)
+				assert.Equal(t, 100000, wallet.Quota)
+			default:
+				require.NotNil(t, taskErr)
+				assert.Equal(t, model.CNYBillingReserved, record.Status)
+				assert.Equal(t, 90000, wallet.Quota)
+				assert.Zero(t, wallet.UsedQuota)
+			}
+			var user model.User
+			require.NoError(t, db.First(&user, 1).Error)
+			assert.Equal(t, 123456, user.Quota)
+			assert.Zero(t, user.UsedQuota)
+		})
+	}
+}
+
+func TestCNYTextAdmissionBeforeChannelMetadata(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Token{}, &model.CNYWallet{}, &model.CNYTokenBudget{}, &model.CNYBillingRecord{})
+	previousDB := model.DB
+	mainType, logType := common.MainDatabaseType(), common.LogDatabaseType()
+	model.DB = db
+	common.SetDatabaseTypes(dialect, dialect)
+	t.Cleanup(func() { model.DB = previousDB; common.SetDatabaseTypes(mainType, logType) })
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "native-admit", Status: common.UserStatusEnabled}).Error)
+	require.NoError(t, db.Create(&model.Token{Id: 1, UserId: 1, Key: strings.Repeat("c", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1}).Error)
+	_, err := model.AdjustCNYWallet(1, 99, common.RoleRootUser, 100000, "initial", "test")
+	require.NoError(t, err)
+	_, err = model.UpdateCNYTokenBudget(1, 1, model.CNYTokenBudgetChange{Enabled: true, RemainQuota: 100000})
+	require.NoError(t, err)
+	withTieredBillingConfig(t, map[string]string{"native-text": "tiered_expr"}, map[string]string{"native-text": "v2:CNY:p * 2 + c * 8"})
+	c := taskSubmissionTestContext()
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"native-text","messages":[{"role":"user","content":"hello"}]}`))
+	common.SetContextKey(c, constant.ContextKeyUserId, 1)
+	common.SetContextKey(c, constant.ContextKeyTokenId, 1)
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+	common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, "native-text")
+	c.Set("channel_id", 7)
+	info, err := relaycommon.GenRelayInfo(c, relaytypes.RelayFormatOpenAI, &relaydto.GeneralOpenAIRequest{Model: "native-text"}, nil)
+	require.NoError(t, err)
+	require.Nil(t, info.ChannelMeta)
+	require.Nil(t, relay.PrepareRequestBilling(c, info))
+	require.Nil(t, info.ChannelMeta, "admission must preserve initial routing semantics")
+	record, err := model.GetCNYBillingRecord(info.RequestId)
+	require.NoError(t, err)
+	assert.Equal(t, 7, record.ChannelID)
+	c.Set("channel_id", 8)
+	require.Nil(t, service.PrepareTieredBillingForSelectedGroup(c, info))
+	record, err = model.GetCNYBillingRecord(info.RequestId)
+	require.NoError(t, err)
+	assert.Equal(t, 8, record.ChannelID)
+	info.ChannelMeta = &relaycommon.ChannelMeta{ChannelSetting: relaydto.ChannelSettings{Proxy: "://invalid"}}
+	request := httptest.NewRequest(http.MethodPost, "http://upstream.invalid", strings.NewReader(`{}`))
+	_, err = channel.DoRequest(c, request, info)
+	require.Error(t, err)
+	assert.False(t, service.CNYUpstreamPending(info), "a local proxy error has not submitted paid work")
+	assert.True(t, info.Billing.NeedsRefund())
+	info.Billing.Refund(c)
+	record, err = model.GetCNYBillingRecord(info.RequestId)
+	require.NoError(t, err)
+	assert.Equal(t, model.CNYBillingRefunded, record.Status)
+
+	// Admission through a CNY budget must not unlock legacy USD-only routes.
+	c.Set("token_usd_exhausted", true)
+	for _, handler := range []func(*gin.Context, *relaycommon.RelayInfo) *dto.MidjourneyResponse{relay.RelaySwapFace, relay.RelayMidjourneySubmit} {
+		response := handler(c, &relaycommon.RelayInfo{})
+		require.NotNil(t, response)
+		assert.Equal(t, i18n.T(c, i18n.MsgBillingUSDTokenExhausted), response.Description)
+	}
 }

@@ -18,18 +18,60 @@ const maxCacheSize = 256
 const DefaultExprVersion = 1
 
 const (
+	CurrencyUSD = "USD"
+	CurrencyCNY = "CNY"
+)
+
+const (
 	requestRuleTraceFunction    = "_trace"
 	requestRuleTraceIntFunction = "_trace_int"
 )
 
-// ParseExprVersion extracts the version tag and body from an expression string.
-// Format: "v1:tier(...)" → version=1, body="tier(...)".
-// No prefix defaults to DefaultExprVersion.
+// ParseExprVersion extracts the version and executable body. Invalid headers
+// return version 0; compilation and ExprCurrency report the validation error.
 func ParseExprVersion(exprStr string) (version int, body string) {
-	if strings.HasPrefix(exprStr, "v1:") {
-		return 1, exprStr[3:]
+	version, _, body, err := parseExprDefinition(exprStr)
+	if err != nil {
+		return 0, exprStr
 	}
-	return DefaultExprVersion, exprStr
+	return version, body
+}
+
+// ExprCurrency reads the expression's native pricing currency without running
+// it. Unprefixed expressions and v1 remain USD; v2 requires USD or CNY.
+func ExprCurrency(exprStr string) (string, error) {
+	_, currency, _, err := parseExprDefinition(exprStr)
+	return currency, err
+}
+
+func parseExprDefinition(exprStr string) (version int, currency, body string, err error) {
+	exprStr = strings.TrimSpace(exprStr)
+	if body, ok := strings.CutPrefix(exprStr, "v1:"); ok {
+		return 1, CurrencyUSD, body, nil
+	}
+	if definition, ok := strings.CutPrefix(exprStr, "v2:"); ok {
+		currency, body, ok := strings.Cut(definition, ":")
+		if !ok {
+			return 0, "", "", fmt.Errorf("expr v2 requires a currency and body: v2:USD:<expression> or v2:CNY:<expression>")
+		}
+		if currency != CurrencyUSD && currency != CurrencyCNY {
+			return 0, "", "", fmt.Errorf("unsupported expression currency %q", currency)
+		}
+		return 2, currency, body, nil
+	}
+	if prefix, _, ok := strings.Cut(exprStr, ":"); ok && len(prefix) > 1 && prefix[0] == 'v' {
+		versionTag := true
+		for _, char := range prefix[1:] {
+			if char < '0' || char > '9' {
+				versionTag = false
+				break
+			}
+		}
+		if versionTag {
+			return 0, "", "", fmt.Errorf("unsupported expression version %q", prefix)
+		}
+	}
+	return DefaultExprVersion, CurrencyUSD, exprStr, nil
 }
 
 // requestRulePatcher adds trace side effects to existing request multipliers
@@ -193,7 +235,10 @@ func compileEntryFromCacheByHash(exprStr, hash string) (*cachedEntry, error) {
 	}
 	cacheMu.RUnlock()
 
-	version, body := ParseExprVersion(exprStr)
+	version, _, body, err := parseExprDefinition(exprStr)
+	if err != nil {
+		return nil, err
+	}
 	// Validate before optimization so unreachable fixed-price branches cannot
 	// bypass validation or a host's unsupported-protocol checks.
 	tree, err := parser.Parse(body)
@@ -236,8 +281,8 @@ func compileEntryFromCacheByHash(exprStr, hash string) (*cachedEntry, error) {
 	return entry, nil
 }
 
-// ExprVersion returns the version of a cached expression. Returns DefaultExprVersion
-// if the expression hasn't been compiled yet or is empty.
+// ExprVersion returns the declared version, or DefaultExprVersion for an
+// unprefixed expression. Invalid version or currency headers return 0.
 func ExprVersion(exprStr string) int {
 	if exprStr == "" {
 		return DefaultExprVersion

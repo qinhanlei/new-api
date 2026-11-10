@@ -87,6 +87,10 @@ import {
 } from '@/features/pricing/lib/task-expr'
 import type { BillingUsageSchema } from '@/features/pricing/types'
 import { useDebounce } from '@/hooks/use-debounce'
+import {
+  billingExpressionCurrency,
+  preserveBillingCurrency,
+} from '@/lib/billing-currency'
 import { handleServerError } from '@/lib/handle-server-error'
 import { cn } from '@/lib/utils'
 import { usePricingPreferencesStore } from '@/stores/pricing-preferences-store'
@@ -834,9 +838,12 @@ export const ModelPricingEditorPanel = forwardRef<
     setOrdinaryPricingModel(watchedValues.name)
     setPricingMode('tiered_expr')
     setBillingExpr(
-      taskUsageSchema?.image_count?.unit === 'count'
-        ? 'tier("image", fixed(0)) * image_count'
-        : DEFAULT_TOKEN_BILLING_EXPR
+      preserveBillingCurrency(
+        resolvedBillingExpr,
+        taskUsageSchema?.image_count?.unit === 'count'
+          ? 'tier("image", fixed(0)) * image_count'
+          : DEFAULT_TOKEN_BILLING_EXPR
+      )
     )
     setRequestRuleExpr('')
     setEditorReloadToken((token) => token + 1)
@@ -972,10 +979,20 @@ export const ModelPricingEditorPanel = forwardRef<
                       <TabsTrigger value='tiered_expr'>
                         {t('Expression')}
                       </TabsTrigger>
-                      <TabsTrigger value='per-token'>
+                      <TabsTrigger
+                        value='per-token'
+                        disabled={
+                          billingExpressionCurrency(billingExpr) === 'CNY'
+                        }
+                      >
                         {t('Per-token (deprecated)')}
                       </TabsTrigger>
-                      <TabsTrigger value='per-request'>
+                      <TabsTrigger
+                        value='per-request'
+                        disabled={
+                          billingExpressionCurrency(billingExpr) === 'CNY'
+                        }
+                      >
                         {t('Per-request (deprecated)')}
                       </TabsTrigger>
                     </TabsList>

@@ -92,3 +92,15 @@ channel.upstream_update_added_models: "新增模型示例（展示 {{.Shown}}/{{
 channel.upstream_update_removed_models: "删除模型示例（展示 {{.Shown}}/{{.Total}}）：{{.Models}}"
 channel.upstream_update_failed_channels: "失败渠道 ID（展示 {{.Shown}}/{{.Total}}）：{{.Ids}}"
 channel.upstream_update_more_omitted: "（其余 {{.Count}} 个已省略）"
+
+# Native currency billing
+billing.currency_retry_mismatch: "请求重试期间不能更改扣费币种"
+billing.usd_token_exhausted: "此令牌的美元额度已耗尽"
+billing.currency_unsupported: "不支持的计费币种"
+billing.cny_wallet_only: "人民币计费需要人民币钱包，暂不支持订阅"
+billing.cny_request_unsupported: "此接口暂不支持人民币原币计费"
+billing.cny_paid_tools_unsupported: "人民币原币计费暂不支持付费工具"
+billing.cny_violation_fee_unsupported: "人民币原币计费暂不支持已配置的违规扣费"
+billing.cny_unavailable: "人民币计费暂时不可用"
+billing.cny_insufficient_wallet: "人民币钱包余额不足"
+billing.cny_insufficient_token: "此令牌未启用人民币额度或人民币额度不足"

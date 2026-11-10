@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { billingExpressionCurrency } from '@/lib/billing-currency'
+
 import {
   SORT_OPTIONS,
   FILTER_ALL,
@@ -157,10 +159,20 @@ const PRICE_SORTS: Partial<
  * per call (task models use their first usage example). Undefined when the
  * model has no price of that kind.
  */
+function getModelPricingCurrencies(model: PricingModel): string {
+  const expressions = model.billing_plugin_variants?.length
+    ? model.billing_plugin_variants.map((variant) => variant.billing_expr)
+    : [model.billing_expr]
+  return [...new Set(expressions.map(billingExpressionCurrency))]
+    .sort()
+    .join(',')
+}
+
 function getSortPrice(
   model: PricingModel,
   kind: SortPriceKind
 ): number | undefined {
+  if (getModelPricingCurrencies(model).includes(',')) return undefined
   if (kind === 'request') {
     const example = getCardExamplePrice(model, { tokenUnit: 'M' })
     if (example) return example.total
@@ -201,6 +213,9 @@ export function sortModels(
     const price = new Map(
       sorted.map((m) => [m, getSortPrice(m, priceSort.kind)])
     )
+    const currencies = new Map(
+      sorted.map((model) => [model, getModelPricingCurrencies(model)])
+    )
     // Models without this kind of price stay last in both directions
     sorted.sort((a, b) => {
       const priceA = price.get(a)
@@ -208,6 +223,10 @@ export function sortModels(
       if (priceA === undefined || priceB === undefined) {
         return Number(priceA === undefined) - Number(priceB === undefined)
       }
+      const currencyOrder = (currencies.get(a) ?? 'USD').localeCompare(
+        currencies.get(b) ?? 'USD'
+      )
+      if (currencyOrder !== 0) return currencyOrder
       return priceSort.dir * (priceA - priceB)
     })
     return sorted

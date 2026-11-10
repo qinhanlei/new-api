@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -165,7 +166,8 @@ func effectivePricingSyncData(data map[string]any) map[string]any {
 	for name := range names {
 		expression, _ := expressions[name].(string)
 		if modes[name] == billing_setting.BillingModeTieredExpr {
-			if strings.TrimSpace(expression) == "" {
+			_, currencyErr := billingexpr.ExprCurrency(expression)
+			if strings.TrimSpace(expression) == "" || currencyErr != nil {
 				for _, field := range pricingSyncFields {
 					delete(valueMap(result[field]), name)
 				}
@@ -206,6 +208,26 @@ func modelPricingSyncValues(data map[string]any, name string) map[string]any {
 		}
 	}
 	return values
+}
+
+// Synchronization preserves the currency of an existing price. A new model can
+// import a self-contained expression in either currency; editing a configured
+// price into another currency remains an explicit administrator action.
+func pricingSyncCurrenciesMatch(local, source map[string]any, name string) bool {
+	localMode, configured := valueMap(local[billing_setting.BillingModeField])[name]
+	if !configured {
+		return true
+	}
+	localExpression, sourceExpression := "", ""
+	if localMode == billing_setting.BillingModeTieredExpr {
+		localExpression, _ = valueMap(local[billing_setting.BillingExprField])[name].(string)
+	}
+	if valueMap(source[billing_setting.BillingModeField])[name] == billing_setting.BillingModeTieredExpr {
+		sourceExpression, _ = valueMap(source[billing_setting.BillingExprField])[name].(string)
+	}
+	localCurrency, localErr := billingexpr.ExprCurrency(localExpression)
+	sourceCurrency, sourceErr := billingexpr.ExprCurrency(sourceExpression)
+	return localErr == nil && sourceErr == nil && localCurrency == sourceCurrency
 }
 
 func FetchUpstreamRatios(c *gin.Context) {
@@ -451,6 +473,7 @@ func FetchUpstreamRatios(c *gin.Context) {
 
 			// 如果不是 type1，则尝试按 type2 (/api/pricing) 解析
 			var pricingItems []struct {
+				Currency             string   `json:"currency"`
 				ModelName            string   `json:"model_name"`
 				QuotaType            int      `json:"quota_type"`
 				ModelRatio           *float64 `json:"model_ratio"`
@@ -484,6 +507,16 @@ func FetchUpstreamRatios(c *gin.Context) {
 			for _, item := range pricingItems {
 				if item.ModelName == "" {
 					continue
+				}
+				currency := billingexpr.CurrencyUSD
+				var currencyErr error
+				if item.BillingMode == billing_setting.BillingModeTieredExpr {
+					currency, currencyErr = billingexpr.ExprCurrency(item.BillingExpr)
+				}
+				if currencyErr != nil || (item.Currency != "" && item.Currency != currency) {
+					logger.LogWarn(c.Request.Context(), common.LogText("unrecognized data format from %s: %s", chItem.Name, fmt.Sprintf("model %s has an invalid pricing currency: declared=%q expression=%q error=%v", item.ModelName, item.Currency, currency, currencyErr)))
+					ch <- upstreamResult{Name: uniqueName, Err: "Upstream pricing currency does not match its billing expression"}
+					return
 				}
 				if item.BillingMode == billing_setting.BillingModeTieredExpr {
 					billingModeMap[item.ModelName] = billing_setting.BillingModeTieredExpr
@@ -623,12 +656,15 @@ func FetchUpstreamRatios(c *gin.Context) {
 		row := modelSyncPrices{Current: modelPricingSyncValues(localData, name), Upstreams: make(map[string]map[string]any)}
 		expressionPriority := valueMap(localData[billing_setting.BillingModeField])[name] == billing_setting.BillingModeTieredExpr
 		for _, channel := range successfulChannels {
-			if valueMap(channel.data[billing_setting.BillingModeField])[name] == billing_setting.BillingModeTieredExpr {
+			if pricingSyncCurrenciesMatch(localData, channel.data, name) && valueMap(channel.data[billing_setting.BillingModeField])[name] == billing_setting.BillingModeTieredExpr {
 				expressionPriority = true
 				break
 			}
 		}
 		for _, channel := range successfulChannels {
+			if !pricingSyncCurrenciesMatch(localData, channel.data, name) {
+				continue
+			}
 			candidate := modelPricingSyncValues(channel.data, name)
 			if expressionPriority && candidate[billing_setting.BillingModeField] != billing_setting.BillingModeTieredExpr {
 				continue
@@ -725,7 +761,7 @@ func buildDifferences(localData map[string]any, successfulChannels []struct {
 	for modelName := range allModels {
 		expressionPriority := valueMap(localData[billing_setting.BillingModeField])[modelName] == billing_setting.BillingModeTieredExpr
 		for _, channel := range successfulChannels {
-			if valueMap(channel.data[billing_setting.BillingModeField])[modelName] == billing_setting.BillingModeTieredExpr {
+			if pricingSyncCurrenciesMatch(localData, channel.data, modelName) && valueMap(channel.data[billing_setting.BillingModeField])[modelName] == billing_setting.BillingModeTieredExpr {
 				expressionPriority = true
 			}
 		}
@@ -744,6 +780,9 @@ func buildDifferences(localData map[string]any, successfulChannels []struct {
 			hasDifference := false
 
 			for _, channel := range successfulChannels {
+				if !pricingSyncCurrenciesMatch(localData, channel.data, modelName) {
+					continue
+				}
 				if expressionPriority && valueMap(channel.data[billing_setting.BillingModeField])[modelName] != billing_setting.BillingModeTieredExpr {
 					continue
 				}

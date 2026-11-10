@@ -60,7 +60,10 @@ func PrepareRequestBilling(c *gin.Context, info *relaycommon.RelayInfo) *types.N
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest))
 	}
-	if priceData.FreeModel {
+	if apiErr := service.ValidateBillingCurrency(c, info); apiErr != nil {
+		return apiErr
+	}
+	if priceData.FreeModel && !service.IsCNYBilling(info) {
 		logger.LogInfo(c, common.LogText("model %s is free, skipping pre-consume", info.OriginModelName))
 		return nil
 	}
@@ -77,6 +80,8 @@ func RefundFailedRequestBilling(c *gin.Context, info *relaycommon.RelayInfo, api
 	if info.Billing != nil {
 		info.Billing.Refund(c)
 	}
-	service.ChargeViolationFeeIfNeeded(c, info, apiErr)
+	if !service.IsCNYBilling(info) {
+		service.ChargeViolationFeeIfNeeded(c, info, apiErr)
+	}
 	return apiErr
 }

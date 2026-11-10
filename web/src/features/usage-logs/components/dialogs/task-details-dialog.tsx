@@ -187,7 +187,11 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
             <DetailRow label={t('Group')} value={props.log.group || '-'} />
             <DetailRow
               label={t('Quota')}
-              value={formatLogQuota(props.log.quota)}
+              value={
+                props.log.status === 'AWAITING_REVIEW'
+                  ? `${formatLogQuota(props.log.quota, props.log.currency)} · ${t('Reserved')}`
+                  : formatLogQuota(props.log.quota, props.log.currency)
+              }
               mono
             />
             {props.log.admin_info?.request_id ? (

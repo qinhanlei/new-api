@@ -16,7 +16,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { formatBillingCurrencyFromUSD } from '@/lib/currency'
+import { billingExpressionCurrency } from '@/lib/billing-currency'
+import {
+  formatBillingCurrencyFromUSD,
+  formatNativeMoney,
+  type BillingCurrency,
+} from '@/lib/currency'
 
 import { TOKEN_UNIT_DIVISORS } from '../constants'
 import type {
@@ -46,6 +51,7 @@ import {
 import { getTaskPricingDisplayTiers } from './task-matrix-display'
 
 export type DynamicPriceOptions = {
+  billingCurrency?: BillingCurrency
   tokenUnit: TokenUnit
   showCurrencySymbol?: boolean
   showRechargePrice?: boolean
@@ -59,6 +65,7 @@ export type DynamicPriceOptions = {
 export type DynamicPriceLabelKind = 'i18n' | 'schema'
 
 export type DynamicPriceEntry = {
+  billingCurrency?: BillingCurrency
   key: string
   field: string
   label: string
@@ -210,12 +217,17 @@ export function formatDynamicUnitPrice(
     TOKEN_UNIT_DIVISORS[options.tokenUnit]
   const displayPrice = applyRechargeRate(
     priceUSD,
-    options.showRechargePrice ?? false,
+    options.billingCurrency !== 'CNY' && (options.showRechargePrice ?? false),
     priceRate,
     usdExchangeRate
   )
 
-  return formatBillingCurrencyFromUSD(displayPrice, {
+  const formatAmount =
+    options.billingCurrency === 'CNY'
+      ? (amount: number, format: Parameters<typeof formatNativeMoney>[2]) =>
+          formatNativeMoney(amount, 'CNY', format)
+      : formatBillingCurrencyFromUSD
+  return formatAmount(displayPrice, {
     showSymbol: options.showCurrencySymbol ?? true,
     digitsLarge: 4,
     digitsSmall: 6,
@@ -233,12 +245,17 @@ export function formatTaskUsageUnitPrice(
   const priceUSD = valuePerUnit * groupRatio
   const displayPrice = applyRechargeRate(
     priceUSD,
-    options.showRechargePrice ?? false,
+    options.billingCurrency !== 'CNY' && (options.showRechargePrice ?? false),
     priceRate,
     usdExchangeRate
   )
 
-  return formatBillingCurrencyFromUSD(displayPrice, {
+  const formatAmount =
+    options.billingCurrency === 'CNY'
+      ? (amount: number, format: Parameters<typeof formatNativeMoney>[2]) =>
+          formatNativeMoney(amount, 'CNY', format)
+      : formatBillingCurrencyFromUSD
+  return formatAmount(displayPrice, {
     showSymbol: options.showCurrencySymbol ?? true,
     digitsLarge: 4,
     digitsSmall: 6,
@@ -390,6 +407,10 @@ export function getDynamicPricingSummary(
   model: PricingModel,
   options: DynamicPriceOptions
 ): DynamicPricingSummary | null {
+  options = {
+    ...options,
+    billingCurrency: billingExpressionCurrency(model.billing_expr),
+  }
   const variants = model.billing_plugin_variants
   if (variants?.length) {
     const summaries = variants.flatMap((variant) => {
@@ -407,12 +428,16 @@ export function getDynamicPricingSummary(
     ) {
       perCallEntries.push({
         key: 'modelPrice',
+        billingCurrency: 'USD',
         field: 'modelPrice',
         label: 'Price per request',
         shortLabel: 'Per-call',
         labelKind: 'i18n',
         value: model.model_price,
-        formatted: formatTaskUsageUnitPrice(model.model_price, options),
+        formatted: formatTaskUsageUnitPrice(model.model_price, {
+          ...options,
+          billingCurrency: 'USD',
+        }),
         unit: 'request',
       })
     }
@@ -426,7 +451,7 @@ export function getDynamicPricingSummary(
     ]) {
       for (const entry of providerEntries) {
         // Identical field names with different units describe different prices.
-        const key = `${entry.field}:${entry.unit}`
+        const key = `${entry.billingCurrency ?? 'USD'}:${entry.field}:${entry.unit}`
         const range = ranges.get(key)
         const merged = range?.entry ?? { ...entry, key }
         if (
@@ -448,17 +473,23 @@ export function getDynamicPricingSummary(
       value: min,
       minValue: min,
       maxValue: max,
-      formatted: formatTaskUsageUnitPrice(min, options),
+      formatted: formatTaskUsageUnitPrice(min, {
+        ...options,
+        billingCurrency: entry.billingCurrency,
+      }),
       formattedRange:
         min === max
           ? undefined
-          : `${formatTaskUsageUnitPrice(min, options)} – ${formatTaskUsageUnitPrice(max, options)}`,
+          : `${formatTaskUsageUnitPrice(min, { ...options, billingCurrency: entry.billingCurrency })} – ${formatTaskUsageUnitPrice(max, { ...options, billingCurrency: entry.billingCurrency })}`,
     }))
     const primaryKeys = new Set(
       summaries.flatMap((summary) =>
         summary.primaryEntries
           .slice(0, 1)
-          .map((entry) => `${entry.field}:${entry.unit}`)
+          .map(
+            (entry) =>
+              `${entry.billingCurrency ?? 'USD'}:${entry.field}:${entry.unit}`
+          )
       )
     )
     const primary = entries.filter(
@@ -560,6 +591,10 @@ export function getDynamicPricingSummary(
       }
     })
   }
+  entries = entries.map((entry) => ({
+    ...entry,
+    billingCurrency: options.billingCurrency,
+  }))
   const rawExpression = model.billing_expr || ''
 
   return {
@@ -600,6 +635,10 @@ export function getCardExamplePrice(
   model: PricingModel,
   options: DynamicPriceOptions
 ): CardExamplePrice | null {
+  options = {
+    ...options,
+    billingCurrency: billingExpressionCurrency(model.billing_expr),
+  }
   if (model.billing_plugin_variants?.length) {
     const variant = model.billing_plugin_variants.find(
       (provider) => provider.billing_expr

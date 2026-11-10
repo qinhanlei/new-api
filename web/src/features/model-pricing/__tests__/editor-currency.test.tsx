@@ -131,7 +131,9 @@ function renderEditor(
 
 async function selectCurrency(label: string) {
   const user = userEvent.setup()
-  await user.click(screen.getByRole('combobox', { name: 'Pricing currency' }))
+  await user.click(
+    screen.getByRole('combobox', { name: 'USD display currency' })
+  )
   await user.click(await screen.findByRole('option', { name: label }))
 }
 
@@ -615,7 +617,7 @@ it('preserves a legacy per-request draft when conversion is unsupported', async 
 it('defaults to USD, remembers a currency choice and restores it when reopened', async () => {
   const editor = renderEditor()
   expect(
-    screen.getByRole('combobox', { name: 'Pricing currency' })
+    screen.getByRole('combobox', { name: 'USD display currency' })
   ).toHaveTextContent('US dollar (USD)')
   expect(screen.getByRole('textbox', { name: 'Input price' })).toHaveValue('2')
   await selectCurrency('Site currency (CNY)')
@@ -629,7 +631,7 @@ it('defaults to USD, remembers a currency choice and restores it when reopened',
   await usePricingPreferencesStore.persist.rehydrate()
   renderEditor()
   expect(
-    screen.getByRole('combobox', { name: 'Pricing currency' })
+    screen.getByRole('combobox', { name: 'USD display currency' })
   ).toHaveTextContent('Site currency (CNY)')
 })
 
@@ -643,7 +645,7 @@ it('opens currency help by keyboard and restores focus after Escape', async () =
     name: 'About pricing currency',
   })
   expect(
-    within(dialog).getByText(/The system always bills in USD/)
+    within(dialog).getByText(/This setting only converts USD price inputs/)
   ).toBeVisible()
   expect(
     within(dialog).getByText('Current exchange rate: 1 USD = 7 CNY')
@@ -750,7 +752,7 @@ it.each([0, -1, Infinity, Number.NaN, undefined])(
       )
     ).toBeVisible()
     await userEvent.click(
-      screen.getByRole('combobox', { name: 'Pricing currency' })
+      screen.getByRole('combobox', { name: 'USD display currency' })
     )
     expect(
       await screen.findByRole('option', { name: 'Site currency (CNY)' })
@@ -767,7 +769,7 @@ it.each(['USD', 'TOKENS'] as const)(
     })
     renderEditor()
     await userEvent.click(
-      screen.getByRole('combobox', { name: 'Pricing currency' })
+      screen.getByRole('combobox', { name: 'USD display currency' })
     )
     expect(screen.getAllByRole('option')).toHaveLength(1)
     expect(
@@ -798,6 +800,26 @@ it('blocks a non-finite conversion and allows saving after the amount is correct
   fireEvent.change(fixed, { target: { value: '0' } })
   expect(await commit(editor.ref)).toMatchObject({ price: '0' })
 })
+
+it.each([
+  ['v2:CNY:', 'CNY'],
+  ['v2:USD:', 'USD'],
+  ['', 'USD'],
+])(
+  'labels the %s expression preview in its billing currency',
+  async (prefix, currency) => {
+    const expression = `${prefix}tier("base", p * 10 + c * 20)`
+    renderEditor({ billingMode: 'tiered_expr', billingExpr: expression })
+    const preview = within(
+      screen.getByRole('complementary', { name: 'Preview' })
+    )
+    expect(preview.getByText(`Expression (${currency})`)).toBeVisible()
+    expect(preview.getByText(expression)).toBeVisible()
+    await selectCurrency('Site currency (CNY)')
+    expect(preview.getByText(`Expression (${currency})`)).toBeVisible()
+    expect(preview.getByText(expression)).toBeVisible()
+  }
+)
 
 it('converts tier price coefficients but leaves token thresholds and rule multipliers unchanged', async () => {
   const expr =
@@ -832,7 +854,7 @@ it('keeps custom raw expressions byte-for-byte intact on currency changes', asyn
   expect(await commit(editor.ref)).toMatchObject({ billingExpr: expr })
   expect(
     screen.getByText(
-      'Raw expressions and presets use USD. Currency selection only converts visual price inputs and monetary previews.'
+      'Raw expressions use the billing currency. USD prices may use the display currency conversion; CNY prices are entered directly.'
     )
   ).toBeVisible()
 })
@@ -949,10 +971,10 @@ it('switches currency using the keyboard without changing the saved configuratio
   const editor = renderEditor()
   const original = await commit(editor.ref)
   const user = userEvent.setup()
-  screen.getByRole('combobox', { name: 'Pricing currency' }).focus()
+  screen.getByRole('combobox', { name: 'USD display currency' }).focus()
   await user.keyboard('{ArrowDown}{End}{Enter}')
   expect(
-    screen.getByRole('combobox', { name: 'Pricing currency' })
+    screen.getByRole('combobox', { name: 'USD display currency' })
   ).toHaveTextContent('Site currency (CNY)')
   expect(await commit(editor.ref)).toEqual(original)
 })

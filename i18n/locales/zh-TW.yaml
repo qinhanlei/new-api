@@ -92,3 +92,15 @@ channel.upstream_update_added_models: "新增模型範例（顯示 {{.Shown}}/{{
 channel.upstream_update_removed_models: "刪除模型範例（顯示 {{.Shown}}/{{.Total}}）：{{.Models}}"
 channel.upstream_update_failed_channels: "失敗管道 ID（顯示 {{.Shown}}/{{.Total}}）：{{.Ids}}"
 channel.upstream_update_more_omitted: "（其餘 {{.Count}} 個已省略）"
+
+# Native currency billing
+billing.currency_retry_mismatch: "請求重試期間不能更改扣費幣種"
+billing.usd_token_exhausted: "此權杖的美元額度已耗盡"
+billing.currency_unsupported: "不支援的計費幣種"
+billing.cny_wallet_only: "人民幣計費需要人民幣錢包，暫不支援訂閱"
+billing.cny_request_unsupported: "此介面暫不支援人民幣原幣計費"
+billing.cny_paid_tools_unsupported: "人民幣原幣計費暫不支援付費工具"
+billing.cny_violation_fee_unsupported: "人民幣原幣計費暫不支援已設定的違規扣費"
+billing.cny_unavailable: "人民幣計費暫時無法使用"
+billing.cny_insufficient_wallet: "人民幣錢包餘額不足"
+billing.cny_insufficient_token: "此權杖未啟用人民幣額度或人民幣額度不足"

@@ -19,7 +19,12 @@ For commercial licensing, please contact support@quantumnous.com
 import { formatLogQuota, formatTimestampToDate } from '@/lib/format'
 
 import type { UsageLog } from '../data/schema'
-import { logTokenName, parseLogOther, renderLogContent } from './format'
+import {
+  getNativeQuotaAdjustment,
+  logTokenName,
+  parseLogOther,
+  renderLogContent,
+} from './format'
 import {
   getLogTypeConfig,
   isDisplayableLogType,
@@ -51,6 +56,12 @@ export function getLogCsvHeader(isAdmin: boolean, t: Translate): string[] {
     t('IP'),
     t('Request ID'),
     t('Details'),
+    t('Billing currency'),
+    t('Billing status'),
+    t('Reserved'),
+    t('Quota before adjustment'),
+    t('Quota after adjustment'),
+    t('Reason'),
   ]
 }
 
@@ -61,6 +72,7 @@ export function getLogCsvRow(
   t: Translate
 ): string[] {
   const other = parseLogOther(log.other ?? '')
+  const adjustment = getNativeQuotaAdjustment(log, other)
   const usage = isDisplayableLogType(log.type)
   const cacheWrite =
     (other?.cache_creation_tokens_5m ?? 0) +
@@ -86,11 +98,26 @@ export function getLogCsvRow(
     usage ? String(log.completion_tokens ?? 0) : '',
     usage ? String(other?.cache_tokens ?? 0) : '',
     usage ? String(cacheWrite) : '',
-    usage ? formatLogQuota(log.quota ?? 0) : '',
+    adjustment?.amount ??
+      (usage ? formatLogQuota(log.quota ?? 0, log.currency) : ''),
     isTimingLogType(log.type) ? `${log.use_time ?? 0}s` : '',
     log.ip ?? '',
     log.request_id ?? '',
     renderLogContent(other, t) ?? log.content ?? '',
+    log.currency ?? 'USD',
+    other?.billing_status
+      ? t(
+          { reserved: 'Reserved', settled: 'Settled', refunded: 'Refunded' }[
+            other.billing_status
+          ]
+        )
+      : '',
+    other?.billing_status === 'reserved'
+      ? formatLogQuota(other.reserved_quota ?? 0, log.currency)
+      : '',
+    adjustment?.before ?? '',
+    adjustment?.after ?? '',
+    adjustment?.reason ?? '',
   ]
 }
 

@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { splitBillingCurrency } from '@/lib/billing-currency'
+
 import {
   BILLING_CACHE_VAR_MAP,
   CLAUDE_CACHE_CREATION_1H_MULTIPLIER,
@@ -58,6 +60,7 @@ export type VisualTier = {
 }
 
 export type VisualConfig = {
+  currencyPrefix?: string
   tiers: VisualTier[]
 }
 
@@ -145,6 +148,7 @@ export function generateExprFromVisualConfig(
     return 'p * 0 + c * 0'
   }
   const tiers = config.tiers
+  const prefix = config.currencyPrefix ?? ''
 
   if (tiers.length === 1) {
     const tier = tiers[0]
@@ -152,9 +156,9 @@ export function generateExprFromVisualConfig(
     const body = `tier("${label}", ${buildTierBodyExpr(tier)})`
     const cond = buildConditionStr(tier.conditions)
     if (cond) {
-      return `${cond} ? ${body} : p * 0 + c * 0`
+      return `${prefix}${cond} ? ${body} : p * 0 + c * 0`
     }
-    return body
+    return prefix + body
   }
 
   const parts: string[] = []
@@ -170,7 +174,7 @@ export function generateExprFromVisualConfig(
       parts.push(body)
     }
   }
-  return parts.join(' : ')
+  return prefix + parts.join(' : ')
 }
 
 export function tryParseVisualConfig(
@@ -178,9 +182,8 @@ export function tryParseVisualConfig(
 ): VisualConfig | null {
   if (!exprStr) return null
   try {
-    let body = exprStr
-    const versionMatch = body.match(/^v\d+:([\s\S]*)$/)
-    if (versionMatch) body = versionMatch[1]
+    const { prefix, body } = splitBillingCurrency(exprStr)
+    if (/^\s*v\d+:/.test(body)) return null
     const cacheVarNames = BILLING_CACHE_VAR_MAP.map((cv) => cv.exprVar)
     const optCacheStr = cacheVarNames
       .map((v) => `(?:\\s*\\+\\s*${v}\\s*\\*\\s*([\\d.eE+-]+))?`)
@@ -202,6 +205,7 @@ export function tryParseVisualConfig(
         if (val != null) tier[cv.field] = Number(val)
       })
       return normalizeVisualConfig({
+        ...(prefix ? { currencyPrefix: prefix } : {}),
         tiers: [normalizeVisualTier(tier as Partial<VisualTier>)],
       })
     }
@@ -250,7 +254,7 @@ export function tryParseVisualConfig(
     if (regenerated.replaceAll(/\s+/g, '') !== body.replaceAll(/\s+/g, '')) {
       return null
     }
-    return cfg
+    return { ...cfg, ...(prefix ? { currencyPrefix: prefix } : {}) }
   } catch {
     return null
   }

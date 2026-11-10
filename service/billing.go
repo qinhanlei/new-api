@@ -22,6 +22,9 @@ const (
 // 会话已存在时（任务重试换到另一个渠道）把预扣补到 preConsumedQuota，
 // 和首次预扣一样必须由余额覆盖。
 func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+	if apiErr := ValidateBillingCurrency(c, relayInfo); apiErr != nil {
+		return apiErr
+	}
 	if relayInfo != nil && relayInfo.QuotaClamp != nil {
 		return types.NewErrorWithStatusCode(
 			relayInfo.QuotaClamp,
@@ -39,13 +42,29 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 		)
 	}
 	if relayInfo != nil && relayInfo.Billing != nil {
+		if session, ok := relayInfo.Billing.(*CNYBillingSession); ok {
+			session.mu.Lock()
+			session.params.ChannelID = c.GetInt("channel_id")
+			session.mu.Unlock()
+		}
 		if err := relayInfo.Billing.ReserveBeforeSubmit(preConsumedQuota); err != nil {
+			if IsCNYBilling(relayInfo) {
+				return cnyReservationError(c, err)
+			}
 			var apiErr *types.NewAPIError
 			if errors.As(err, &apiErr) {
 				return apiErr
 			}
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry())
 		}
+		return nil
+	}
+	if IsCNYBilling(relayInfo) {
+		session, err := newCNYBillingSession(c, relayInfo, preConsumedQuota)
+		if err != nil {
+			return cnyReservationError(c, err)
+		}
+		relayInfo.Billing = session
 		return nil
 	}
 	session, apiErr := NewBillingSession(c, relayInfo, preConsumedQuota)
@@ -63,6 +82,13 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 // SettleBilling 执行计费结算。如果 RelayInfo 上有 BillingSession 则通过 session 结算，
 // 否则回退到旧的 PostConsumeQuota 路径（兼容按次计费等场景）。
 func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuota int) error {
+	if IsCNYBilling(relayInfo) {
+		session, ok := relayInfo.Billing.(*CNYBillingSession)
+		if !ok {
+			return errors.New("CNY settlement requires a native billing session")
+		}
+		return session.Settle(actualQuota)
+	}
 	if relayInfo.Billing != nil {
 		preConsumed := relayInfo.Billing.GetPreConsumedQuota()
 		delta := actualQuota - preConsumed

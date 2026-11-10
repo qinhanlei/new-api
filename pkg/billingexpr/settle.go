@@ -6,15 +6,14 @@ import (
 	"github.com/QuantumNous/new-api/common"
 )
 
-// quotaConversion converts raw expression output to quota based on the
-// expression version. This is the central dispatch point for future versions
-// that may use a different conversion formula.
+// quotaConversion keeps the existing quota scale in the snapshot's native
+// currency. Version 2 only declares currency; it does not change arithmetic.
 func quotaConversion(exprOutput float64, snap *BillingSnapshot) float64 {
 	if snap.TaskUsageBilling {
 		return exprOutput * snap.QuotaPerUnit
 	}
 	switch snap.ExprVersion {
-	default: // v1: coefficients are $/1M tokens prices
+	default: // v1 and v2: coefficients are native currency per 1M tokens.
 		return exprOutput / 1_000_000 * snap.QuotaPerUnit
 	}
 }
@@ -26,6 +25,16 @@ func ComputeTieredQuota(snap *BillingSnapshot, params TokenParams) (TieredResult
 }
 
 func ComputeTieredQuotaWithRequest(snap *BillingSnapshot, params TokenParams, request RequestInput) (TieredResult, error) {
+	currency, err := ExprCurrency(snap.ExprString)
+	if err != nil {
+		return TieredResult{}, err
+	}
+	if currency != snap.BillingCurrency() {
+		return TieredResult{}, fmt.Errorf("billing snapshot currency %q does not match expression currency %q", snap.BillingCurrency(), currency)
+	}
+	if snap.ExprVersion != 0 && snap.ExprVersion != ExprVersion(snap.ExprString) {
+		return TieredResult{}, fmt.Errorf("billing snapshot version %d does not match expression version %d", snap.ExprVersion, ExprVersion(snap.ExprString))
+	}
 	if snap.TaskUsageBilling && UsesFixedPricingByHash(snap.ExprString, snap.ExprHash) {
 		return TieredResult{}, fmt.Errorf("fixed pricing is not supported for task usage expressions")
 	}

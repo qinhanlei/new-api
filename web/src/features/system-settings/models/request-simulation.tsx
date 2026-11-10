@@ -39,6 +39,7 @@ import {
 } from '@/components/ui/select'
 import {
   formatPricingAmount,
+  CNY_PRICING_CURRENCY,
   type PricingCurrency,
 } from '@/features/model-pricing/currency'
 import { useBillingTime } from '@/features/pricing/hooks/use-billing-time'
@@ -51,6 +52,7 @@ import type {
 } from '@/features/pricing/lib/billing-expression/types'
 import { taskPriceLabel } from '@/features/pricing/lib/task-price-display'
 import type { BillingUsageSchema } from '@/features/pricing/types'
+import { billingExpressionCurrency } from '@/lib/billing-currency'
 
 const DIAGNOSTIC_LABELS: Record<DiagnosticCode, string> = {
   syntax: 'Invalid expression syntax',
@@ -355,7 +357,9 @@ export function RequestSimulation(props: RequestSimulationProps) {
               {t('Simulated request cost')}:{' '}
               {formatPricingAmount(
                 success.cost / (props.mode === 'token' ? 1_000_000 : 1),
-                props.currency
+                billingExpressionCurrency(props.expression) === 'CNY'
+                  ? CNY_PRICING_CURRENCY
+                  : props.currency
               )}
               {success.billingUnit === 'request' && `/${t('request')}`}
             </p>

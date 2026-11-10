@@ -227,9 +227,7 @@ func ValidateUserToken(key string) (token *Token, err error) {
 	}
 	token, err = GetTokenByKey(key, false)
 	if err == nil {
-		if token.Status == common.TokenStatusExhausted ||
-			token.Status == common.TokenStatusExpired ||
-			token.Status != common.TokenStatusEnabled {
+		if token.Status != common.TokenStatusEnabled && token.Status != common.TokenStatusExhausted {
 			return token, ErrTokenInvalid
 		}
 		if token.ExpiredTime != -1 && token.ExpiredTime < common.GetTimestamp() {
@@ -242,7 +240,16 @@ func ValidateUserToken(key string) (token *Token, err error) {
 			}
 			return token, ErrTokenInvalid
 		}
-		if !token.UnlimitedQuota && token.RemainQuota <= 0 {
+		if token.Status == common.TokenStatusExhausted || (!token.UnlimitedQuota && token.RemainQuota <= 0) {
+			// Currency is selected after authentication. CNY-enabled tokens may
+			// authenticate here; each billing path must enforce its own budget.
+			hasCNY, cnyErr := HasCNYTokenQuota(token.Id)
+			if cnyErr != nil {
+				return token, fmt.Errorf("%w: %v", ErrDatabase, cnyErr)
+			}
+			if hasCNY {
+				return token, nil
+			}
 			if !common.RedisEnabled {
 				token.Status = common.TokenStatusExhausted
 				err := token.SelectUpdate()

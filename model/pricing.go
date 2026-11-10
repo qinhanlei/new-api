@@ -7,6 +7,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
@@ -15,6 +16,7 @@ import (
 )
 
 type PricingPluginVariant struct {
+	Currency             string                               `json:"currency"`
 	PluginKey            string                               `json:"plugin_key"`
 	PluginName           string                               `json:"plugin_name"`
 	Icon                 string                               `json:"icon,omitempty"`
@@ -25,6 +27,7 @@ type PricingPluginVariant struct {
 }
 
 type Pricing struct {
+	Currency               string                               `json:"currency"`
 	BillingPluginVariants  []PricingPluginVariant               `json:"billing_plugin_variants,omitempty"`
 	ModelName              string                               `json:"model_name"`
 	Description            string                               `json:"description,omitempty"`
@@ -327,6 +330,7 @@ func updatePricing() {
 	pluginGeneration := jsplugin.DefaultRegistry.Generation()
 	for model, groups := range modelGroupsMap {
 		pricing := Pricing{
+			Currency:               billingexpr.CurrencyUSD,
 			ModelName:              model,
 			EnableGroup:            groups.Items(),
 			SupportedEndpointTypes: modelSupportEndpointTypes[model],
@@ -374,12 +378,14 @@ func updatePricing() {
 			if expr, ok := billing_setting.GetBillingExpr(model); ok && strings.TrimSpace(expr) != "" {
 				pricing.BillingMode = billingMode
 				pricing.BillingExpr = expr
+				pricing.Currency, _ = billingexpr.ExprCurrency(expr)
 			}
 		} else if target, resolved := ResolveTaskModelAlias(pluginGeneration, model); resolved && target.Declared != "" {
 			if tailMode := billing_setting.GetBillingMode(target.Declared); tailMode == "tiered_expr" {
 				if expr, ok := billing_setting.GetBillingExpr(target.Declared); ok && strings.TrimSpace(expr) != "" {
 					pricing.BillingMode = tailMode
 					pricing.BillingExpr = expr
+					pricing.Currency, _ = billingexpr.ExprCurrency(expr)
 				}
 			}
 		}
@@ -411,6 +417,7 @@ func updatePricing() {
 					schema = map[string]jsplugin.UsageFieldSchema{}
 				}
 				expression, hasExpression := billing_setting.ResolveTaskBillingExpr(provider.Meta.Key, model, "")
+				currency, _ := billingexpr.ExprCurrency(expression)
 				mode := billing_setting.BillingModeRatio
 				if hasExpression || billing_setting.GetBillingMode(model) == billing_setting.BillingModeTieredExpr {
 					mode = billing_setting.BillingModeTieredExpr
@@ -420,7 +427,7 @@ func updatePricing() {
 				}
 				pricing.BillingPluginVariants = append(pricing.BillingPluginVariants, PricingPluginVariant{
 					PluginKey: provider.Meta.Key, PluginName: provider.Meta.Name, Icon: provider.Meta.Icon,
-					BillingExpr: expression, BillingMode: mode,
+					BillingExpr: expression, BillingMode: mode, Currency: currency,
 					BillingUsageSchema: jsplugin.CloneUsageSchema(schema), BillingUsageExamples: jsplugin.CloneUsageExamples(examples),
 				})
 			}

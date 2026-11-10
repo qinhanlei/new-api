@@ -191,6 +191,9 @@ func coverMidjourneyTaskDto(c *gin.Context, originTask *model.Midjourney) (midjo
 }
 
 func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyResponse {
+	if apiErr := service.ValidateBillingCurrency(c, info); apiErr != nil {
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, apiErr.Error())
+	}
 	var swapFaceRequest dto.SwapFaceRequest
 	err := common.UnmarshalBodyReusable(c, &swapFaceRequest)
 	if err != nil {
@@ -408,6 +411,9 @@ func RelayMidjourneyTask(c *gin.Context, relayMode int) *dto.MidjourneyResponse 
 }
 
 func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dto.MidjourneyResponse {
+	if apiErr := service.ValidateBillingCurrency(c, relayInfo); apiErr != nil {
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, apiErr.Error())
+	}
 	consumeQuota := true
 	var midjRequest dto.MidjourneyRequest
 	err := common.UnmarshalBodyReusable(c, &midjRequest)

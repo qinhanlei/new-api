@@ -65,6 +65,7 @@ type TraceResult struct {
 type BillingSnapshot struct {
 	EstimatedImageCount       *int           `json:"estimated_image_count,omitempty"`
 	BillingMode               string         `json:"billing_mode"`
+	Currency                  string         `json:"currency,omitempty"`
 	ModelName                 string         `json:"model_name"`
 	ExprString                string         `json:"expr_string"`
 	ExprHash                  string         `json:"expr_hash"`
@@ -81,6 +82,14 @@ type BillingSnapshot struct {
 	ExprVersion               int            `json:"expr_version"`
 	TaskUsageBilling          bool           `json:"task_usage_billing,omitempty"`
 	UsageFacts                map[string]any `json:"usage_facts,omitempty"`
+}
+
+// BillingCurrency preserves the USD denomination of historical snapshots.
+func (s *BillingSnapshot) BillingCurrency() string {
+	if s == nil || s.Currency == "" {
+		return CurrencyUSD
+	}
+	return s.Currency
 }
 
 // TieredResult holds everything needed after running tiered settlement.

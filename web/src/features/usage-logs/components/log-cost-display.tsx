@@ -32,12 +32,15 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import type { BillingCurrency } from '@/lib/currency'
 import { formatLogQuota } from '@/lib/format'
 
 import { hasToolSurcharge } from '../lib/format'
 import type { LogOtherData } from '../types'
 
 interface LogCostDisplayProps {
+  currency?: BillingCurrency
+  adjustmentAmount?: string
   quota: number
   other: LogOtherData | null
   showBillingSource?: boolean
@@ -82,9 +85,11 @@ export function LogCostDisplay(props: LogCostDisplayProps) {
   const { t } = useTranslation()
   const isSubscription = props.other?.billing_source === 'subscription'
   const showToolSurcharge = hasToolSurcharge(props.other)
-  const quota = isSubscription
+  const reserved = props.other?.billing_status === 'reserved'
+  let quota = isSubscription
     ? (props.other?.subscription_consumed ?? props.quota)
     : props.quota
+  if (reserved) quota = props.other?.reserved_quota ?? 0
   let source: string | undefined
 
   // A log billed to a subscription always names its funding source: that
@@ -132,7 +137,13 @@ export function LogCostDisplay(props: LogCostDisplayProps) {
               <TooltipContent>{source}</TooltipContent>
             </Tooltip>
           ) : null}
-          <span className='whitespace-nowrap'>{formatLogQuota(quota)}</span>
+          <span className='whitespace-nowrap'>
+            {props.adjustmentAmount ?? formatLogQuota(quota, props.currency)}
+          </span>
+          {reserved && <span>{t('Reserved')}</span>}
+          {props.other?.billing_status === 'refunded' && (
+            <span>{t('Refunded')}</span>
+          )}
         </StatusBadge>
         {showToolSurcharge ? <ToolSurchargeMarker /> : null}
       </div>

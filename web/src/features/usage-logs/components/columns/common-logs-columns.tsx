@@ -48,7 +48,7 @@ import { pluginUsageSchema } from '@/features/pricing/lib/plugin-pricing'
 import { taskUsageUnitLabel } from '@/features/pricing/lib/task-price-display'
 import type { BillingUsageSchema } from '@/features/pricing/types'
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
-import { formatBillingCurrencyFromUSD } from '@/lib/currency'
+import { formatBillingCurrencyFromUSD, formatNativeMoney } from '@/lib/currency'
 import { formatLogQuota, formatTimestampToDate } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { useSystemConfigStore } from '@/stores/system-config-store'
@@ -57,6 +57,7 @@ import { LOG_TYPE_ALL_VALUE } from '../../constants'
 import type { UsageLog } from '../../data/schema'
 import {
   formatModelName,
+  getNativeQuotaAdjustment,
   decodeBillingExprB64,
   getTieredBillingSummary,
   hasAnyCacheTokens,
@@ -160,7 +161,7 @@ function buildTypeDetailSegments(
       })
     }
     segments.push({
-      text: `${t('Fee')}: ${formatLogQuota(other?.fee_quota ?? log.quota)}`,
+      text: `${t('Fee')}: ${formatLogQuota(other?.fee_quota ?? log.quota, log.currency)}`,
       muted: true,
     })
     return segments
@@ -171,10 +172,11 @@ function buildTypeDetailSegments(
   const segments: DetailSegment[] = []
 
   const priceOpts = { digitsLarge: 4, digitsSmall: 6, abbreviate: false }
-  const formatPrice = (price: number) =>
-    `${formatBillingCurrencyFromUSD(price, priceOpts)}/M`
   const formatPriceCompact = (price: number) =>
-    formatBillingCurrencyFromUSD(price, priceOpts)
+    log.currency === 'CNY'
+      ? formatNativeMoney(price, 'CNY', priceOpts)
+      : formatBillingCurrencyFromUSD(price, priceOpts)
+  const formatPrice = (price: number) => `${formatPriceCompact(price)}/M`
   const formatPriceList = (prices: string[], showUnit: boolean) => {
     const text = prices.join(' / ')
     return showUnit ? `${text}/M` : text
@@ -198,11 +200,11 @@ function buildTypeDetailSegments(
         const definition = usageSchema?.[field]
         const unitKey = getTaskUsagePriceUnitLabelKey(definition?.unit)
         const unitLabel = taskUsageUnitLabel(definition, language, t(unitKey))
-        return `${field} ${formatTaskUsageUnitPrice(price, { tokenUnit: 'M' })}/${unitLabel}`
+        return `${field} ${formatTaskUsageUnitPrice(price, { tokenUnit: 'M', billingCurrency: log.currency })}/${unitLabel}`
       })
       if (tier.constant > 0) {
         prices.push(
-          `${t('Additional charge')} ${formatTaskUsageUnitPrice(tier.constant, { tokenUnit: 'M' })}/${t('request')}`
+          `${t('Additional charge')} ${formatTaskUsageUnitPrice(tier.constant, { tokenUnit: 'M', billingCurrency: log.currency })}/${t('request')}`
         )
       }
       segments.push({
@@ -776,12 +778,15 @@ export function useCommonLogsColumns(
         header: t('Cost'),
         cell: ({ row }) => {
           const log = row.original
-          if (!isDisplayableLogType(log.type)) return null
+          const other = parseLogOther(log.other)
+          const adjustment = getNativeQuotaAdjustment(log, other)
+          if (!isDisplayableLogType(log.type) && !adjustment) return null
 
           const quota = row.getValue('quota') as number
-          const other = parseLogOther(log.other)
           return (
             <LogCostDisplay
+              currency={log.currency}
+              adjustmentAmount={adjustment?.amount}
               quota={quota}
               other={other}
               showBillingSource={showBillingSource}

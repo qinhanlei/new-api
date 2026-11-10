@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
@@ -114,6 +115,7 @@ func TestPricingAliasCarriesPluginUsageSchemaAndTailExpr(t *testing.T) {
 	assert.Equal(t, "Estimated duration.", pricing["alias-model"].BillingUsageSchema["seconds"].Description["en"])
 	assert.Equal(t, "tiered_expr", pricing["alias-model"].BillingMode)
 	assert.Equal(t, `u("seconds")`, pricing["alias-model"].BillingExpr)
+	assert.Equal(t, billingexpr.CurrencyUSD, pricing["alias-model"].Currency)
 	assert.Equal(t, "tiered_expr", pricing["pricing-usage-model"].BillingMode)
 	assert.Equal(t, `u("seconds")`, pricing["pricing-usage-model"].BillingExpr)
 
@@ -277,12 +279,14 @@ func TestPricingSharedPluginVariantsUseEachSchemaAndExpression(t *testing.T) {
 	}
 	require.ErrorContains(t, ValidateModelPricing("pricing-usage-model", draft), "compile")
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-		billing_setting.PluginBillingExprOption: `{"pricing-beta::pricing-usage-model":"tier(\"beta\", u(\"credits\") * 2)"}`,
+		billing_setting.PluginBillingExprOption: `{"pricing-beta::pricing-usage-model":"v2:CNY:tier(\"beta\", u(\"credits\") * 2)"}`,
 	}))
 	InvalidatePricingCache()
 	priced := pricingByModel(GetPricing())["pricing-usage-model"].BillingPluginVariants
 	require.Len(t, priced, 2)
-	assert.Equal(t, `tier("beta", u("credits") * 2)`, priced[1].BillingExpr)
+	assert.Equal(t, `v2:CNY:tier("beta", u("credits") * 2)`, priced[1].BillingExpr)
+	assert.Equal(t, billingexpr.CurrencyUSD, priced[0].Currency)
+	assert.Equal(t, billingexpr.CurrencyCNY, priced[1].Currency)
 	previousPrice := ratio_setting.ModelPrice2JSONString()
 	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrice)) })
 	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"pricing-usage-model":0.25}`))
@@ -292,12 +296,15 @@ func TestPricingSharedPluginVariantsUseEachSchemaAndExpression(t *testing.T) {
 	require.Len(t, mixed, 2)
 	assert.Equal(t, billing_setting.BillingModeRatio, mixed[0].BillingMode)
 	assert.Equal(t, billing_setting.BillingModeTieredExpr, mixed[1].BillingMode)
+	assert.Equal(t, billingexpr.CurrencyUSD, mixed[0].Currency)
+	assert.Equal(t, billingexpr.CurrencyCNY, mixed[1].Currency)
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: `{}`}))
 	InvalidatePricingCache()
 	perCall := pricingByModel(GetPricing())["pricing-usage-model"]
 	assert.Empty(t, perCall.BillingPluginVariants)
 	assert.Equal(t, 1, perCall.QuotaType)
 	assert.Equal(t, 0.25, perCall.ModelPrice)
+	assert.Equal(t, billingexpr.CurrencyUSD, perCall.Currency)
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
 		billing_setting.PluginBillingExprOption: `{"pricing-beta::pricing-usage-model":"tier(\"beta\", u(\"credits\") * 2)"}`,
 	}))
@@ -310,6 +317,66 @@ func TestPricingSharedPluginVariantsUseEachSchemaAndExpression(t *testing.T) {
 	encoded, err := common.Marshal(single)
 	require.NoError(t, err)
 	assert.Contains(t, string(encoded), "billing_plugin_variants")
+}
+
+func TestModelPricingNativeCurrencyPreviewAndSnapshot(t *testing.T) {
+	resetPricingEndpointTestTables(t)
+	require.NoError(t, DB.AutoMigrate(&Option{}))
+	require.NoError(t, DB.Where(commonKeyCol+" IN ?", modelPricingOptionKeys).Delete(&Option{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, DB.Where(commonKeyCol+" IN ?", modelPricingOptionKeys).Delete(&Option{}).Error)
+	})
+	saved := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() { require.NoError(t, config.GlobalConfig.LoadFromDB(saved)) })
+	const name = "native-currency-price"
+	const expression = `v2:CNY:tier("base", p * 2 + c * 8)`
+	expressions, err := common.Marshal(map[string]string{name: expression})
+	require.NoError(t, err)
+	options := map[string]string{
+		"billing_setting.billing_mode": `{"native-currency-price":"tiered_expr"}`,
+		"billing_setting.billing_expr": string(expressions),
+	}
+	for key, value := range options {
+		require.NoError(t, DB.Create(&Option{Key: key, Value: value}).Error)
+	}
+	require.NoError(t, config.GlobalConfig.LoadFromDB(options))
+	insertPricingEndpointChannel(t, 955, constant.ChannelTypeOpenAI, dto.ChannelOtherSettings{})
+	insertPricingEndpointAbility(t, 955, name)
+	pricing := pricingByModel(GetPricing())[name]
+	assert.Equal(t, billingexpr.CurrencyCNY, pricing.Currency)
+	assert.Equal(t, expression, pricing.BillingExpr)
+
+	snapshot, err := GetModelPricingSnapshot([]string{name})
+	require.NoError(t, err)
+	require.Len(t, snapshot.Entries, 1)
+	entry := snapshot.Entries[0]
+	assert.Equal(t, billingexpr.CurrencyCNY, entry.Currency)
+	assert.Equal(t, expression, entry.Effective["billing_setting.billing_expr"])
+	assert.Equal(t, expression, entry.Configured["billing_setting.billing_expr"])
+	var exported map[string]string
+	require.NoError(t, common.UnmarshalJsonStr(snapshot.Options["billing_setting.billing_expr"], &exported))
+	assert.Equal(t, expression, exported[name])
+
+	draft := PricingValues{"billing_setting.billing_mode": billing_setting.BillingModeTieredExpr, "billing_setting.billing_expr": expression}
+	preview, err := PreviewModelPricing(name, draft)
+	require.NoError(t, err)
+	assert.Equal(t, billingexpr.CurrencyCNY, ModelPricingCurrency(preview))
+	assert.Equal(t, expression, preview["billing_setting.billing_expr"])
+	conversion, err := PreviewModelPricingConversion(name, draft)
+	require.NoError(t, err)
+	assert.Equal(t, billingexpr.CurrencyCNY, conversion.Currency)
+
+	draft["billing_setting.billing_expr"] = `v2:USD:tier("base", p * 2 + c * 8)`
+	preview, err = PreviewModelPricing(name, draft)
+	require.NoError(t, err)
+	assert.Equal(t, billingexpr.CurrencyUSD, ModelPricingCurrency(preview))
+	assert.NotEqual(t, entry.Version, ModelPricingVersion(draft))
+	draft["billing_setting.billing_expr"] = `v2:EUR:p * 2`
+	_, err = PreviewModelPricing(name, draft)
+	require.ErrorContains(t, err, "unsupported expression currency")
+	preview, err = PreviewModelPricing(name, PricingValues{"ModelPrice": float64(1), "billing_setting.billing_mode": billing_setting.BillingModeRatio})
+	require.NoError(t, err)
+	assert.Equal(t, billingexpr.CurrencyUSD, ModelPricingCurrency(preview))
 }
 
 // Prices saved while a plugin fit stop fitting when it changes: a dropped model

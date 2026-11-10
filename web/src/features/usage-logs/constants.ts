@@ -194,6 +194,7 @@ export const TASK_ACTIONS = {
  * Task status
  */
 export const TASK_STATUS = {
+  AWAITING_REVIEW: 'AWAITING_REVIEW',
   NOT_START: 'NOT_START', // 未启动
   SUBMITTED: 'SUBMITTED', // 队列中
   IN_PROGRESS: 'IN_PROGRESS', // 执行中
@@ -310,6 +311,7 @@ export const TASK_ACTION_MAPPINGS: Record<string, StatusMapping> = {
  * Task status mappings
  */
 export const TASK_STATUS_MAPPINGS: Record<string, StatusMapping> = {
+  [TASK_STATUS.AWAITING_REVIEW]: { label: 'Awaiting review', variant: 'amber' },
   [TASK_STATUS.SUCCESS]: { label: 'Success', variant: 'green' },
   [TASK_STATUS.NOT_START]: { label: 'Not Started', variant: 'neutral' },
   [TASK_STATUS.SUBMITTED]: { label: 'Queued', variant: 'yellow' },

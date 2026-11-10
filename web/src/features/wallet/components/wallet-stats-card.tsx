@@ -16,13 +16,16 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useQuery } from '@tanstack/react-query'
 import { Activity, BarChart3, WalletCards } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { IconBadge, type IconBadgeTone } from '@/components/ui/icon-badge'
 import { Skeleton } from '@/components/ui/skeleton'
+import { formatBillingQuota } from '@/lib/currency'
 import { formatQuota } from '@/lib/format'
 
+import { getCurrencyWallet } from '../currency-api'
 import type { UserWalletData } from '../types'
 
 interface WalletStatsCardProps {
@@ -32,6 +35,11 @@ interface WalletStatsCardProps {
 
 export function WalletStatsCard(props: WalletStatsCardProps) {
   const { t } = useTranslation()
+  const cnyWallet = useQuery({
+    queryKey: ['currency-wallet', 'self', 'CNY'],
+    queryFn: () => getCurrencyWallet(),
+    enabled: props.user !== null,
+  })
   if (props.loading) {
     return (
       <div className='grid grid-cols-3 divide-x rounded-lg border'>
@@ -68,6 +76,26 @@ export function WalletStatsCard(props: WalletStatsCardProps) {
       tone: 'info',
     },
     {
+      label: t('CNY balance'),
+      value: cnyWallet.data
+        ? formatBillingQuota(cnyWallet.data.quota, 'CNY')
+        : '—',
+      description: cnyWallet.isError
+        ? t('Failed to load CNY wallet')
+        : t('CNY wallet; no exchange rate conversion'),
+      icon: WalletCards,
+      tone: 'success',
+    },
+    {
+      label: t('CNY consumption'),
+      value: cnyWallet.data
+        ? formatBillingQuota(cnyWallet.data.used_quota, 'CNY')
+        : '—',
+      description: t('Settled CNY consumption'),
+      icon: BarChart3,
+      tone: 'info',
+    },
+    {
       label: t('API Requests'),
       value: (props.user?.request_count ?? 0).toLocaleString(),
       description: t('Total requests made'),
@@ -77,7 +105,7 @@ export function WalletStatsCard(props: WalletStatsCardProps) {
   ]
 
   return (
-    <div className='grid grid-cols-3 divide-x rounded-lg border'>
+    <div className='grid grid-cols-2 divide-x rounded-lg border sm:grid-cols-5'>
       {stats.map((item) => (
         <div key={item.label} className='min-w-0 px-2.5 py-2.5 sm:px-5 sm:py-4'>
           <div className='flex items-center gap-1.5 sm:gap-2.5'>

@@ -85,6 +85,7 @@ function getLogTypeValue(value: unknown): LogTypeValue {
 }
 
 function buildSearchSourceKey(values: {
+  currency?: unknown
   startTime?: unknown
   endTime?: unknown
   channel?: unknown
@@ -97,6 +98,7 @@ function buildSearchSourceKey(values: {
   type?: unknown
 }) {
   return [
+    values.currency,
     values.startTime,
     values.endTime,
     values.channel,
@@ -149,6 +151,7 @@ export function CommonLogsFilterBar<TData>(
   const searchState = useMemo<CommonLogDraft>(() => {
     const { start, end } = getDefaultTimeRange()
     const sourceValues = {
+      currency: searchParams.currency,
       startTime: searchParams.startTime,
       endTime: searchParams.endTime,
       channel: searchParams.channel,
@@ -161,6 +164,7 @@ export function CommonLogsFilterBar<TData>(
       type: searchParams.type,
     }
     const filters: CommonLogFilters = {
+      currency: searchParams.currency,
       startTime: searchParams.startTime
         ? new Date(searchParams.startTime)
         : start,
@@ -179,6 +183,7 @@ export function CommonLogsFilterBar<TData>(
       logType: getLogTypeValue(searchParams.type),
     }
   }, [
+    searchParams.currency,
     searchParams.startTime,
     searchParams.endTime,
     searchParams.channel,
@@ -319,6 +324,31 @@ export function CommonLogsFilterBar<TData>(
     </Tooltip>
   )
 
+  const currencyFilter = (
+    <LogsFilterField>
+      <Select
+        items={[
+          { value: 'USD', label: 'USD' },
+          { value: 'CNY', label: 'CNY' },
+        ]}
+        value={filters.currency ?? 'USD'}
+        onValueChange={(value) => {
+          if (value === 'USD' || value === 'CNY') {
+            handleChange('currency', value)
+            handleApply({ ...filters, currency: value })
+          }
+        }}
+      >
+        <SelectTrigger aria-label={t('Billing currency')} className='h-8'>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value='USD'>USD</SelectItem>
+          <SelectItem value='CNY'>CNY</SelectItem>
+        </SelectContent>
+      </Select>
+    </LogsFilterField>
+  )
   const dateRangeFilter = (
     <LogsFilterField wide>
       <CompactDateTimeRangePicker
@@ -494,6 +524,7 @@ export function CommonLogsFilterBar<TData>(
       primaryFilters={
         <>
           {dateRangeFilter}
+          {currencyFilter}
           {modelFilter}
           {groupFilter}
           {typeFilter}
@@ -503,6 +534,7 @@ export function CommonLogsFilterBar<TData>(
       mobilePinnedFilters={dateRangeFilter}
       mobileFilters={
         <>
+          {currencyFilter}
           {modelFilter}
           {groupFilter}
           {typeFilter}

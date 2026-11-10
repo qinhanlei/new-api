@@ -72,6 +72,72 @@ async function chineseTranslator() {
 }
 
 describe('usage log CSV export', () => {
+  test.each([
+    { delta: 500000, after: 1000000, amount: '+¥1' },
+    { delta: -250000, after: 250000, amount: '-¥0.5' },
+  ])(
+    'exports native adjustment $amount with both balances and reason',
+    (scenario) => {
+      const t = (key: string) => key
+      const header = getLogCsvHeader(false, t)
+      const log: UsageLog = {
+        ...consumeLog,
+        type: 3,
+        currency: 'CNY',
+        quota: scenario.delta,
+        other: JSON.stringify({
+          delta_quota: scenario.delta,
+          before_quota: 500000,
+          after_quota: scenario.after,
+          reason: 'Reconciliation',
+        }),
+      }
+      const row = getLogCsvRow(log, false, t)
+      expect(row).toHaveLength(header.length)
+      expect(row[header.indexOf('Cost')]).toBe(scenario.amount)
+      expect(row[header.indexOf('Quota before adjustment')]).toBe('¥1')
+      expect(row[header.indexOf('Quota after adjustment')]).toBe(
+        `¥${scenario.after / 500000}`
+      )
+      expect(row[header.indexOf('Reason')]).toBe('Reconciliation')
+      expect(row[header.indexOf('Input Tokens')]).toBe('')
+      for (const legacy of [
+        { ...log, currency: 'USD' as const },
+        { ...log, other: '{}' },
+      ]) {
+        const legacyRow = getLogCsvRow(legacy, false, t)
+        for (const key of [
+          'Cost',
+          'Quota before adjustment',
+          'Quota after adjustment',
+          'Reason',
+        ]) {
+          expect(legacyRow[header.indexOf(key)]).toBe('')
+        }
+      }
+    }
+  )
+  test('exports native CNY and preserves pending reservation separately from settled cost', () => {
+    const t = (key: string) => key
+    const header = getLogCsvHeader(false, t)
+    const row = getLogCsvRow(
+      {
+        ...consumeLog,
+        currency: 'CNY',
+        quota: 0,
+        other: JSON.stringify({
+          billing_status: 'reserved',
+          reserved_quota: 250000,
+        }),
+      },
+      false,
+      t
+    )
+    expect(row[header.indexOf('Billing currency')]).toBe('CNY')
+    expect(row[header.indexOf('Billing status')]).toBe('Reserved')
+    expect(row[header.indexOf('Cost')]).toBe('¥0')
+    expect(row[header.indexOf('Reserved')]).toBe('¥0.5')
+  })
   test('header in the user view has no user or channel column', async () => {
     const t = await chineseTranslator()
 
@@ -111,6 +177,12 @@ describe('usage log CSV export', () => {
       '3s',
       '203.0.113.9',
       'req-1',
+      '',
+      'USD',
+      '',
+      '',
+      '',
+      '',
       '',
     ])
   })
@@ -154,7 +226,7 @@ describe('usage log CSV export', () => {
 
     expect(row.slice(1, 2)).toEqual(['充值'])
     expect(row.slice(5, 12)).toEqual(['', '', '', '', '', '', ''])
-    expect(row.at(-1)).toBe('充值 $5')
+    expect(row[getLogCsvHeader(false, t).indexOf('Details')]).toBe('充值 $5')
   })
 
   test('cells are quoted and text that starts a formula stays text', () => {

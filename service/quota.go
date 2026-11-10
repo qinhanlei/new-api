@@ -431,6 +431,9 @@ type postConsumeQuotaResult struct {
 }
 
 func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQuota int, sendEmail bool) error {
+	if IsCNYBilling(relayInfo) {
+		return fmt.Errorf("CNY billing cannot use the USD quota path")
+	}
 	_, err := postConsumeQuotaWithResult(relayInfo, quota, preConsumedQuota, sendEmail)
 	return err
 }

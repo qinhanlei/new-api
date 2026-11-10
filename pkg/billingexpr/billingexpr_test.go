@@ -11,6 +11,109 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestNativeCurrencyKeepsExpressionArithmeticAndQuotaScale(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		body      string
+		params    billingexpr.TokenParams
+		request   billingexpr.RequestInput
+		task      bool
+		wantQuota int
+		wantClamp bool
+	}{
+		{"token and cache prices", `tier("base", p * 2.5 + c * 15 + cr * 0.2)`, billingexpr.TokenParams{P: 125, C: 37, CR: 10}, billingexpr.RequestInput{}, false, 543, false},
+		{"task token price per million", `tier("video", u("tokens") * 10.43 / 1000000)`, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: map[string]any{"tokens": float64(1_000_000)}}, true, 6_518_750, false},
+		{"task unit price", `tier("video", u("seconds") * 0.4)`, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: map[string]any{"seconds": float64(10)}}, true, 2_500_000, false},
+		{"fixed request price", `tier("request", fixed(0.01))`, billingexpr.TokenParams{}, billingexpr.RequestInput{}, false, 6250, false},
+		{"explicit free price", `tier("free", fixed(0))`, billingexpr.TokenParams{}, billingexpr.RequestInput{}, false, 0, false},
+		{"oversized price", `tier("request", fixed(1e20))`, billingexpr.TokenParams{}, billingexpr.RequestInput{}, false, common.MaxQuota, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var original billingexpr.TieredResult
+			for _, definition := range []struct {
+				prefix   string
+				currency string
+				version  int
+			}{
+				{"", billingexpr.CurrencyUSD, 1},
+				{"v1:", billingexpr.CurrencyUSD, 1},
+				{"v2:USD:", billingexpr.CurrencyUSD, 2},
+				{"v2:CNY:", billingexpr.CurrencyCNY, 2},
+			} {
+				expression := definition.prefix + tc.body
+				currency, err := billingexpr.ExprCurrency(expression)
+				require.NoError(t, err)
+				assert.Equal(t, definition.currency, currency)
+				version, body := billingexpr.ParseExprVersion(expression)
+				assert.Equal(t, definition.version, version)
+				assert.Equal(t, tc.body, body)
+				snapshot := &billingexpr.BillingSnapshot{
+					Currency: currency, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
+					ExprVersion: version, GroupRatio: 1.25, QuotaPerUnit: 500000, TaskUsageBilling: tc.task,
+				}
+				result, err := billingexpr.ComputeTieredQuotaWithRequest(snapshot, tc.params, tc.request)
+				require.NoError(t, err)
+				assert.Equal(t, tc.wantQuota, result.ActualQuotaAfterGroup)
+				assert.Equal(t, tc.wantClamp, result.Clamp != nil)
+				if definition.prefix == "" {
+					original = result
+				} else {
+					assert.Equal(t, original, result, "currency must not change numeric settlement")
+					assert.NotEqual(t, billingexpr.ExprHashString(tc.body), snapshot.ExprHash)
+				}
+			}
+		})
+	}
+}
+
+func TestExpressionRejectsUnknownCurrencyAndVersion(t *testing.T) {
+	for _, tc := range []struct{ expression, message string }{
+		{`v2:EUR:p * 2`, "unsupported expression currency"},
+		{`v2:cny:p * 2`, "unsupported expression currency"},
+		{`v2::p * 2`, "unsupported expression currency"},
+		{`v2:CNY`, "requires a currency and body"},
+		{`v3:CNY:p * 2`, "unsupported expression version"},
+		{`v0:p * 2`, "unsupported expression version"},
+	} {
+		t.Run(tc.expression, func(t *testing.T) {
+			_, err := billingexpr.ExprCurrency(tc.expression)
+			require.ErrorContains(t, err, tc.message)
+			_, err = billingexpr.CompileFromCache(tc.expression)
+			require.ErrorContains(t, err, tc.message)
+			_, _, err = billingexpr.RunExpr(tc.expression, billingexpr.TokenParams{P: 1})
+			require.ErrorContains(t, err, tc.message)
+		})
+	}
+}
+
+func TestBillingSnapshotPreservesCurrencyThroughSerialization(t *testing.T) {
+	var historical billingexpr.BillingSnapshot
+	require.NoError(t, common.UnmarshalJsonStr(`{"expr_string":"p * 2","group_ratio":1,"quota_per_unit":500000}`, &historical))
+	historical.ExprHash = billingexpr.ExprHashString(historical.ExprString)
+	assert.Equal(t, billingexpr.CurrencyUSD, historical.BillingCurrency())
+	_, err := billingexpr.ComputeTieredQuota(&historical, billingexpr.TokenParams{P: 1})
+	require.NoError(t, err)
+
+	expression := `v2:CNY:p * 2`
+	snapshot := &billingexpr.BillingSnapshot{Currency: billingexpr.CurrencyCNY, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), ExprVersion: 2, GroupRatio: 1, QuotaPerUnit: 500000}
+	encoded, err := common.Marshal(snapshot)
+	require.NoError(t, err)
+	var restored billingexpr.BillingSnapshot
+	require.NoError(t, common.Unmarshal(encoded, &restored))
+	assert.Equal(t, billingexpr.CurrencyCNY, restored.BillingCurrency())
+	_, err = billingexpr.ComputeTieredQuota(&restored, billingexpr.TokenParams{P: 1})
+	require.NoError(t, err)
+	for _, currency := range []string{"", billingexpr.CurrencyUSD, "EUR"} {
+		restored.Currency = currency
+		_, err = billingexpr.ComputeTieredQuota(&restored, billingexpr.TokenParams{P: 1})
+		require.ErrorContains(t, err, "snapshot currency")
+	}
+	restored.Currency = billingexpr.CurrencyCNY
+	restored.ExprVersion = 3
+	_, err = billingexpr.ComputeTieredQuota(&restored, billingexpr.TokenParams{P: 1})
+	require.ErrorContains(t, err, "snapshot version")
+}
+
 func TestFixedPriceBranches(t *testing.T) {
 	const expression = `(len <= 32000 ? tier("short", fixed(0.01)) : tier("long", p * 2 + c * 8)) * (param("fast") == true ? 2 : 1)`
 	for _, tc := range []struct {

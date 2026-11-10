@@ -59,6 +59,7 @@ func PreviewModelPricing(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, model.ModelPricingDescription{
+		Currency:       model.ModelPricingCurrency(preview),
 		Effective:      preview,
 		CacheWriteMode: model.ResolveCacheWriteMode(request.ModelName, request.Pricing),
 		BillingDetails: model.ResolveLegacyBillingDetails(request.ModelName, preview, request.Pricing),

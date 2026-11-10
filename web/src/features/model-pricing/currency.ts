@@ -31,6 +31,12 @@ export const USD_PRICING_CURRENCY: PricingCurrency = {
   exchangeRate: 1,
 }
 
+export const CNY_PRICING_CURRENCY: PricingCurrency = {
+  label: 'CNY',
+  symbol: '¥',
+  exchangeRate: 1,
+}
+
 export function getSitePricingCurrency(
   config: CurrencyConfig
 ): PricingCurrency | null {

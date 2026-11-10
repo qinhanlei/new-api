@@ -78,9 +78,10 @@ function DetailPreview(props: {
   other: LogOtherData
   isAdmin: boolean
   type?: number
+  currency?: 'USD' | 'CNY'
 }) {
   const table = useReactTable({
-    data: [makeLog(props.other, props.type)],
+    data: [{ ...makeLog(props.other, props.type), currency: props.currency }],
     columns: useCommonLogsColumns(props.isAdmin, false),
     getCoreRowModel: getCoreRowModel(),
   })
@@ -99,11 +100,12 @@ const plugin = {
 }
 const previousConfig = useSystemConfigStore.getState().config
 let client: QueryClient
-const i18n = createInstance()
+let i18n: ReturnType<typeof createInstance>
 beforeEach(async () => {
+  i18n = createInstance()
   await i18n.init({
     lng: 'en',
-    resources: { en },
+    resources: { en, zh },
     interpolation: { escapeValue: false },
   })
   useSystemConfigStore
@@ -121,11 +123,21 @@ afterEach(() => {
   client.clear()
   useSystemConfigStore.getState().setConfig(previousConfig)
 })
-function renderPreview(other: LogOtherData, isAdmin = true, type?: number) {
+function renderPreview(
+  other: LogOtherData,
+  isAdmin = true,
+  type?: number,
+  currency?: 'USD' | 'CNY'
+) {
   render(
     <I18nextProvider i18n={i18n}>
       <QueryClientProvider client={client}>
-        <DetailPreview other={other} isAdmin={isAdmin} type={type} />
+        <DetailPreview
+          other={other}
+          isAdmin={isAdmin}
+          type={type}
+          currency={currency}
+        />
       </QueryClientProvider>
     </I18nextProvider>
   )
@@ -434,6 +446,53 @@ test('task log prices use localized unit labels from pricing metadata', async ()
   expect(
     screen.getByRole('button', { name: /images · images/ })
   ).toHaveTextContent('images · images $0.25/张')
+})
+
+test('CNY task log prices stay in CNY when the site display exchange rate changes', async () => {
+  client.setQueryData(['pricing'], {
+    data: [
+      {
+        model_name: 'wan2.5-i2v-preview',
+        billing_usage_schema: {
+          images: { type: 'number', unit: 'count', unitLabel: { en: 'image' } },
+        },
+      },
+    ],
+    vendors: [],
+  })
+  useSystemConfigStore
+    .getState()
+    .setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType: 'CNY',
+        usdExchangeRate: 7,
+      },
+    })
+  const preview = renderPreview(
+    {
+      is_task: true,
+      billing_mode: 'tiered_expr',
+      expr_b64: btoa('v2:CNY:tier("images", u("images") * 0.25)'),
+      matched_tier: 'images',
+    },
+    true,
+    2,
+    'CNY'
+  )
+  expect(preview).toHaveTextContent('images · images ¥0.25/image')
+  await act(() =>
+    useSystemConfigStore
+      .getState()
+      .setConfig({
+        currency: {
+          ...DEFAULT_CURRENCY_CONFIG,
+          quotaDisplayType: 'CNY',
+          usdExchangeRate: 14,
+        },
+      })
+  )
+  expect(preview).toHaveTextContent('images · images ¥0.25/image')
 })
 
 test('task log prices select the executing provider’s schema', () => {

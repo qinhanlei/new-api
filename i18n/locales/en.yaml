@@ -91,3 +91,15 @@ channel.upstream_update_added_models: "Added model examples (showing {{.Shown}}/
 channel.upstream_update_removed_models: "Removed model examples (showing {{.Shown}}/{{.Total}}): {{.Models}}"
 channel.upstream_update_failed_channels: "Failed channel IDs (showing {{.Shown}}/{{.Total}}): {{.Ids}}"
 channel.upstream_update_more_omitted: " ({{.Count}} more omitted)"
+
+# Native currency billing
+billing.currency_retry_mismatch: "Billing currency cannot change during a request retry"
+billing.usd_token_exhausted: "The USD budget of this token is exhausted"
+billing.currency_unsupported: "Unsupported billing currency"
+billing.cny_wallet_only: "CNY billing requires the CNY wallet; subscriptions are not supported"
+billing.cny_request_unsupported: "This endpoint does not support native CNY billing"
+billing.cny_paid_tools_unsupported: "Paid tools are not supported with native CNY billing"
+billing.cny_violation_fee_unsupported: "Native CNY billing does not support this configured violation fee"
+billing.cny_unavailable: "CNY billing is temporarily unavailable"
+billing.cny_insufficient_wallet: "Insufficient CNY wallet balance"
+billing.cny_insufficient_token: "The CNY budget of this token is disabled or insufficient"

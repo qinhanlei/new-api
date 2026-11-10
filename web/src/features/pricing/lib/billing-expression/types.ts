@@ -109,7 +109,8 @@ export type BillingRequestRule = {
 export type CompiledBillingExpression = {
   status: 'ready'
   source: string
-  version: 1
+  version: 1 | 2
+  currency: 'USD' | 'CNY'
   ast: ExpressionNode
   variables: ReadonlySet<BillingVariable>
   functions: ReadonlySet<string>

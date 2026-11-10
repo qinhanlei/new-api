@@ -73,10 +73,18 @@ function QuotaLogPreview(props: { log: UsageLog }) {
     .rows[0].getAllCells()
     .find((item) => item.column.id === 'content')
   if (!cell) throw new Error('The quota log must have a content column')
+  const costCell = table
+    .getRowModel()
+    .rows[0].getAllCells()
+    .find((item) => item.column.id === 'quota')
 
   return (
     <>
       {flexRender(cell.column.columnDef.cell, cell.getContext())}
+      <div data-testid='quota-cell'>
+        {costCell &&
+          flexRender(costCell.column.columnDef.cell, costCell.getContext())}
+      </div>
       <DetailsDialog
         log={props.log}
         isAdmin={false}
@@ -145,6 +153,83 @@ describe('quota adjustment log localization', () => {
     queryClient.clear()
     useSystemConfigStore.getState().setConfig(previousConfig)
   })
+
+  test.each([
+    { delta: 500000, before: 500000, after: 1000000, amount: '+¥1' },
+    { delta: -250000, before: 1000000, after: 750000, amount: '-¥0.5' },
+  ])(
+    'shows signed CNY adjustment $amount in the list and native balances in details',
+    async (scenario) => {
+      useSystemConfigStore.getState().setConfig({
+        currency: {
+          ...DEFAULT_CURRENCY_CONFIG,
+          quotaDisplayType: 'CNY',
+          usdExchangeRate: 19,
+        },
+      })
+      const i18n = createInstance()
+      await i18n.init({ lng: 'en', resources: { en } })
+      const log: UsageLog = {
+        id: 1,
+        user_id: 1,
+        created_at: 1,
+        type: 3,
+        currency: 'CNY',
+        content: 'Manual credit correction',
+        username: 'quota-user',
+        token_name: '',
+        model_name: '',
+        quota: scenario.delta,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        use_time: 0,
+        is_stream: false,
+        channel: 0,
+        channel_name: '',
+        token_id: 0,
+        group: '',
+        ip: '',
+        request_id: 'native-adjustment',
+        upstream_request_id: '',
+        other: JSON.stringify({
+          delta_quota: scenario.delta,
+          before_quota: scenario.before,
+          after_quota: scenario.after,
+          reason: 'Manual credit correction',
+        }),
+      }
+      const { rerender } = render(
+        <I18nextProvider i18n={i18n}>
+          <QueryClientProvider client={queryClient}>
+            <QuotaLogPreview log={log} />
+          </QueryClientProvider>
+        </I18nextProvider>
+      )
+      expect(
+        within(screen.getByTestId('quota-cell')).getByText(scenario.amount)
+      ).toBeInTheDocument()
+      const dialog = within(screen.getByRole('dialog'))
+      expect(dialog.getByText(scenario.amount)).toBeVisible()
+      expect(dialog.getByText('CNY')).toBeVisible()
+      expect(dialog.getByText('Quota before adjustment')).toBeVisible()
+      expect(dialog.getByText(`¥${scenario.before / 500000}`)).toBeVisible()
+      expect(dialog.getByText('Quota after adjustment')).toBeVisible()
+      expect(dialog.getByText(`¥${scenario.after / 500000}`)).toBeVisible()
+      expect(dialog.getByText('Reason')).toBeVisible()
+
+      rerender(
+        <I18nextProvider i18n={i18n}>
+          <QueryClientProvider client={queryClient}>
+            <QuotaLogPreview log={{ ...log, currency: 'USD' }} />
+          </QueryClientProvider>
+        </I18nextProvider>
+      )
+      expect(screen.getByTestId('quota-cell')).toBeEmptyDOMElement()
+      expect(
+        screen.queryByText('Quota before adjustment')
+      ).not.toBeInTheDocument()
+    }
+  )
 
   test.each(cases)(
     '$action switches language in the preview and details',

@@ -105,6 +105,37 @@ export interface CurrencyFormatOptions {
   locale?: Intl.LocalesArgument | undefined
 }
 
+export type BillingCurrency = 'USD' | 'CNY'
+
+/** Native balances and settled amounts must never depend on a display FX rate. */
+export function formatNativeMoney(
+  amount: number | null | undefined,
+  currency: BillingCurrency,
+  options?: CurrencyFormatOptions
+): string {
+  if (amount == null || !Number.isFinite(amount)) return '-'
+  return formatCurrencyValue(amount, mergeOptions(options), {
+    kind: 'currency',
+    symbol: currency === 'CNY' ? '¥' : '$',
+    currencyCode: currency,
+    exchangeRate: 1,
+  })
+}
+
+export function formatBillingQuota(
+  quota: number | null | undefined,
+  currency: BillingCurrency = 'USD',
+  options?: CurrencyFormatOptions,
+  quotaPerUnit = 500000
+): string {
+  if (currency === 'USD') return formatQuotaWithCurrency(quota, options)
+  return formatNativeMoney(
+    quota == null ? quota : quota / quotaPerUnit,
+    currency,
+    options
+  )
+}
+
 type ResolvedCurrencyFormatOptions = Omit<
   Required<CurrencyFormatOptions>,
   'locale'

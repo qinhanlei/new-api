@@ -24,6 +24,7 @@ import {
   splitBillingExprAndRequestRules,
   type ParsedTier,
 } from '@/features/pricing/lib/billing-expr'
+import { formatLogQuota } from '@/lib/format'
 import { translateServerText } from '@/lib/server-error-message'
 
 import type { UsageLog } from '../data/schema'
@@ -167,6 +168,32 @@ export function parseLogOther(other: string): LogOtherData | null {
     // eslint-disable-next-line no-console
     console.error('Failed to parse log other field:', error)
     return null
+  }
+}
+
+/** Native wallet adjustments are separate from legacy USD management logs. */
+export function getNativeQuotaAdjustment(
+  log: Pick<UsageLog, 'type' | 'currency'>,
+  other: LogOtherData | null
+) {
+  if (
+    log.currency !== 'CNY' ||
+    log.type !== 3 ||
+    typeof other?.delta_quota !== 'number' ||
+    !Number.isFinite(other.delta_quota) ||
+    typeof other.before_quota !== 'number' ||
+    !Number.isFinite(other.before_quota) ||
+    typeof other.after_quota !== 'number' ||
+    !Number.isFinite(other.after_quota)
+  ) {
+    return null
+  }
+  const sign = other.delta_quota > 0 ? '+' : ''
+  return {
+    amount: `${sign}${formatLogQuota(other.delta_quota, 'CNY')}`,
+    before: formatLogQuota(other.before_quota, 'CNY'),
+    after: formatLogQuota(other.after_quota, 'CNY'),
+    reason: typeof other.reason === 'string' ? other.reason : '',
   }
 }
 

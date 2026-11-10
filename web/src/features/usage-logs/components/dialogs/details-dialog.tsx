@@ -62,7 +62,7 @@ import { BILLING_PRICING_VARS } from '@/features/pricing/lib/billing-expr'
 import { pluginUsageSchema } from '@/features/pricing/lib/plugin-pricing'
 import { PolicyDecisionRecord } from '@/features/system-settings/request-policies/decision-record'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
-import { formatBillingCurrencyFromUSD } from '@/lib/currency'
+import { formatBillingCurrencyFromUSD, formatNativeMoney } from '@/lib/currency'
 import { formatLogQuota, formatTokens, formatUseTime } from '@/lib/format'
 import { translateServerText } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
@@ -71,6 +71,7 @@ import { AuditDetailFields } from '../../audit/components/audit-detail-fields'
 import type { UsageLog } from '../../data/schema'
 import {
   parseLogOther,
+  getNativeQuotaAdjustment,
   getParamOverrideActionLabel,
   parseAuditLine,
   decodeBillingExprB64,
@@ -181,7 +182,10 @@ function BillingBreakdown(props: {
 
   const rows: Array<{ label: string; value: string }> = []
   const priceOpts = { digitsLarge: 4, digitsSmall: 6, abbreviate: false }
-  const fmtPrice = (usd: number) => formatBillingCurrencyFromUSD(usd, priceOpts)
+  const fmtPrice = (amount: number) =>
+    log.currency === 'CNY'
+      ? formatNativeMoney(amount, 'CNY', priceOpts)
+      : formatBillingCurrencyFromUSD(amount, priceOpts)
   const baseInputUSD = other.model_ratio != null ? other.model_ratio * 2.0 : 0
 
   if (isTieredExpr) {
@@ -383,9 +387,26 @@ function BillingBreakdown(props: {
       )}
       <DetailRow
         label={t('Total Cost')}
-        value={formatLogQuota(log.quota)}
+        value={formatLogQuota(log.quota, log.currency)}
         mono
       />
+      {other.billing_status && (
+        <DetailRow
+          label={t('Billing status')}
+          value={t(
+            { reserved: 'Reserved', settled: 'Settled', refunded: 'Refunded' }[
+              other.billing_status
+            ]
+          )}
+        />
+      )}
+      {other.billing_status === 'reserved' && (
+        <DetailRow
+          label={t('Reserved')}
+          value={formatLogQuota(other.reserved_quota ?? 0, log.currency)}
+          mono
+        />
+      )}
     </DetailSection>
   )
 }
@@ -521,6 +542,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
   const { t } = useTranslation()
   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
   const other = parseLogOther(props.log.other)
+  const nativeAdjustment = getNativeQuotaAdjustment(props.log, other)
   const typeConfig = getLogTypeConfig(props.log.type)
 
   const isViolation = isViolationFeeLog(other)
@@ -916,7 +938,10 @@ export function DetailsDialog(props: DetailsDialogProps) {
             )}
             <DetailRow
               label={t('Fee Amount')}
-              value={formatLogQuota(other.fee_quota ?? props.log.quota)}
+              value={formatLogQuota(
+                other.fee_quota ?? props.log.quota,
+                props.log.currency
+              )}
               mono
             />
           </DetailSection>
@@ -1030,6 +1055,30 @@ export function DetailsDialog(props: DetailsDialogProps) {
         {quotaOperation && (
           <DetailSection label={t('Quota adjustment details')}>
             <AuditDetailFields fields={quotaOperation.fields} />
+          </DetailSection>
+        )}
+
+        {nativeAdjustment && (
+          <DetailSection label={t('Quota adjustment details')}>
+            <DetailRow label={t('Billing currency')} value='CNY' />
+            <DetailRow
+              label={t('Amount')}
+              value={nativeAdjustment.amount}
+              mono
+            />
+            <DetailRow
+              label={t('Quota before adjustment')}
+              value={nativeAdjustment.before}
+              mono
+            />
+            <DetailRow
+              label={t('Quota after adjustment')}
+              value={nativeAdjustment.after}
+              mono
+            />
+            {nativeAdjustment.reason && (
+              <DetailRow label={t('Reason')} value={nativeAdjustment.reason} />
+            )}
           </DetailSection>
         )}
 
