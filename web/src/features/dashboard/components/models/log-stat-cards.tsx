@@ -33,10 +33,12 @@ import type {
   DashboardFilters,
 } from '@/features/dashboard/types'
 import { toIntlLocale } from '@/i18n/languages'
-import { formatCompactNumber, formatNumber, formatQuota } from '@/lib/format'
+import { formatBillingQuota } from '@/lib/currency'
+import { formatCompactNumber, formatNumber } from '@/lib/format'
 import { computeTimeRange } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
+import { useSystemConfigStore } from '@/stores/system-config-store'
 
 interface LogStatCardsProps {
   filters?: DashboardFilters
@@ -60,6 +62,7 @@ function formatStatNumber(value: number, locale: Intl.LocalesArgument) {
 
 export function LogStatCards(props: LogStatCardsProps) {
   const { i18n } = useTranslation()
+  useSystemConfigStore((state) => state.config.currency.quotaPerUnit)
   const statCardsConfig = useModelStatCardsConfig()
   const user = useAuthStore((state) => state.auth.user)
   const isAdmin = !!(user?.role && user.role >= 10)
@@ -127,8 +130,8 @@ export function LogStatCards(props: LogStatCardsProps) {
     const formatted =
       config.key === 'quota'
         ? {
-            displayValue: formatQuota(rawValue),
-            fullValue: formatQuota(rawValue),
+            displayValue: formatBillingQuota(rawValue, 'USD', { locale }),
+            fullValue: formatBillingQuota(rawValue, 'USD', { locale }),
           }
         : formatStatNumber(rawValue, locale)
 

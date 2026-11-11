@@ -152,6 +152,49 @@ func TestCNYCurrencyEndpointsAuthorization(t *testing.T) {
 		assert.Equal(t, apiToken.Key, unchanged.Key)
 	})
 
+	t.Run("adjustment_modes_without_a_reason", func(t *testing.T) {
+		for _, step := range []struct {
+			body string
+			want int
+		}{
+			{`{"mode":"override","value":500,"operation_id":"api-mode-override"}`, 500},
+			{`{"mode":"add","value":100,"operation_id":"api-mode-add"}`, 600},
+			{`{"mode":"subtract","value":50,"operation_id":"api-mode-subtract"}`, 550},
+			{`{"mode":"override","value":500,"operation_id":"api-mode-override"}`, 550},
+			{`{"mode":"override","value":0,"operation_id":"api-mode-zero"}`, 0},
+			{`{"mode":"override","value":-50,"operation_id":"api-mode-negative"}`, -50},
+		} {
+			response := accessTokenRequest(router, http.MethodPost, adminPath, adminWrite, "", step.body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			var payload struct {
+				Data model.CNYWallet `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+			assert.Equal(t, step.want, payload.Data.Quota)
+		}
+		for _, body := range []string{
+			`{"mode":"add","value":0,"operation_id":"zero-add"}`,
+			`{"mode":"subtract","value":-1,"operation_id":"negative-subtract"}`,
+			`{"mode":"override","operation_id":"missing-value"}`,
+			`{"value":1,"operation_id":"missing-mode"}`,
+			`{"mode":"delta","value":1,"operation_id":"invalid-mode"}`,
+			`{"mode":"override","value":1,"delta_quota":1,"operation_id":"mixed-contract"}`,
+			`{"mode":"","delta_quota":1,"operation_id":"mixed-mode"}`,
+			`{"value":0,"delta_quota":1,"operation_id":"mixed-value"}`,
+		} {
+			response := accessTokenRequest(router, http.MethodPost, adminPath, adminWrite, "", body)
+			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+		}
+		response := accessTokenRequest(router, http.MethodPost, adminPath, adminWrite, "", `{"mode":"override","value":501,"operation_id":"api-mode-override"}`)
+		assert.Equal(t, http.StatusConflict, response.Code)
+		wallet, err := model.GetCNYWallet(owner.Id)
+		require.NoError(t, err)
+		assert.Equal(t, -50, wallet.Quota)
+		var record model.CNYBillingRecord
+		require.NoError(t, model.DB.Where("kind = ? AND request_id = ?", model.CNYBillingAdjustment, "api-mode-override").First(&record).Error)
+		assert.Equal(t, "CNY wallet adjustment", record.Reason)
+	})
+
 	t.Run("currency_and_audit", func(t *testing.T) {
 		response := accessTokenRequest(router, http.MethodGet, "/api/user/self/currency/USD", ownerRead, "", "")
 		assert.Equal(t, http.StatusBadRequest, response.Code)

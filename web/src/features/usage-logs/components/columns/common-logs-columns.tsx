@@ -48,7 +48,7 @@ import { pluginUsageSchema } from '@/features/pricing/lib/plugin-pricing'
 import { taskUsageUnitLabel } from '@/features/pricing/lib/task-price-display'
 import type { BillingUsageSchema } from '@/features/pricing/types'
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
-import { formatBillingCurrencyFromUSD, formatNativeMoney } from '@/lib/currency'
+import { formatNativeMoney } from '@/lib/currency'
 import { formatLogQuota, formatTimestampToDate } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { useSystemConfigStore } from '@/stores/system-config-store'
@@ -161,7 +161,7 @@ function buildTypeDetailSegments(
       })
     }
     segments.push({
-      text: `${t('Fee')}: ${formatLogQuota(other?.fee_quota ?? log.quota, log.currency)}`,
+      text: `${t('Fee')}: ${formatLogQuota(other?.fee_quota ?? log.quota, log.currency, other?.quota_per_unit)}`,
       muted: true,
     })
     return segments
@@ -173,9 +173,7 @@ function buildTypeDetailSegments(
 
   const priceOpts = { digitsLarge: 4, digitsSmall: 6, abbreviate: false }
   const formatPriceCompact = (price: number) =>
-    log.currency === 'CNY'
-      ? formatNativeMoney(price, 'CNY', priceOpts)
-      : formatBillingCurrencyFromUSD(price, priceOpts)
+    formatNativeMoney(price, log.currency ?? 'USD', priceOpts)
   const formatPrice = (price: number) => `${formatPriceCompact(price)}/M`
   const formatPriceList = (prices: string[], showUnit: boolean) => {
     const text = prices.join(' / ')
@@ -281,7 +279,7 @@ function buildTypeDetailSegments(
     const isPerCall = isPerCallBilling(modelPrice)
     if (isPerCall && modelPrice != null) {
       segments.push({
-        text: `${t('Per-call')} · ${formatBillingCurrencyFromUSD(modelPrice, priceOpts)}`,
+        text: `${t('Per-call')} · ${formatPriceCompact(modelPrice)}`,
       })
     } else if (other.model_ratio != null) {
       const inputPriceUSD = other.model_ratio * 2.0

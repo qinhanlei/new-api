@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, render, screen } from '@testing-library/react'
 import { createInstance } from 'i18next'
 import { I18nextProvider, initReactI18next } from 'react-i18next'
@@ -25,8 +26,13 @@ import { BillingHistoryDialog } from '@/features/wallet/components/dialogs/billi
 import en from '@/i18n/locales/en.json'
 import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
+import {
+  DEFAULT_CURRENCY_CONFIG,
+  useSystemConfigStore,
+} from '@/stores/system-config-store'
 
 import { RechargeFormCard } from '../components/recharge-form-card'
+import { WalletStatsCard } from '../components/wallet-stats-card'
 
 const i18n = createInstance()
 
@@ -125,3 +131,71 @@ it.each([
     expect(screen.getByPlaceholderText('Minimum 1')).toBeVisible()
   }
 )
+
+it('keeps USD and CNY wallet balances distinct when the reference display mode changes', async () => {
+  await i18n.changeLanguage('en')
+  const previousConfig = useSystemConfigStore.getState().config
+  const client = new QueryClient({
+    defaultOptions: { queries: { staleTime: Infinity } },
+  })
+  client.setQueryData(['currency-wallet', 'self', 'CNY'], {
+    currency: 'CNY',
+    quota: 3000000,
+    used_quota: 1500000,
+    quota_per_unit: 1000000,
+  })
+  const user = {
+    id: 1,
+    username: 'user',
+    quota: 2500000,
+    used_quota: 1250000,
+    request_count: 1234,
+    aff_quota: 0,
+    aff_history_quota: 0,
+    aff_count: 0,
+    group: 'default',
+  }
+  try {
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType: 'CNY',
+        usdExchangeRate: 7,
+      },
+    })
+    render(
+      <I18nextProvider i18n={i18n}>
+        <QueryClientProvider client={client}>
+          <WalletStatsCard user={user} />
+        </QueryClientProvider>
+      </I18nextProvider>
+    )
+    for (const label of [
+      'USD balance',
+      'USD consumption',
+      'CNY balance',
+      'CNY consumption',
+    ]) {
+      expect(screen.getAllByText(label)).toHaveLength(1)
+    }
+    for (const quotaDisplayType of ['CNY', 'CUSTOM', 'TOKENS'] as const) {
+      await act(() => {
+        useSystemConfigStore.getState().setConfig({
+          currency: {
+            ...DEFAULT_CURRENCY_CONFIG,
+            quotaDisplayType,
+            usdExchangeRate: 14,
+            customCurrencySymbol: '€',
+            customCurrencyExchangeRate: 0.8,
+          },
+        })
+      })
+      for (const value of ['$5', '$2.5', '¥3', '¥1.5']) {
+        expect(screen.getByText(value)).toBeVisible()
+      }
+    }
+  } finally {
+    client.clear()
+    useSystemConfigStore.getState().setConfig(previousConfig)
+  }
+})

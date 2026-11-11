@@ -21,7 +21,7 @@ import { useTranslation } from 'react-i18next'
 import { QuotaDetailsPopover } from '@/components/quota-details-popover'
 import { Progress } from '@/components/ui/progress'
 import { toIntlLocale } from '@/i18n/languages'
-import { formatQuotaWithCurrency, getCurrencyDisplay } from '@/lib/currency'
+import { formatBillingQuota } from '@/lib/currency'
 import { cn } from '@/lib/utils'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
@@ -36,9 +36,8 @@ type ApiKeyQuotaCellProps = {
 
 export function ApiKeyQuotaCell(props: ApiKeyQuotaCellProps) {
   const { t, i18n } = useTranslation()
-  useSystemConfigStore((state) => state.config.currency)
-  const { meta: currency } = getCurrencyDisplay()
-  const quotaUnit = currency.kind === 'tokens' ? t('Tokens') : currency.symbol
+  useSystemConfigStore((state) => state.config.currency.quotaPerUnit)
+  const quotaUnit = 'USD'
   const used = props.apiKey.used_quota
   const remaining = props.apiKey.remain_quota
   const total = used + remaining
@@ -46,11 +45,11 @@ export function ApiKeyQuotaCell(props: ApiKeyQuotaCellProps) {
   const percentage = hasProgress
     ? Math.min(100, Math.max(0, (remaining / total) * 100))
     : 0
-  const formattedUsed = formatQuotaWithCurrency(used, { showSymbol: false })
-  const formattedRemaining = formatQuotaWithCurrency(remaining, {
+  const formattedUsed = formatBillingQuota(used, 'USD', { showSymbol: false })
+  const formattedRemaining = formatBillingQuota(remaining, 'USD', {
     showSymbol: false,
   })
-  const formattedTotal = formatQuotaWithCurrency(total, { showSymbol: false })
+  const formattedTotal = formatBillingQuota(total, 'USD', { showSymbol: false })
   const formattedPercentage = new Intl.NumberFormat(
     toIntlLocale(i18n.resolvedLanguage || i18n.language),
     { maximumFractionDigits: 1 }

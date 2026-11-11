@@ -156,12 +156,37 @@ func cnyBalanceAfter(before, delta int) (int, error) {
 	return result, nil
 }
 
+type cnyWalletAdjustment struct {
+	Mode  string `json:"mode"`
+	Value int    `json:"value"`
+}
+
 func AdjustCNYWallet(userID, operatorID, operatorRole, deltaQuota int, operationID, reason string) (*CNYBillingRecord, error) {
-	if userID <= 0 || operatorID <= 0 || !cnyOperationID.MatchString(operationID) || strings.TrimSpace(reason) == "" || len(reason) > 2000 {
+	return adjustCNYWallet(userID, operatorID, operatorRole, cnyWalletAdjustment{Mode: "delta", Value: deltaQuota}, operationID, reason)
+}
+
+func AdjustCNYWalletByMode(userID, operatorID, operatorRole int, mode string, value int, operationID, reason string) (*CNYBillingRecord, error) {
+	if mode != "add" && mode != "subtract" && mode != "override" {
 		return nil, ErrCNYInvalid
+	}
+	if mode != "override" && value <= 0 {
+		return nil, ErrCNYInvalid
+	}
+	return adjustCNYWallet(userID, operatorID, operatorRole, cnyWalletAdjustment{Mode: mode, Value: value}, operationID, reason)
+}
+
+func adjustCNYWallet(userID, operatorID, operatorRole int, change cnyWalletAdjustment, operationID, reason string) (*CNYBillingRecord, error) {
+	if userID <= 0 || operatorID <= 0 || !cnyOperationID.MatchString(operationID) || len(reason) > 2000 {
+		return nil, ErrCNYInvalid
+	}
+	if change.Value > common.MaxWalletQuota || change.Value < -common.MaxWalletQuota {
+		return nil, ErrWalletQuotaLimitExceeded
 	}
 	if operatorRole != common.RoleRootUser && operatorRole != common.RoleAdminUser {
 		return nil, ErrUserQuotaPermission
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "CNY wallet adjustment"
 	}
 	var record CNYBillingRecord
 	err := DB.Transaction(func(tx *gorm.DB) error {
@@ -178,7 +203,24 @@ func AdjustCNYWallet(userID, operatorID, operatorRole, deltaQuota int, operation
 		}
 		err = tx.Where("kind = ? AND request_id = ?", CNYBillingAdjustment, operationID).First(&record).Error
 		if err == nil {
-			if record.UserID != userID || record.OperatorID != operatorID || record.DeltaQuota != deltaQuota || record.Reason != reason {
+			if record.UserID != userID || record.OperatorID != operatorID || record.Reason != reason {
+				return ErrCNYConflict
+			}
+			var metadata struct {
+				Adjustment *cnyWalletAdjustment `json:"wallet_adjustment"`
+			}
+			if record.Other != "" {
+				if err = common.UnmarshalJsonStr(record.Other, &metadata); err != nil {
+					return ErrCNYConflict
+				}
+			}
+			if metadata.Adjustment != nil {
+				if *metadata.Adjustment != change {
+					return ErrCNYConflict
+				}
+			} else if change.Mode != "delta" || record.DeltaQuota != change.Value {
+				// Historical adjustments only recorded a delta. Never interpret
+				// one as a replayable absolute balance override.
 				return ErrCNYConflict
 			}
 			return nil
@@ -186,14 +228,29 @@ func AdjustCNYWallet(userID, operatorID, operatorRole, deltaQuota int, operation
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
+		deltaQuota := change.Value
+		if change.Mode == "subtract" {
+			deltaQuota = -deltaQuota
+		} else if change.Mode == "override" {
+			// Derive the delta from the locked available balance, preserving
+			// in-flight reservations and already settled consumption.
+			deltaQuota, err = cnyBalanceAfter(change.Value, -wallet.Quota)
+			if err != nil {
+				return err
+			}
+		}
 		after, err := cnyBalanceAfter(wallet.Quota, deltaQuota)
+		if err != nil {
+			return err
+		}
+		metadata, err := common.Marshal(map[string]any{"wallet_adjustment": change})
 		if err != nil {
 			return err
 		}
 		now := common.GetTimestamp()
 		record = CNYBillingRecord{Kind: CNYBillingAdjustment, RequestID: operationID, Currency: "CNY", QuotaPerUnit: CNYQuotaPerUnit,
 			UserID: userID, Username: user.Username, OperatorID: operatorID, Status: CNYBillingSettled,
-			DeltaQuota: deltaQuota, BeforeQuota: wallet.Quota, AfterQuota: after, Reason: reason, CreatedAt: now, UpdatedAt: now, SettledAt: now}
+			DeltaQuota: deltaQuota, BeforeQuota: wallet.Quota, AfterQuota: after, Reason: reason, Other: string(metadata), CreatedAt: now, UpdatedAt: now, SettledAt: now}
 		wallet.Quota = after
 		wallet.Version++
 		if err = tx.Save(wallet).Error; err != nil {

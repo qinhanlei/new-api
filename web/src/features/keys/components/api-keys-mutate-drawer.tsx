@@ -65,7 +65,6 @@ import { Textarea } from '@/components/ui/textarea'
 import { RelatedPolicyLink } from '@/features/system-settings/request-policies/related-policy-link'
 import { useStatus } from '@/hooks/use-status'
 import { getUserModels, getUserGroups } from '@/lib/api'
-import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
 import { handleServerError } from '@/lib/handle-server-error'
 import {
   requireServerSuccess,
@@ -361,13 +360,11 @@ export function ApiKeysMutateDrawer({
     form.setValue('expired_time', now)
   }
 
-  const { meta: currencyMeta } = getCurrencyDisplay()
-  const currencyLabel = getCurrencyLabel()
-  const tokensOnly = currencyMeta.kind === 'tokens'
+  const currencyLabel = 'USD'
   const quotaLabel = t('Quota ({{currency}})', { currency: currencyLabel })
-  const quotaPlaceholder = tokensOnly
-    ? t('Enter quota in tokens')
-    : t('Enter quota in {{currency}}', { currency: currencyLabel })
+  const quotaPlaceholder = t('Enter quota in {{currency}}', {
+    currency: currencyLabel,
+  })
   const autoGroupsMode = form.watch('auto_groups_mode')
   const unlimitedQuota = form.watch('unlimited_quota')
 
@@ -623,7 +620,7 @@ export function ApiKeysMutateDrawer({
                         <Input
                           {...field}
                           type='number'
-                          step={tokensOnly ? 1 : 0.01}
+                          step={0.01}
                           placeholder={quotaPlaceholder}
                           onChange={(e) =>
                             field.onChange(
@@ -633,30 +630,14 @@ export function ApiKeysMutateDrawer({
                         />
                       </FormControl>
                       <FormDescription>
-                        {tokensOnly
-                          ? t('Enter the quota amount in tokens')
-                          : t('Enter the quota amount in {{currency}}', {
-                              currency: currencyLabel,
-                            })}
+                        {t('Enter the quota amount in {{currency}}', {
+                          currency: currencyLabel,
+                        })}
                       </FormDescription>
                       <FormMessage />
                     </FormItem>
                   )}
                 />
-              )}
-
-              {currentRowId !== undefined ? (
-                <TokenCurrencyBudget
-                  key={currentRowId}
-                  tokenId={currentRowId}
-                  open={open}
-                />
-              ) : (
-                <p className='text-muted-foreground text-xs'>
-                  {t(
-                    'Create the API key first, then enable its CNY budget from Edit.'
-                  )}
-                </p>
               )}
 
               <FormField
@@ -681,6 +662,19 @@ export function ApiKeysMutateDrawer({
                   </FormItem>
                 )}
               />
+              {currentRowId !== undefined ? (
+                <TokenCurrencyBudget
+                  key={currentRowId}
+                  tokenId={currentRowId}
+                  open={open}
+                />
+              ) : (
+                <p className='text-muted-foreground text-xs'>
+                  {t(
+                    'Create the API key first, then enable its CNY budget from Edit.'
+                  )}
+                </p>
+              )}
             </SideDrawerSection>
 
             <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>

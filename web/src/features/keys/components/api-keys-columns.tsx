@@ -26,9 +26,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { useMediaQuery } from '@/hooks'
 import { toIntlLocale } from '@/i18n/languages'
 import { getUserGroups } from '@/lib/api'
-import { getCurrencyDisplay } from '@/lib/currency'
 import { requireServerSuccess } from '@/lib/server-error-message'
-import { useSystemConfigStore } from '@/stores/system-config-store'
 
 import { API_KEY_STATUSES } from '../constants'
 import type { ApiKey } from '../types'
@@ -69,9 +67,6 @@ function useGroupRatios(): Record<string, number | string> {
 
 export function useApiKeysColumns(now: number): ColumnDef<ApiKey>[] {
   const { t, i18n } = useTranslation()
-  useSystemConfigStore((state) => state.config.currency)
-  const { meta: currency } = getCurrencyDisplay()
-  const quotaUnit = currency.kind === 'tokens' ? t('Tokens') : currency.symbol
   const groupRatios = useGroupRatios()
   const shouldReduceMotion = useMediaQuery('(prefers-reduced-motion: reduce)')
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
@@ -143,7 +138,7 @@ export function useApiKeysColumns(now: number): ColumnDef<ApiKey>[] {
       {
         id: 'quota',
         accessorKey: 'remain_quota',
-        header: `${t('Quota')} (${quotaUnit})`,
+        header: `${t('Quota')} (USD)`,
         cell: ({ row }) => <ApiKeyQuotaCell apiKey={row.original} now={now} />,
         size: 260,
         minSize: 260,
@@ -233,6 +228,6 @@ export function useApiKeysColumns(now: number): ColumnDef<ApiKey>[] {
         meta: { pinned: 'right' as const },
       },
     ],
-    [t, quotaUnit, now, groupRatios, shouldReduceMotion, locale, justNowLabel]
+    [t, now, groupRatios, shouldReduceMotion, locale, justNowLabel]
   )
 }

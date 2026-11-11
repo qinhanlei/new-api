@@ -17,7 +17,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useRef, useState } from 'react'
+import { nanoid } from 'nanoid'
+import { useId, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -28,6 +29,7 @@ import { Label } from '@/components/ui/label'
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
   SelectTrigger,
   SelectValue,
@@ -37,12 +39,10 @@ import {
   adjustCurrencyWallet,
 } from '@/features/wallet/currency-api'
 import {
-  getCurrencyDisplay,
-  getCurrencyLabel,
+  billingAmountToQuota,
   formatBillingQuota,
   type BillingCurrency,
 } from '@/lib/currency'
-import { formatQuota, parseQuotaFromDollars } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
 import { cn } from '@/lib/utils'
 
@@ -59,12 +59,13 @@ interface UserQuotaDialogProps {
 
 export function UserQuotaDialog(props: UserQuotaDialogProps) {
   const { t } = useTranslation()
+  const id = useId()
   const queryClient = useQueryClient()
   const [mode, setMode] = useState<QuotaAdjustMode>('add')
   const [amount, setAmount] = useState('')
   const [loading, setLoading] = useState(false)
   const [billingCurrency, setBillingCurrency] = useState<BillingCurrency>('USD')
-  const [reason, setReason] = useState('')
+  const submitting = useRef(false)
   const adjustmentAttempt = useRef<{
     fingerprint: string
     operationId: string
@@ -75,66 +76,71 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
     enabled: props.open && billingCurrency === 'CNY',
   })
 
-  const { meta: currencyMeta } = getCurrencyDisplay()
-  const currencyLabel = billingCurrency === 'CNY' ? 'CNY' : getCurrencyLabel()
-  const tokensOnly = billingCurrency === 'USD' && currencyMeta.kind === 'tokens'
-
-  const amountValue = Number.parseFloat(amount) || 0
-  const quotaValue =
-    billingCurrency === 'CNY'
-      ? Math.round(Math.abs(amountValue) * 500000)
-      : parseQuotaFromDollars(Math.abs(amountValue))
+  const quotaPerUnit =
+    billingCurrency === 'CNY' ? cnyWallet.data?.quota_per_unit : undefined
+  const amountValue = Number(amount)
+  const quotaValue = billingAmountToQuota(
+    mode === 'override' ? amountValue : Math.abs(amountValue),
+    billingCurrency,
+    quotaPerUnit
+  )
+  const validAmount =
+    Number.isFinite(amountValue) &&
+    Number.isSafeInteger(quotaValue) &&
+    (mode === 'override' || quotaValue > 0)
+  const walletReady = billingCurrency === 'USD' || !!cnyWallet.data
 
   const getPreviewText = () => {
-    if (billingCurrency === 'CNY') {
-      if (!cnyWallet.data) {
-        return t(cnyWallet.isError ? 'Failed to load CNY wallet' : 'Loading...')
-      }
-      const delta = mode === 'subtract' ? -quotaValue : quotaValue
-      return `${formatBillingQuota(cnyWallet.data.quota, 'CNY')} → ${formatBillingQuota(cnyWallet.data.quota + delta, 'CNY')}`
+    if (billingCurrency === 'CNY' && !cnyWallet.data) {
+      return t(cnyWallet.isError ? 'Failed to load CNY wallet' : 'Loading...')
     }
-    const current = props.currentQuota
-    const val = quotaValue
+    const current =
+      billingCurrency === 'CNY'
+        ? (cnyWallet.data?.quota ?? 0)
+        : props.currentQuota
+    const options = { digitsLarge: 2, digitsSmall: 4, abbreviate: true }
+    const currentDisplay = formatBillingQuota(
+      current,
+      billingCurrency,
+      options,
+      quotaPerUnit
+    )
+    const amountDisplay = formatBillingQuota(
+      quotaValue,
+      billingCurrency,
+      options,
+      quotaPerUnit
+    )
     switch (mode) {
       case 'add':
-        return `${t('Current quota')}: ${formatQuota(current)}  +${formatQuota(val)} = ${formatQuota(current + val)}`
+        return `${t('Current quota')}: ${currentDisplay}  +${amountDisplay} = ${formatBillingQuota(current + quotaValue, billingCurrency, options, quotaPerUnit)}`
       case 'subtract':
-        return `${t('Current quota')}: ${formatQuota(current)}  -${formatQuota(val)} = ${formatQuota(current - val)}`
-      case 'override': {
-        const overrideQuota = parseQuotaFromDollars(amountValue)
-        return `${t('Current quota')}: ${formatQuota(current)} → ${formatQuota(overrideQuota)}`
-      }
+        return `${t('Current quota')}: ${currentDisplay}  -${amountDisplay} = ${formatBillingQuota(current - quotaValue, billingCurrency, options, quotaPerUnit)}`
+      case 'override':
+        return `${t('Current quota')}: ${currentDisplay} → ${amountDisplay}`
       default:
         return ''
     }
   }
 
   const handleConfirm = async () => {
-    if (!amount && mode !== 'override') return
-    if (quotaValue <= 0 && mode !== 'override') return
+    if (submitting.current || !validAmount || !walletReady) return
 
+    submitting.current = true
     setLoading(true)
     try {
       if (billingCurrency === 'CNY') {
-        if (
-          !reason.trim() ||
-          !Number.isSafeInteger(quotaValue) ||
-          quotaValue <= 0
-        ) {
-          return
-        }
-        const delta = mode === 'subtract' ? -quotaValue : quotaValue
-        const fingerprint = JSON.stringify([props.userId, delta, reason.trim()])
+        const fingerprint = JSON.stringify([props.userId, mode, quotaValue])
         if (adjustmentAttempt.current?.fingerprint !== fingerprint) {
           adjustmentAttempt.current = {
             fingerprint,
-            operationId: crypto.randomUUID(),
+            operationId: `cny-${nanoid()}`,
           }
         }
         const updated = await adjustCurrencyWallet(props.userId, {
-          delta_quota: delta,
+          mode,
+          value: quotaValue,
           operation_id: adjustmentAttempt.current.operationId,
-          reason: reason.trim(),
         })
         queryClient.setQueryData(
           ['currency-wallet', props.userId, 'CNY'],
@@ -146,18 +152,16 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
         adjustmentAttempt.current = null
         toast.success(t('Quota adjusted successfully'))
         setAmount('')
-        setReason('')
+        setMode('add')
         props.onOpenChange(false)
         props.onSuccess()
         return
       }
-      const value =
-        mode === 'override' ? parseQuotaFromDollars(amountValue) : quotaValue
       const result = await adjustUserQuota({
         id: props.userId,
         action: 'add_quota',
         mode,
-        value: mode === 'override' ? value : Math.abs(value),
+        value: quotaValue,
       })
       if (result.success) {
         toast.success(t('Quota adjusted successfully'))
@@ -171,6 +175,7 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
     } catch (e: unknown) {
       handleServerError(e, t('Failed to adjust quota'))
     } finally {
+      submitting.current = false
       setLoading(false)
     }
   }
@@ -181,9 +186,9 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
     props.onOpenChange(false)
   }
 
-  const placeholder = tokensOnly
-    ? t('Enter amount in tokens')
-    : t('Enter amount in {{currency}}', { currency: currencyLabel })
+  const placeholder = t('Enter amount in {{currency}}', {
+    currency: billingCurrency,
+  })
 
   return (
     <Dialog
@@ -200,11 +205,7 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
           </Button>
           <Button
             onClick={handleConfirm}
-            disabled={
-              loading ||
-              (billingCurrency === 'CNY' &&
-                (!cnyWallet.data || !reason.trim() || quotaValue <= 0))
-            }
+            disabled={loading || !validAmount || !walletReady}
           >
             {loading ? t('Processing...') : t('Confirm')}
           </Button>
@@ -213,7 +214,7 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
     >
       <div className='space-y-4'>
         <div className='space-y-2'>
-          <Label>{t('Billing currency')}</Label>
+          <Label htmlFor={`${id}-currency`}>{t('Billing currency')}</Label>
           <Select
             value={billingCurrency}
             items={[
@@ -229,12 +230,17 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
               }
             }}
           >
-            <SelectTrigger aria-label={t('Billing currency')}>
+            <SelectTrigger
+              id={`${id}-currency`}
+              aria-label={t('Billing currency')}
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value='USD'>USD</SelectItem>
-              <SelectItem value='CNY'>CNY</SelectItem>
+              <SelectGroup>
+                <SelectItem value='USD'>USD</SelectItem>
+                <SelectItem value='CNY'>CNY</SelectItem>
+              </SelectGroup>
             </SelectContent>
           </Select>
         </div>
@@ -243,40 +249,40 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
         <div className='space-y-2'>
           <Label>{t('Mode')}</Label>
           <div className='flex gap-1'>
-            {(['add', 'subtract', 'override'] as const)
-              .filter((m) => billingCurrency === 'USD' || m !== 'override')
-              .map((m) => (
-                <Button
-                  key={m}
-                  type='button'
-                  variant='outline'
-                  size='sm'
-                  disabled={loading}
-                  className={cn(
-                    mode === m &&
-                      'bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground'
-                  )}
-                  onClick={() => {
-                    setMode(m)
-                    setAmount('')
-                  }}
-                >
-                  {m === 'add' && t('Add')}
-                  {!(m === 'add') && m === 'subtract' && t('Subtract')}
-                  {!(m === 'add') && !(m === 'subtract') && t('Override')}
-                </Button>
-              ))}
+            {(['add', 'subtract', 'override'] as const).map((m) => (
+              <Button
+                key={m}
+                type='button'
+                variant='outline'
+                size='sm'
+                disabled={loading}
+                aria-pressed={mode === m}
+                className={cn(
+                  mode === m &&
+                    'bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground'
+                )}
+                onClick={() => {
+                  setMode(m)
+                  setAmount('')
+                }}
+              >
+                {m === 'add' && t('Add')}
+                {!(m === 'add') && m === 'subtract' && t('Subtract')}
+                {!(m === 'add') && !(m === 'subtract') && t('Override')}
+              </Button>
+            ))}
           </div>
         </div>
 
         <div className='space-y-2'>
-          <Label>
-            {t('Amount')} ({currencyLabel})
+          <Label htmlFor={`${id}-amount`}>
+            {t('Amount')} ({billingCurrency})
           </Label>
           <Input
+            id={`${id}-amount`}
             aria-label={t('Amount')}
             type='number'
-            step={tokensOnly ? 1 : 0.000001}
+            step={0.000001}
             min={mode === 'override' ? undefined : 0}
             placeholder={placeholder}
             value={amount}
@@ -287,18 +293,6 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
             }}
           />
         </div>
-        {billingCurrency === 'CNY' && (
-          <div className='space-y-2'>
-            <Label htmlFor='cny-adjustment-reason'>{t('Reason')}</Label>
-            <Input
-              id='cny-adjustment-reason'
-              value={reason}
-              disabled={loading}
-              onChange={(event) => setReason(event.target.value)}
-              maxLength={255}
-            />
-          </div>
-        )}
       </div>
     </Dialog>
   )

@@ -238,13 +238,19 @@ export function formatTimeStr(date: Date): string {
  */
 export function formatLogQuota(
   quota: number,
-  currency: BillingCurrency = 'USD'
+  currency: BillingCurrency = 'USD',
+  quotaPerUnit?: number
 ): string {
-  return formatBillingQuota(quota, currency, {
-    digitsLarge: 4,
-    digitsSmall: 6,
-    abbreviate: false,
-  })
+  return formatBillingQuota(
+    quota,
+    currency,
+    {
+      digitsLarge: 4,
+      digitsSmall: 6,
+      abbreviate: false,
+    },
+    quotaPerUnit
+  )
 }
 
 /**

@@ -460,15 +460,13 @@ test('CNY task log prices stay in CNY when the site display exchange rate change
     ],
     vendors: [],
   })
-  useSystemConfigStore
-    .getState()
-    .setConfig({
-      currency: {
-        ...DEFAULT_CURRENCY_CONFIG,
-        quotaDisplayType: 'CNY',
-        usdExchangeRate: 7,
-      },
-    })
+  useSystemConfigStore.getState().setConfig({
+    currency: {
+      ...DEFAULT_CURRENCY_CONFIG,
+      quotaDisplayType: 'CNY',
+      usdExchangeRate: 7,
+    },
+  })
   const preview = renderPreview(
     {
       is_task: true,
@@ -482,15 +480,13 @@ test('CNY task log prices stay in CNY when the site display exchange rate change
   )
   expect(preview).toHaveTextContent('images · images ¥0.25/image')
   await act(() =>
-    useSystemConfigStore
-      .getState()
-      .setConfig({
-        currency: {
-          ...DEFAULT_CURRENCY_CONFIG,
-          quotaDisplayType: 'CNY',
-          usdExchangeRate: 14,
-        },
-      })
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType: 'CNY',
+        usdExchangeRate: 14,
+      },
+    })
   )
   expect(preview).toHaveTextContent('images · images ¥0.25/image')
 })
@@ -558,5 +554,21 @@ test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
     expect(preview.textContent).toBe(
       `Dynamic Pricing · ${scenario === 'unknown tier' ? 'old' : 'music'}`
     )
+  }
+)
+
+test.each(['CNY', 'CUSTOM', 'TOKENS'] as const)(
+  'keeps historical USD per-call prices in USD in %s display mode',
+  (quotaDisplayType) => {
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType,
+        usdExchangeRate: 7,
+        customCurrencyExchangeRate: 0.8,
+      },
+    })
+    const preview = renderPreview({ model_price: 0.25 })
+    expect(preview).toHaveTextContent('Per-call · $0.25')
   }
 )

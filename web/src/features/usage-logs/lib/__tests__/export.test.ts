@@ -17,7 +17,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { createInstance } from 'i18next'
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test } from 'vitest'
+
+import {
+  DEFAULT_CURRENCY_CONFIG,
+  useSystemConfigStore,
+} from '@/stores/system-config-store'
 
 import type { UsageLog } from '../../data/schema'
 import { getLogCsvHeader, getLogCsvRow, toCsvLine } from '../export'
@@ -235,3 +240,35 @@ describe('usage log CSV export', () => {
     ).toBe(`"'=HYPERLINK(""x"")","-12.5","'+cmd","a""b","two\nlines"\r\n`)
   })
 })
+
+afterEach(() => {
+  useSystemConfigStore
+    .getState()
+    .setConfig({ currency: { ...DEFAULT_CURRENCY_CONFIG } })
+})
+
+test.each(['USD', 'CNY'] as const)(
+  'exports %s amounts using their recorded scale without display FX conversion',
+  (currency) => {
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType: 'CNY',
+        usdExchangeRate: 7,
+        quotaPerUnit: 1000000,
+      },
+    })
+    const t = (key: string) => key
+    const header = getLogCsvHeader(false, t)
+    const row = getLogCsvRow(
+      {
+        ...consumeLog,
+        currency,
+        other: JSON.stringify({ quota_per_unit: 250000 }),
+      },
+      false,
+      t
+    )
+    expect(row[header.indexOf('Cost')]).toBe(currency === 'USD' ? '$1' : '¥1')
+  }
+)

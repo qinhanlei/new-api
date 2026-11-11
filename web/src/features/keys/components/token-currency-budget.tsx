@@ -24,11 +24,20 @@ import { toast } from 'sonner'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
 import { Button } from '@/components/ui/button'
-import { Field, FieldLabel } from '@/components/ui/field'
+import {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldLabel,
+} from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { api } from '@/lib/api'
-import { formatBillingQuota } from '@/lib/currency'
+import {
+  billingAmountToQuota,
+  billingQuotaToAmount,
+  formatBillingQuota,
+} from '@/lib/currency'
 import { handleServerError } from '@/lib/handle-server-error'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
@@ -100,11 +109,7 @@ export function TokenCurrencyBudget(props: { tokenId: number; open: boolean }) {
   return (
     <div className='space-y-3 rounded-lg border p-3'>
       <p className='text-sm font-medium'>{t('CNY token budget')}</p>
-      <p className='text-muted-foreground text-xs'>
-        {t(
-          'Saved separately. CNY requests also require sufficient CNY wallet balance.'
-        )}
-      </p>
+      <p className='text-muted-foreground text-xs'>{t('Saved separately.')}</p>
       {!values && budget.isError && (
         <ErrorState
           className='min-h-0 py-3'
@@ -138,11 +143,22 @@ export function TokenCurrencyBudget(props: { tokenId: number; open: boolean }) {
             />
           </Field>
           <Field orientation='horizontal'>
-            <FieldLabel htmlFor={`${id}-unlimited`}>
-              {t('Unlimited CNY quota')}
-            </FieldLabel>
+            <FieldContent>
+              <FieldLabel htmlFor={`${id}-unlimited`}>
+                {t('Unlimited CNY quota for this key')}
+              </FieldLabel>
+              <FieldDescription
+                id={`${id}-unlimited-description`}
+                className='text-xs'
+              >
+                {t(
+                  'Limits CNY-priced model usage. Wallet funds are still required.'
+                )}
+              </FieldDescription>
+            </FieldContent>
             <Switch
               id={`${id}-unlimited`}
+              aria-describedby={`${id}-unlimited-description`}
               disabled={saving || !values.enabled}
               checked={values.unlimited_quota}
               onCheckedChange={(unlimited_quota) =>
@@ -160,13 +176,19 @@ export function TokenCurrencyBudget(props: { tokenId: number; open: boolean }) {
                 type='number'
                 min={0}
                 step={0.000002}
-                value={values.remain_quota / 500000}
+                value={billingQuotaToAmount(
+                  values.remain_quota,
+                  'CNY',
+                  values.quota_per_unit
+                )}
                 disabled={saving || !values.enabled}
                 onChange={(event) =>
                   setDraft({
                     ...values,
-                    remain_quota: Math.round(
-                      Number(event.target.value) * 500000
+                    remain_quota: billingAmountToQuota(
+                      Number(event.target.value),
+                      'CNY',
+                      values.quota_per_unit
                     ),
                   })
                 }
@@ -175,7 +197,12 @@ export function TokenCurrencyBudget(props: { tokenId: number; open: boolean }) {
           )}
           <p className='text-muted-foreground text-xs'>
             {t('CNY consumption')}:{' '}
-            {formatBillingQuota(values.used_quota, 'CNY')}
+            {formatBillingQuota(
+              values.used_quota,
+              'CNY',
+              undefined,
+              values.quota_per_unit
+            )}
           </p>
           <div className='flex gap-2'>
             <Button

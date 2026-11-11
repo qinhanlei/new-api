@@ -99,7 +99,9 @@ export function getLogCsvRow(
     usage ? String(other?.cache_tokens ?? 0) : '',
     usage ? String(cacheWrite) : '',
     adjustment?.amount ??
-      (usage ? formatLogQuota(log.quota ?? 0, log.currency) : ''),
+      (usage
+        ? formatLogQuota(log.quota ?? 0, log.currency, other?.quota_per_unit)
+        : ''),
     isTimingLogType(log.type) ? `${log.use_time ?? 0}s` : '',
     log.ip ?? '',
     log.request_id ?? '',
@@ -113,7 +115,11 @@ export function getLogCsvRow(
         )
       : '',
     other?.billing_status === 'reserved'
-      ? formatLogQuota(other.reserved_quota ?? 0, log.currency)
+      ? formatLogQuota(
+          other.reserved_quota ?? 0,
+          log.currency,
+          other?.quota_per_unit
+        )
       : '',
     adjustment?.before ?? '',
     adjustment?.after ?? '',

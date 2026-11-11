@@ -22,8 +22,10 @@ import { useTranslation } from 'react-i18next'
 
 import { IconBadge, type IconBadgeTone } from '@/components/ui/icon-badge'
 import { Skeleton } from '@/components/ui/skeleton'
+import { toIntlLocale } from '@/i18n/languages'
 import { formatBillingQuota } from '@/lib/currency'
-import { formatQuota } from '@/lib/format'
+import { formatNumber } from '@/lib/format'
+import { useSystemConfigStore } from '@/stores/system-config-store'
 
 import { getCurrencyWallet } from '../currency-api'
 import type { UserWalletData } from '../types'
@@ -34,7 +36,9 @@ interface WalletStatsCardProps {
 }
 
 export function WalletStatsCard(props: WalletStatsCardProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  useSystemConfigStore((state) => state.config.currency.quotaPerUnit)
   const cnyWallet = useQuery({
     queryKey: ['currency-wallet', 'self', 'CNY'],
     queryFn: () => getCurrencyWallet(),
@@ -62,23 +66,28 @@ export function WalletStatsCard(props: WalletStatsCardProps) {
     tone: IconBadgeTone
   }[] = [
     {
-      label: t('Current Balance'),
-      value: formatQuota(props.user?.quota ?? 0),
+      label: t('USD balance'),
+      value: formatBillingQuota(props.user?.quota ?? 0, 'USD', { locale }),
       description: t('Remaining quota'),
       icon: WalletCards,
       tone: 'success',
     },
     {
-      label: t('Total Usage'),
-      value: formatQuota(props.user?.used_quota ?? 0),
-      description: t('Total consumed quota'),
+      label: t('USD consumption'),
+      value: formatBillingQuota(props.user?.used_quota ?? 0, 'USD', { locale }),
+      description: t('USD model consumption'),
       icon: BarChart3,
       tone: 'info',
     },
     {
       label: t('CNY balance'),
       value: cnyWallet.data
-        ? formatBillingQuota(cnyWallet.data.quota, 'CNY')
+        ? formatBillingQuota(
+            cnyWallet.data.quota,
+            'CNY',
+            { locale },
+            cnyWallet.data.quota_per_unit
+          )
         : '—',
       description: cnyWallet.isError
         ? t('Failed to load CNY wallet')
@@ -89,15 +98,20 @@ export function WalletStatsCard(props: WalletStatsCardProps) {
     {
       label: t('CNY consumption'),
       value: cnyWallet.data
-        ? formatBillingQuota(cnyWallet.data.used_quota, 'CNY')
+        ? formatBillingQuota(
+            cnyWallet.data.used_quota,
+            'CNY',
+            { locale },
+            cnyWallet.data.quota_per_unit
+          )
         : '—',
-      description: t('Settled CNY consumption'),
+      description: t('CNY model consumption'),
       icon: BarChart3,
       tone: 'info',
     },
     {
       label: t('API Requests'),
-      value: (props.user?.request_count ?? 0).toLocaleString(),
+      value: formatNumber(props.user?.request_count ?? 0, locale),
       description: t('Total requests made'),
       icon: Activity,
       tone: 'chart-4',

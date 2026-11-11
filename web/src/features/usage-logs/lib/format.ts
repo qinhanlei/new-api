@@ -190,9 +190,9 @@ export function getNativeQuotaAdjustment(
   }
   const sign = other.delta_quota > 0 ? '+' : ''
   return {
-    amount: `${sign}${formatLogQuota(other.delta_quota, 'CNY')}`,
-    before: formatLogQuota(other.before_quota, 'CNY'),
-    after: formatLogQuota(other.after_quota, 'CNY'),
+    amount: `${sign}${formatLogQuota(other.delta_quota, 'CNY', other.quota_per_unit)}`,
+    before: formatLogQuota(other.before_quota, 'CNY', other.quota_per_unit),
+    after: formatLogQuota(other.after_quota, 'CNY', other.quota_per_unit),
     reason: typeof other.reason === 'string' ? other.reason : '',
   }
 }

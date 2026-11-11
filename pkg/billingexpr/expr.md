@@ -584,12 +584,21 @@ declared version differs from its expression. CNY snapshots must explicitly stor
    enter prices directly in CNY. Changing currency clears the editor's previous
    prices; review and save the resulting `v2:CNY:` expression.
 2. In user management, open the user's quota adjustment, select **CNY**, and
-   credit the CNY wallet with an amount and reason.
+   choose Add, Subtract, or Override and enter the amount, as for USD. Override
+   replaces the available CNY balance without changing reservations or consumed
+   quota. The server supplies an audit reason when none is provided; retries
+   reuse the operation ID to prevent a duplicate adjustment.
 3. Create the API key, then open **Edit**, enable **CNY billing**, set its separate
    CNY budget (or unlimited budget), and select **Save CNY budget**. CNY access is
-   disabled by default; enabling it does not fund the user's wallet.
+   disabled by default; enabling it does not fund the user's wallet. Unlimited
+   CNY quota removes the key's budget cap; the wallet still needs funds.
 4. Select **CNY** in the usage-log currency filter. Lists, statistics, and exports
    use that currency; API callers pass `currency=CNY` to the existing log APIs.
+
+Wallet balances, model consumption, quota inputs, and usage logs retain their
+native USD or CNY units regardless of the display currency or exchange rate.
+The display preference remains available for reference pricing and payment
+conversion. Historical logs use their recorded quota scale when available.
 
 The CNY wallet is separate from the existing USD wallet and subscriptions.
 USD balances and subscription allowances cannot pay CNY charges, and

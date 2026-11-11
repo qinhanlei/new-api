@@ -424,3 +424,110 @@ describe('API keys mutate drawer user quota query switch', () => {
     expect(createdPayloads[0]?.allow_user_quota_query).toBe(false)
   })
 })
+
+describe('API key currency controls', () => {
+  test('keeps the new-key CNY hint after the USD unlimited control', async () => {
+    installApiFixtures([])
+    await renderCreateDrawer()
+    const unlimited = screen.getByRole('switch', { name: 'Unlimited Quota' })
+    const hint = screen.getByText(
+      'Create the API key first, then enable its CNY budget from Edit.'
+    )
+    expect(unlimited.compareDocumentPosition(hint)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING
+    )
+    fireEvent.click(unlimited)
+    const amount = screen.getByRole('spinbutton', { name: 'Quota (USD)' })
+    expect(amount.compareDocumentPosition(unlimited)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING
+    )
+  })
+
+  test('keeps CNY controls after USD controls and preserves its draft when USD unlimited changes', async () => {
+    installApiFixtures([])
+    const currentRow: ApiKey = {
+      id: 42,
+      name: 'dual-currency',
+      key: '',
+      status: 1,
+      remain_quota: 5000000,
+      used_quota: 0,
+      unlimited_quota: false,
+      expired_time: -1,
+      created_time: 1,
+      accessed_time: 0,
+      group: 'default',
+      auto_groups: [],
+      cross_group_retry: false,
+      model_limits_enabled: false,
+      model_limits: '',
+      allow_ips: '',
+      allow_user_quota_query: true,
+    }
+    const budget = {
+      enabled: true,
+      remain_quota: 500000,
+      used_quota: 0,
+      unlimited_quota: false,
+      version: 2,
+      quota_per_unit: 500000,
+    }
+    const getFixture = apiClient.get
+    vi.spyOn(apiClient, 'get').mockImplementation(async (url) => {
+      if (url === '/api/token/42') {
+        return { data: { success: true, data: currentRow } }
+      }
+      if (url === '/api/token/42/currency/CNY') {
+        return { data: { success: true, data: budget } }
+      }
+      return getFixture(url)
+    })
+    const put = vi.spyOn(api, 'put').mockResolvedValue({
+      data: { success: true, data: { ...budget, remain_quota: 2000000 } },
+    })
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    renderedDrawer = { queryClient }
+    render(
+      <QueryClientProvider client={queryClient}>
+        <I18nextProvider i18n={i18n}>
+          <ApiKeysProvider>
+            <ApiKeysMutateDrawer
+              open
+              currentRow={currentRow}
+              onOpenChange={() => undefined}
+            />
+          </ApiKeysProvider>
+        </I18nextProvider>
+      </QueryClientProvider>
+    )
+    const cnyAmount = await screen.findByRole('spinbutton', {
+      name: 'Remaining CNY quota',
+    })
+    await waitFor(() => expect(findButton('Save changes', true)).toBeEnabled())
+    const usdUnlimited = screen.getByRole('switch', { name: 'Unlimited Quota' })
+    expect(usdUnlimited.compareDocumentPosition(cnyAmount)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING
+    )
+    fireEvent.change(cnyAmount, { target: { value: '4' } })
+    fireEvent.click(usdUnlimited)
+    expect(screen.queryByRole('spinbutton', { name: 'Quota (USD)' })).toBeNull()
+    expect(cnyAmount).toBeVisible()
+    expect(cnyAmount).toHaveValue(4)
+    fireEvent.click(usdUnlimited)
+    expect(screen.getByRole('spinbutton', { name: 'Quota (USD)' })).toHaveValue(
+      10
+    )
+    expect(cnyAmount).toHaveValue(4)
+    fireEvent.click(screen.getByRole('button', { name: 'Save CNY budget' }))
+    await waitFor(() =>
+      expect(put).toHaveBeenCalledWith('/api/token/42/currency/CNY', {
+        enabled: true,
+        remain_quota: 2000000,
+        unlimited_quota: false,
+        expected_version: 2,
+      })
+    )
+  })
+})

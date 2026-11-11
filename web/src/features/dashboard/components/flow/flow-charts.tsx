@@ -84,7 +84,7 @@ import type {
   FlowOverflowMode,
   FlowRole,
 } from '@/features/dashboard/types'
-import { formatQuota } from '@/lib/format'
+import { formatBillingQuota } from '@/lib/currency'
 import { ROLE } from '@/lib/roles'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { useThemeColor } from '@/lib/theme-color'
@@ -398,7 +398,9 @@ export function FlowCharts(props: FlowChartsProps) {
   const metricLabel = t(FLOW_METRIC_LABEL_KEYS[metric])
   const formatNodeMetricValue = useCallback(
     (value: number) =>
-      metric === 'quota' ? formatQuota(value) : formatFlowMetricNumber(value),
+      metric === 'quota'
+        ? formatBillingQuota(value)
+        : formatFlowMetricNumber(value),
     [metric]
   )
   // Explicit filters (the chips/dropdown control) narrow the rows that feed the
@@ -461,7 +463,7 @@ export function FlowCharts(props: FlowChartsProps) {
       buildFlowSankeySpec(
         flowData.flow,
         chartTitle,
-        formatQuota,
+        formatBillingQuota,
         {
           quota: t('Quota'),
           tokens: t('Tokens'),
