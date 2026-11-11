@@ -84,6 +84,8 @@ type responsesWSCallState struct {
 	controls chan responsesWSControl
 	done     chan struct{}
 	terminal *responsesWSMessage
+	// Accounting uncertainty must not replace upstream events or an existing close.
+	suppressErrorEvent bool
 	// A nonzero closeCode ends the connection after this request.
 	closeCode   int
 	closeReason string
@@ -197,7 +199,7 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		// before that release, so a concurrent upstream close cannot report it
 		// as a normal closure; shutdown itself takes neither lock.
 		outgoing := state.terminal
-		if apiErr != nil {
+		if apiErr != nil && !state.suppressErrorEvent {
 			if body, err := buildResponsesWSErrorPayload(envelope.EventID, streamID, apiErr, upstreamURLs...); err == nil {
 				outgoing = &responsesWSMessage{kind: websocket.TextMessage, body: body}
 			}
@@ -289,6 +291,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		if apiErr != nil {
 			return apiErr
 		}
+		if err := service.MarkCNYUpstreamPending(info, true); err != nil {
+			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+		}
 		if err := s.writeTarget(websocket.TextMessage, payload); err != nil {
 			state.closeCode = websocket.CloseInternalServerErr
 			return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
@@ -341,6 +346,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			if !s.setTarget(target) {
 				return types.NewError(context.Canceled, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 			}
+			if err := service.MarkCNYUpstreamPending(info, true); err != nil {
+				return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+			}
 			if err := s.writeTarget(websocket.TextMessage, payload); err != nil {
 				state.closeCode = websocket.CloseInternalServerErr
 				return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
@@ -392,6 +400,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			if incoming.err != nil {
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, incoming.err)
 				state.closeCode, state.closeReason = websocket.CloseInternalServerErr, "upstream connection closed"
+				if accumulator.WalletUsageUnknown() {
+					return responsesWalletUsageUnknown(c, state, info)
+				}
 				ConsumeResponsesQuota(c, info, accumulator.Finish())
 				return nil
 			}
@@ -446,10 +457,14 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 						if ambiguous {
 							state.closeCode = websocket.CloseInternalServerErr
 						}
+						if accumulator.WalletUsageUnknown() {
+							return responsesWalletUsageUnknown(c, state, info)
+						}
 						ConsumeResponsesQuota(c, info, accumulator.Finish())
 						return nil
 					}
-					if rejection.Error == nil {
+					hadErrorObject := rejection.Error != nil
+					if !hadErrorObject {
 						// An error frame without an error object still describes the
 						// rejected request; keep the client-facing type stable.
 						rejection.Error = &types.OpenAIError{Type: "invalid_request_error", Message: event.Message, Code: event.Code}
@@ -457,6 +472,19 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 					rejected := types.WithOpenAIError(*rejection.Error, rejection.Status, types.ErrOptionWithSkipRetry())
 					if rejected.StatusCode < 400 || rejected.StatusCode > 599 {
 						rejected.StatusCode = http.StatusBadRequest
+					}
+					if !ambiguous && rejection.Status >= 400 && rejection.Status < 500 && rejection.Status != http.StatusRequestTimeout {
+						if err := service.MarkCNYUpstreamPending(info, false); err != nil {
+							return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+						}
+					} else if service.CNYUpstreamPending(info) {
+						state.closeCode, state.closeReason = websocket.CloseInternalServerErr, "upstream usage is unknown"
+						if !hadErrorObject {
+							service.RecordUnknownWalletUsage(c, info)
+							return rejected
+						}
+						state.terminal = &incoming
+						return responsesWalletUsageUnknown(c, state, info)
 					}
 					return rejected
 				}
@@ -479,6 +507,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				}
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 				state.terminal = &incoming
+				if accumulator.WalletUsageUnknown() {
+					return responsesWalletUsageUnknown(c, state, info)
+				}
 				ConsumeResponsesQuota(c, info, accumulator.Finish())
 				return nil
 			}
@@ -508,10 +539,16 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		case <-idle.C:
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, context.DeadlineExceeded)
 			state.closeCode, state.closeReason = websocket.CloseInternalServerErr, "upstream response timed out"
+			if accumulator.WalletUsageUnknown() {
+				return responsesWalletUsageUnknown(c, state, info)
+			}
 			ConsumeResponsesQuota(c, info, accumulator.Finish())
 			return nil
 		case <-s.ctx.Done():
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, s.ctx.Err())
+			if accumulator.WalletUsageUnknown() {
+				return responsesWalletUsageUnknown(c, state, info)
+			}
 			ConsumeResponsesQuota(c, info, accumulator.Finish())
 			return nil
 		}
@@ -958,4 +995,10 @@ func selectResponsesWSChannel(c *gin.Context, modelName string, retryParam *serv
 		return nil, err
 	}
 	return channel, nil
+}
+
+func responsesWalletUsageUnknown(c *gin.Context, state *responsesWSCallState, info *relaycommon.RelayInfo) *types.NewAPIError {
+	state.suppressErrorEvent = true
+	service.RecordUnknownWalletUsage(c, info)
+	return types.NewError(errors.New(i18n.T(c, i18n.MsgBillingUpstreamUsageUnknown)), types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 }

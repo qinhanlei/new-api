@@ -204,7 +204,7 @@ func TestPreConsumePolicyDatabaseMatrix(t *testing.T) {
 				t.Skip("set " + dialect.env + " to run this database")
 			}
 			db := modelManagementDB(t, dialect.kind, os.Getenv(dialect.env))
-			require.NoError(t, db.AutoMigrate(&model.Token{}))
+			require.NoError(t, db.AutoMigrate(&model.Token{}, &model.CNYWallet{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}))
 			for key, value := range map[string]string{
 				"quota_setting.trust_quota_usd":        "10.5",
 				"quota_setting.pre_consume_multiplier": "1.5",
@@ -272,7 +272,7 @@ func TestPreConsumePolicyDatabaseMatrix(t *testing.T) {
 					require.NoError(t, model.UpdateOption("quota_setting.pre_consume_multiplier", strconv.FormatFloat(tc.multiplier, 'f', -1, 64)))
 					user := model.User{Username: fmt.Sprintf("policy-user-%d", i), Quota: tc.wallet, Group: "default", AffCode: fmt.Sprintf("policy-aff-%d", i)}
 					require.NoError(t, db.Create(&user).Error)
-					token := model.Token{UserId: user.Id, Key: fmt.Sprintf("policy-token-%d", i), RemainQuota: tc.token, UnlimitedQuota: tc.unlimited}
+					token := model.Token{UserId: user.Id, Key: fmt.Sprintf("policy-token-%d", i), RemainQuota: tc.token, UnlimitedQuota: tc.unlimited, Status: common.TokenStatusEnabled, ExpiredTime: -1}
 					require.NoError(t, db.Create(&token).Error)
 					ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 					ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)

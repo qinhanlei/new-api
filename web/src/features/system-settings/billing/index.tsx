@@ -16,7 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { SettingsPage } from '../components/settings-page'
+import { useTranslation } from 'react-i18next'
+
+import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
+
+import { SettingsPage, SettingsPageFrame } from '../components/settings-page'
+import { CurrencyBillingSection } from '../general/currency-billing-section'
 import type { BillingSettings } from '../types'
 import {
   BILLING_DEFAULT_SECTION,
@@ -110,6 +116,16 @@ const defaultBillingSettings: BillingSettings = {
 }
 
 export function BillingSettings() {
+  const { t } = useTranslation()
+  const role = useAuthStore((state) => state.auth.user?.role ?? ROLE.GUEST)
+  if (role < ROLE.ADMIN) return null
+  if (role !== ROLE.SUPER_ADMIN) {
+    return (
+      <SettingsPageFrame title={t('Currency & Display')}>
+        <CurrencyBillingSection />
+      </SettingsPageFrame>
+    )
+  }
   return (
     <SettingsPage
       routePath='/_authenticated/system-settings/billing/$section'

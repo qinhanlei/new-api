@@ -24,11 +24,11 @@ import {
   splitBillingExprAndRequestRules,
   type ParsedTier,
 } from '@/features/pricing/lib/billing-expr'
-import { formatLogQuota } from '@/lib/format'
+import { formatLogQuota, formatTimestampToDate } from '@/lib/format'
 import { translateServerText } from '@/lib/server-error-message'
 
 import type { UsageLog } from '../data/schema'
-import type { LogOtherData } from '../types'
+import type { LogOtherData, WalletFundingLog } from '../types'
 import { buildQuotaAuditOperation } from './quota-audit-operation'
 
 export { normalizeTierLabel }
@@ -168,6 +168,59 @@ export function parseLogOther(other: string): LogOtherData | null {
     // eslint-disable-next-line no-console
     console.error('Failed to parse log other field:', error)
     return null
+  }
+}
+
+/** Recorded wallet movements use their own scales, including any native debt. */
+export function getWalletFundingDisplay(
+  funding: WalletFundingLog | undefined,
+  t: (key: string) => string
+) {
+  if (!funding) return null
+  const usesAlternateWallet =
+    funding.currency === 'CNY' ? funding.usd_quota > 0 : funding.cny_quota > 0
+  const exchangeRate =
+    usesAlternateWallet && funding.exchange.enabled
+      ? (funding.exchange.rate ?? '')
+      : ''
+
+  return {
+    usdAmount: formatLogQuota(
+      funding.usd_quota,
+      'USD',
+      funding.usd_quota_per_unit
+    ),
+    cnyAmount: formatLogQuota(
+      funding.cny_quota,
+      'CNY',
+      funding.cny_quota_per_unit
+    ),
+    showUsd:
+      funding.usd_quota !== 0 ||
+      (funding.currency === 'USD' && funding.cny_quota === 0),
+    showCny:
+      funding.cny_quota !== 0 ||
+      (funding.currency === 'CNY' && funding.usd_quota === 0),
+    status: {
+      reserved: t('Reserved'),
+      submitted: t('Held pending settlement'),
+      settled: t('Settled'),
+      refunded: t('Refunded to original wallets'),
+    }[funding.status],
+    exchangeRate,
+    exchangeTime:
+      exchangeRate && funding.exchange.source_time
+        ? formatTimestampToDate(funding.exchange.source_time)
+        : '',
+    hasDebt: funding.debt_quota > 0,
+    debtAmount: formatLogQuota(
+      funding.debt_quota,
+      funding.currency,
+      funding.currency === 'CNY'
+        ? funding.cny_quota_per_unit
+        : funding.usd_quota_per_unit
+    ),
+    debtCurrency: funding.currency,
   }
 }
 

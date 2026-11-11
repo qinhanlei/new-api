@@ -1,5 +1,12 @@
 package model
 
+import (
+	"fmt"
+
+	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
+)
+
 type Midjourney struct {
 	Id          int    `json:"id"`
 	Code        int    `json:"code"`
@@ -24,8 +31,132 @@ type Midjourney struct {
 	Buttons     string `json:"buttons"`
 	Properties  string `json:"properties"`
 
-	TokenId          int `json:"-" gorm:"default:0"`
-	BillingChannelId int `json:"-" gorm:"default:0"`
+	TokenId                int    `json:"-" gorm:"default:0"`
+	BillingChannelId       int    `json:"-" gorm:"default:0"`
+	WalletFundingRequestID string `json:"-" gorm:"type:varchar(191);index"`
+}
+
+// InsertWalletMidjourney commits accepted work, its frozen payment and native
+// usage together. An insert failure leaves the pre-submit reservation intact.
+func InsertWalletMidjourney(task *Midjourney) (bool, error) {
+	if task == nil || task.WalletFundingRequestID == "" || task.MjId == "" || task.Quota < 0 || task.Quota > common.MaxQuota {
+		return false, ErrCNYInvalid
+	}
+	record, err := GetWalletFundingRecord(task.WalletFundingRequestID)
+	if err != nil {
+		return false, err
+	}
+	candidate := *task
+	created := false
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		wallet, err := lockCNYWallet(tx, record.UserID)
+		if err != nil {
+			return err
+		}
+		var user User
+		if err = lockForUpdate(tx.Unscoped()).First(&user, record.UserID).Error; err != nil {
+			return err
+		}
+		if err = lockForUpdate(tx).First(record, record.ID).Error; err != nil {
+			return err
+		}
+		if record.UserID != task.UserId || record.TokenID != task.TokenId || record.Currency != "USD" {
+			return ErrCNYConflict
+		}
+		if record.TaskID != "" {
+			if err = tx.Where("wallet_funding_request_id = ?", record.RequestID).First(&candidate).Error; err != nil {
+				return err
+			}
+			if record.TaskID != fmt.Sprintf("mj:%d", candidate.Id) || candidate.MjId != task.MjId {
+				return ErrCNYConflict
+			}
+			return nil
+		}
+		if record.Status != CNYBillingReserved || record.ReservedQuota != candidate.Quota {
+			return ErrCNYState
+		}
+		if err = tx.Create(&candidate).Error; err != nil {
+			return err
+		}
+		record.TaskID = fmt.Sprintf("mj:%d", candidate.Id)
+		if err = finalizeWalletFunding(tx, wallet, &user, record, candidate.Quota, false); err != nil {
+			return err
+		}
+		if err = tx.Unscoped().Model(&User{}).Where("id = ?", candidate.UserId).Updates(map[string]any{
+			"used_quota": gorm.Expr("used_quota + ?", candidate.Quota), "request_count": gorm.Expr("request_count + 1"),
+		}).Error; err != nil {
+			return err
+		}
+		if err = tx.Model(&Channel{}).Where("id = ?", candidate.GetBillingChannelId()).UpdateColumn("used_quota", gorm.Expr("used_quota + ?", candidate.Quota)).Error; err != nil {
+			return err
+		}
+		created = true
+		return nil
+	})
+	if err == nil {
+		*task = candidate
+		invalidateWalletTaskQuotaCache(record)
+	}
+	return created && err == nil, err
+}
+
+// RefundWalletMidjourney keeps the status CAS and refund atomic, so a failed
+// refund remains eligible for the next poll and a stale poll cannot refund twice.
+func RefundWalletMidjourney(task *Midjourney, fromStatus string) (bool, error) {
+	if task == nil || task.Id <= 0 || task.WalletFundingRequestID == "" {
+		return false, ErrCNYInvalid
+	}
+	record, err := GetWalletFundingRecord(task.WalletFundingRequestID)
+	if err != nil {
+		return false, err
+	}
+	candidate := *task
+	won := false
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		wallet, err := lockCNYWallet(tx, record.UserID)
+		if err != nil {
+			return err
+		}
+		var user User
+		if err = lockForUpdate(tx.Unscoped()).First(&user, record.UserID).Error; err != nil {
+			return err
+		}
+		if err = lockForUpdate(tx).First(record, record.ID).Error; err != nil {
+			return err
+		}
+		if record.UserID != task.UserId || record.TokenID != task.TokenId || record.Currency != "USD" || record.TaskID != fmt.Sprintf("mj:%d", task.Id) {
+			return ErrCNYConflict
+		}
+		if record.Status == CNYBillingRefunded {
+			return nil
+		}
+		if record.Status != CNYBillingSettled {
+			return ErrCNYState
+		}
+		candidate.Quota = 0
+		result := tx.Model(&candidate).Where("status = ? AND wallet_funding_request_id = ?", fromStatus, record.RequestID).Select("*").Updates(&candidate)
+		if result.Error != nil || result.RowsAffected == 0 {
+			return result.Error
+		}
+		if err = finalizeWalletFunding(tx, wallet, &user, record, 0, true); err != nil {
+			return err
+		}
+		if err = tx.Unscoped().Model(&User{}).Where("id = ?", task.UserId).UpdateColumn("used_quota", gorm.Expr("used_quota - ?", record.Quota)).Error; err != nil {
+			return err
+		}
+		if err = tx.Model(&Channel{}).Where("id = ?", task.GetBillingChannelId()).UpdateColumn("used_quota", gorm.Expr("used_quota - ?", record.Quota)).Error; err != nil {
+			return err
+		}
+		won = true
+		return nil
+	})
+	if err == nil {
+		if won {
+			*task = candidate
+		}
+		invalidateWalletTaskQuotaCache(record)
+	}
+	return won && err == nil, err
 }
 
 // TaskQueryParams 用于包含所有搜索条件的结构体，可以根据需求添加更多字段

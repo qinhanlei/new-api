@@ -17,12 +17,17 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -770,6 +775,432 @@ func TestResponsesWSErrorAttribution(t *testing.T) {
 			assert.Equal(t, tc.terminal, terminal)
 			assert.Equal(t, tc.ambiguous, ambiguous)
 			assert.Equal(t, tc.controlError, controlError)
+		})
+	}
+}
+
+func TestRealtimeWalletAuthoritativeUsageAndUnknownTail(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	for _, tc := range []struct {
+		name                 string
+		usage                string
+		tail                 bool
+		want                 int
+		unknown              bool
+		overlap, native      bool
+		limited, shortWallet bool
+	}{
+		{"complete", `,"usage":{"total_tokens":300,"input_tokens":300,"input_token_details":{"text_tokens":300}}`, false, 300, false, false, false, false, false},
+		{"explicit-zero", `,"usage":{"total_tokens":0,"input_tokens":0}`, false, 0, false, false, false, false, false},
+		{"missing-usage", "", false, 0, true, false, false, false, false},
+		{"unfinished-tail", `,"usage":{"total_tokens":300,"input_tokens":300,"input_token_details":{"text_tokens":300}}`, true, 300, true, false, false, false, false},
+		{"overlapping-responses-and-audio", `,"usage":{"total_tokens":300,"input_tokens":300,"input_token_details":{"text_tokens":300}}`, false, 900, false, true, false, false, false},
+		{"native-overlap-cross-currency-off", `,"usage":{"total_tokens":300,"input_tokens":300,"input_token_details":{"text_tokens":300}}`, false, 900, false, true, true, false, false},
+		{"key-overrun", `,"usage":{"total_tokens":300,"input_tokens":300,"input_token_details":{"text_tokens":300}}`, false, 300, false, false, false, true, false},
+		{"key-overrun-wallet-debt", `,"usage":{"total_tokens":300,"input_tokens":300,"input_token_details":{"text_tokens":300}}`, false, 300, false, false, false, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupRelayChannelDB(t)
+			oldRedis, oldBatch, oldLogs, oldLogDB := common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, model.LOG_DB
+			common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, model.LOG_DB = false, false, false, nil
+			t.Cleanup(func() {
+				common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, model.LOG_DB = oldRedis, oldBatch, oldLogs, oldLogDB
+			})
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.CNYWallet{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}))
+			usd := 0
+			if tc.native {
+				usd = 10000
+			}
+			require.NoError(t, db.Create(&model.User{Id: 1, Username: "realtime", Status: common.UserStatusEnabled, Quota: usd}).Error)
+			cny := 10000
+			if tc.shortWallet {
+				cny = 700
+			}
+			require.NoError(t, db.Create(&model.CNYWallet{UserID: 1, Quota: cny, QuotaPerUnit: 500000}).Error)
+			require.NoError(t, db.Create(&model.Channel{Id: 1, Name: "test", Key: "test"}).Error)
+			policy := model.DefaultWalletExchangePolicy()
+			policy.StaticRate, policy.CrossCurrencyEnabled = "7", !tc.native
+			require.NoError(t, db.Create(&policy).Error)
+			client, gatewayClient, closeClient := newTestWebSocketPair(t)
+			defer closeClient()
+			gatewayTarget, upstream, closeTarget := newTestWebSocketPair(t)
+			defer closeTarget()
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+			info := &relaycommon.RelayInfo{RequestId: tc.name, UserId: 1, IsPlayground: true, ForcePreConsume: true, StartTime: time.Now(), OriginModelName: "test", ClientWs: gatewayClient, TargetWs: gatewayTarget,
+				PriceData: hosttypes.PriceData{ModelRatio: 1, CompletionRatio: 1, QuotaToPreConsume: 100, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}}, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 1, UpstreamModelName: "test"}}
+			if tc.limited {
+				token := model.Token{Id: 1, UserId: 1, Key: strings.Repeat("k", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100}
+				require.NoError(t, db.Create(&token).Error)
+				info.IsPlayground, info.TokenId, info.TokenKey = false, 1, token.Key
+			}
+			session, apiErr := service.NewWalletBillingSession(c, info, 100)
+			require.Nil(t, apiErr)
+			info.Billing = session
+			type outcome struct {
+				err   *types.NewAPIError
+				usage *dto.RealtimeUsage
+			}
+			result := make(chan outcome, 1)
+			go func() { err, usage := openai.OpenaiRealtimeHandler(c, info); result <- outcome{err, usage} }()
+			require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)))
+			require.NoError(t, upstream.SetReadDeadline(time.Now().Add(5*time.Second)))
+			_, _, err := upstream.ReadMessage()
+			require.NoError(t, err)
+			record, err := model.GetWalletFundingRecord(tc.name)
+			require.NoError(t, err)
+			assert.True(t, record.UpstreamPending)
+			if tc.overlap {
+				for _, body := range []string{`{"type":"response.create"}`, `{"type":"input_audio_buffer.append","audio":"AAAA"}`, `{"type":"input_audio_buffer.append","audio":"AAAA"}`} {
+					require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(body)))
+					_, _, err = upstream.ReadMessage()
+					require.NoError(t, err)
+				}
+				record, err = model.GetWalletFundingRecord(tc.name)
+				require.NoError(t, err)
+				assert.Equal(t, 300, record.ReservedQuota, "two creates plus one audio batch, not one reservation per chunk")
+				require.NoError(t, upstream.WriteMessage(websocket.TextMessage, []byte(`{"type":"input_audio_buffer.committed","item_id":"audio1"}`)))
+				for i := range 3 {
+					require.NoError(t, upstream.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":"r%d"}}`, i))))
+				}
+				for i := range 3 {
+					require.NoError(t, upstream.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.done","response":{"id":"r%d"`+tc.usage+`}}`, i))))
+				}
+				require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+				for range 7 {
+					_, _, err = client.ReadMessage()
+					require.NoError(t, err)
+				}
+				require.NoError(t, client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)))
+			} else {
+				require.NoError(t, upstream.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"r1"}}`)))
+				require.NoError(t, upstream.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"r1"`+tc.usage+`}}`)))
+				require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+				_, _, err = client.ReadMessage()
+				require.NoError(t, err)
+				if !tc.unknown || tc.tail {
+					_, _, err = client.ReadMessage()
+					require.NoError(t, err)
+					if tc.tail {
+						require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)))
+						_, _, err = upstream.ReadMessage()
+						require.NoError(t, err)
+						_ = upstream.Close()
+					} else {
+						require.NoError(t, client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)))
+					}
+				}
+			}
+			var out outcome
+			select {
+			case out = <-result:
+			case <-time.After(5 * time.Second):
+				t.Fatal("realtime handler did not finish")
+			}
+			if tc.unknown {
+				require.NotNil(t, out.err)
+				require.Nil(t, out.usage)
+			} else {
+				require.NotNil(t, out.usage)
+				service.PostWssConsumeQuota(c, info, "test", out.usage, nil)
+			}
+			if tc.limited {
+				var token model.Token
+				require.NoError(t, db.First(&token, 1).Error)
+				assert.Equal(t, -200, token.RemainQuota)
+				assert.Equal(t, 300, token.UsedQuota)
+			}
+			info.Billing.Refund(c)
+			record, err = model.GetWalletFundingRecord(tc.name)
+			require.NoError(t, err)
+			if tc.unknown {
+				assert.Equal(t, model.CNYBillingReserved, record.Status)
+				assert.True(t, record.UpstreamPending)
+				assert.GreaterOrEqual(t, record.ReservedQuota, max(100, tc.want))
+			} else {
+				assert.Equal(t, model.CNYBillingSettled, record.Status)
+				assert.Equal(t, tc.want, record.Quota)
+				if tc.shortWallet {
+					assert.Equal(t, 700, record.AlternateCharged)
+					assert.Equal(t, 200, record.DebtQuota)
+				} else if tc.native {
+					assert.Equal(t, tc.want, record.NativeCharged)
+					assert.Zero(t, record.AlternateCharged)
+				} else {
+					assert.Equal(t, tc.want*7, record.AlternateCharged)
+				}
+			}
+		})
+	}
+}
+
+func TestResponsesWSWalletFundingAtEachPaidWrite(t *testing.T) {
+	metrics := config.GlobalConfig.Get("perf_metrics_setting").(*perf_metrics_setting.PerfMetricsSetting)
+	previousMetrics := metrics.Enabled
+	metrics.Enabled = false
+	t.Cleanup(func() { metrics.Enabled = previousMetrics })
+	priorRatios := ratio_setting.ModelRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":1}`))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(priorRatios)) })
+	for _, tc := range []struct {
+		name, event string
+		status      string
+		repeats     int
+	}{
+		{"complete", `{"type":"response.completed","response":{"id":"%s","status":"completed","usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}`, model.CNYBillingSettled, 2},
+		{"reject", `{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"bad input"}}`, model.CNYBillingRefunded, 1},
+		{"completed-without-usage", `{"type":"response.completed","response":{"id":"%s","status":"completed"}}`, model.CNYBillingSettled, 2},
+		{"failed-without-usage", `{"type":"response.failed","response":{"id":"%s","status":"failed","error":{"type":"server_error","message":"upstream failed"}}}`, model.CNYBillingReserved, 1},
+		{"server-error", `{"type":"error","status":500,"error":{"type":"server_error","message":"unknown"}}`, model.CNYBillingReserved, 1},
+		{"bare-error", `{"type":"error","error":{"type":"server_error","message":"unknown"}}`, model.CNYBillingReserved, 1},
+		{"bare-frame", `{"type":"error","status":500,"message":"upstream rejected"}`, model.CNYBillingReserved, 1},
+		{"disconnect", "", model.CNYBillingReserved, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, i18n.Init())
+			db := setupRelayChannelDB(t)
+			oldRedis, oldBatch, oldLogs, oldLogDB := common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, model.LOG_DB
+			common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, model.LOG_DB = false, false, false, db
+			t.Cleanup(func() {
+				common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, model.LOG_DB = oldRedis, oldBatch, oldLogs, oldLogDB
+			})
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.CNYWallet{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}, &model.Log{}))
+			require.NoError(t, db.Create(&model.User{Id: 1, Username: "responses", Status: common.UserStatusEnabled}).Error)
+			require.NoError(t, db.Create(&model.Token{Id: 1, UserId: 1, Key: strings.Repeat("t", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}).Error)
+			require.NoError(t, db.Create(&model.CNYWallet{UserID: 1, Quota: 1000000, QuotaPerUnit: 500000}).Error)
+			policy := model.DefaultWalletExchangePolicy()
+			policy.StaticRate, policy.CrossCurrencyEnabled = "7", true
+			require.NoError(t, db.Create(&policy).Error)
+			observed := make(chan error, 2)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				conn, err := (&websocket.Upgrader{}).Upgrade(w, request, nil)
+				if err != nil {
+					observed <- err
+					return
+				}
+				defer conn.Close()
+				for i := range tc.repeats {
+					_, _, err = conn.ReadMessage()
+					if err != nil {
+						observed <- err
+						return
+					}
+					record, fundingErr := model.GetWalletFundingRecord(fmt.Sprintf("responses-%s-ws-%d", tc.name, i))
+					if fundingErr == nil && !record.UpstreamPending {
+						fundingErr = fmt.Errorf("paid write was not durably pending")
+					}
+					observed <- fundingErr
+					if tc.event == "" {
+						return
+					}
+					body := tc.event
+					if strings.Contains(body, "%s") {
+						body = fmt.Sprintf(body, fmt.Sprintf("r%d", i))
+					}
+					if conn.WriteMessage(websocket.TextMessage, []byte(body)) != nil {
+						return
+					}
+				}
+				_, _, _ = conn.ReadMessage()
+			}))
+			defer upstream.Close()
+			channel := &model.Channel{Id: 1, Name: "test", Key: "test", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Models: "gpt-4o", Group: "default", BaseURL: &upstream.URL}
+			channel.SetSetting(dto.ChannelSettings{ResponsesWebSocketEnabled: true})
+			require.NoError(t, db.Create(channel).Error)
+			client, gateway, cleanup := newTestWebSocketPair(t)
+			defer cleanup()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil).WithContext(ctx)
+			c.Set(common.RequestIdKey, "responses-"+tc.name)
+			finished := make(chan struct{})
+			go func() {
+				defer close(finished)
+				_ = ResponsesWebSocketHelper(c, gateway, func(request *http.Request, requestID string, run func(*gin.Context) *types.NewAPIError) *types.NewAPIError {
+					call, _ := gin.CreateTestContext(httptest.NewRecorder())
+					call.Request = request
+					call.Set(common.RequestIdKey, requestID)
+					common.SetContextKey(call, constant.ContextKeyUserId, 1)
+					common.SetContextKey(call, constant.ContextKeyTokenId, 1)
+					common.SetContextKey(call, constant.ContextKeyTokenUnlimited, true)
+					common.SetContextKey(call, constant.ContextKeyUserGroup, "default")
+					common.SetContextKey(call, constant.ContextKeyTokenGroup, "default")
+					common.SetContextKey(call, constant.ContextKeyUsingGroup, "default")
+					common.SetContextKey(call, constant.ContextKeyUserSetting, dto.UserSetting{BillingPreference: "wallet_only"})
+					service.GetChannelConstraints(call).AddPin(appdto.ChannelPin{ChannelId: 1, Source: appdto.PinSourceToken, Rank: appdto.PinRankToken, RetryMode: appdto.PinRetrySingleAttempt})
+					return run(call)
+				})
+			}()
+			for i := range tc.repeats {
+				require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-4o","input":"hi"}`)))
+				require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+				_, body, err := client.ReadMessage()
+				if tc.event == "" {
+					require.True(t, websocket.IsCloseError(err, websocket.CloseInternalServerErr), "disconnect must retain its existing close semantics: %v %s", err, body)
+				} else {
+					require.NoError(t, err, string(body))
+					if tc.name == "bare-frame" {
+						var rejection responsesWSErrorEvent
+						require.NoError(t, common.Unmarshal(body, &rejection))
+						require.NotNil(t, rejection.Error)
+						assert.Equal(t, "invalid_request_error", rejection.Error.Type)
+						assert.Equal(t, "upstream rejected", rejection.Error.Message)
+					} else if tc.status == model.CNYBillingReserved {
+						want := tc.event
+						if strings.Contains(want, "%s") {
+							want = fmt.Sprintf(want, fmt.Sprintf("r%d", i))
+						}
+						assert.JSONEq(t, want, string(body), "unknown accounting must preserve the upstream terminal event")
+					}
+				}
+				select {
+				case err := <-observed:
+					require.NoError(t, err)
+				case <-time.After(time.Second):
+					t.Fatalf("upstream did not receive create: %s", body)
+				}
+				record, err := model.GetWalletFundingRecord(fmt.Sprintf("responses-%s-ws-%d", tc.name, i))
+				require.NoError(t, err)
+				assert.Equal(t, tc.status, record.Status, string(body))
+				if tc.status == model.CNYBillingReserved {
+					assert.True(t, record.UpstreamPending)
+				}
+			}
+			_ = client.Close()
+			cancel()
+			select {
+			case <-finished:
+			case <-time.After(5 * time.Second):
+				t.Fatal("responses session did not finish")
+			}
+		})
+	}
+}
+
+func TestRealtimeWalletExplicitRejectionAndAudioClear(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	type event struct {
+		client bool
+		body   string
+	}
+	create := event{true, `{"type":"response.create","event_id":"create1"}`}
+	reject := event{false, `{"type":"error","error":{"type":"invalid_request_error","event_id":"create1","message":"invalid create"}}`}
+	appendAudio := event{true, `{"type":"input_audio_buffer.append","audio":"AAAA"}`}
+	clearAudio := event{true, `{"type":"input_audio_buffer.clear"}`}
+	cleared := event{false, `{"type":"input_audio_buffer.cleared"}`}
+	textInput := event{true, `{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}`}
+	created := event{false, `{"type":"response.created","response":{"id":"r1"}}`}
+	completed := event{false, `{"type":"response.done","response":{"id":"r1","usage":{"total_tokens":300,"input_tokens":300,"input_token_details":{"text_tokens":300}}}}`}
+	for _, tc := range []struct {
+		name   string
+		events []event
+		held   bool
+		used   int
+	}{
+		{"rejected-per-call", []event{create, reject}, false, 0},
+		{"server-error-unknown", []event{create, {false, `{"type":"error","error":{"type":"server_error","event_id":"create1","message":"unknown"}}`}}, true, 0},
+		{"unmatched-error", []event{create, {false, `{"type":"error","error":{"type":"invalid_request_error","event_id":"other","message":"other event"}}`}}, true, 0},
+		{"uncommitted-audio-cleared", []event{appendAudio, clearAudio, cleared}, false, 0},
+		{"committed-audio-not-cleared", []event{appendAudio, {true, `{"type":"input_audio_buffer.commit"}`}, clearAudio, cleared}, true, 0},
+		{"committed-batch-budget", []event{appendAudio, {true, `{"type":"input_audio_buffer.commit"}`}, appendAudio}, true, 0},
+		{"auto-commit-explicit-budget", []event{appendAudio, {false, `{"type":"input_audio_buffer.committed","item_id":"audio1"}`}, create}, true, 0},
+		{"auto-response-disabled", []event{{false, `{"type":"session.created","session":{"turn_detection":{"type":"server_vad","create_response":false}}}`}, appendAudio, {false, `{"type":"input_audio_buffer.committed","item_id":"audio1"}`}, create, created, completed}, false, 300},
+		{"auto-response-disabled-ga", []event{{false, `{"type":"session.created","session":{"audio":{"input":{"turn_detection":{"type":"server_vad","create_response":false}}}}}`}, appendAudio, {false, `{"type":"input_audio_buffer.committed","item_id":"audio1"}`}, create, created, completed}, false, 300},
+		{"two-committed-batches", []event{appendAudio, {true, `{"type":"input_audio_buffer.commit"}`}, appendAudio, {true, `{"type":"input_audio_buffer.commit"}`}, created, completed, {false, `{"type":"response.created","response":{"id":"r2"}}`}, {false, `{"type":"response.done","response":{"id":"r2","usage":{"total_tokens":300,"input_tokens":300,"input_token_details":{"text_tokens":300}}}}`}}, false, 600},
+		{"text-input-not-cleared", []event{textInput, appendAudio, clearAudio, cleared}, true, 0},
+		{"new-audio-after-clear", []event{appendAudio, clearAudio, appendAudio, cleared}, true, 0},
+		{"active-response-not-cleared", []event{create, created, appendAudio, clearAudio, cleared}, true, 0},
+		{"rejected-create-keeps-input", []event{textInput, create, reject}, true, 0},
+		{"completed-then-rejected", []event{create, created, completed, create, reject}, false, 300},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupRelayChannelDB(t)
+			oldRedis, oldBatch, oldLogs, oldLogDB := common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, model.LOG_DB
+			common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, model.LOG_DB = false, false, false, nil
+			t.Cleanup(func() {
+				common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, model.LOG_DB = oldRedis, oldBatch, oldLogs, oldLogDB
+			})
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.CNYWallet{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}))
+			quota := 10000
+			if tc.name == "committed-batch-budget" || tc.name == "auto-commit-explicit-budget" || strings.HasPrefix(tc.name, "auto-response-disabled") {
+				quota = 100
+			}
+			require.NoError(t, db.Create(&model.User{Id: 1, Username: "realtime-cancel", Status: common.UserStatusEnabled, Quota: quota}).Error)
+			require.NoError(t, db.Create(&model.Channel{Id: 1, Name: "test", Key: "test"}).Error)
+			client, gatewayClient, closeClient := newTestWebSocketPair(t)
+			defer closeClient()
+			gatewayTarget, upstream, closeTarget := newTestWebSocketPair(t)
+			defer closeTarget()
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+			info := &relaycommon.RelayInfo{RequestId: tc.name, UserId: 1, IsPlayground: true, ForcePreConsume: true, StartTime: time.Now(), OriginModelName: "test", ClientWs: gatewayClient, TargetWs: gatewayTarget,
+				PriceData: hosttypes.PriceData{ModelRatio: 1, CompletionRatio: 1, QuotaToPreConsume: 100, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}}, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 1, UpstreamModelName: "test"}}
+			if tc.name == "rejected-per-call" {
+				info.PriceData.UsePrice, info.PriceData.ModelPrice = true, 0.0002
+			}
+			session, apiErr := service.NewWalletBillingSession(c, info, 100)
+			require.Nil(t, apiErr)
+			info.Billing = session
+			type outcome struct {
+				err   *types.NewAPIError
+				usage *dto.RealtimeUsage
+			}
+			result := make(chan outcome, 1)
+			go func() { err, usage := openai.OpenaiRealtimeHandler(c, info); result <- outcome{err, usage} }()
+			for i, frame := range tc.events {
+				sender, receiver := upstream, client
+				if frame.client {
+					sender, receiver = client, upstream
+				}
+				require.NoError(t, sender.WriteMessage(websocket.TextMessage, []byte(frame.body)))
+				if (tc.name == "committed-batch-budget" || tc.name == "auto-commit-explicit-budget") && i == 2 {
+					require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+					_, body, err := client.ReadMessage()
+					require.NoError(t, err)
+					var rejected dto.RealtimeEvent
+					require.NoError(t, common.Unmarshal(body, &rejected))
+					require.NotNil(t, rejected.Error)
+					assert.Equal(t, "insufficient_quota", rejected.Error.Type)
+					// The next upstream frame must be this harmless control, proving
+					// the unaffordable audio batch never crossed the paid-write boundary.
+					frame.body = `{"type":"session.update","session":{}}`
+					require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(frame.body)))
+				}
+				require.NoError(t, receiver.SetReadDeadline(time.Now().Add(5*time.Second)))
+				_, got, err := receiver.ReadMessage()
+				require.NoError(t, err)
+				assert.JSONEq(t, frame.body, string(got))
+			}
+			require.NoError(t, client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)))
+			var out outcome
+			select {
+			case out = <-result:
+			case <-time.After(5 * time.Second):
+				t.Fatal("realtime handler did not finish")
+			}
+			if tc.held {
+				require.NotNil(t, out.err)
+				require.Nil(t, out.usage)
+			} else if tc.used != 0 {
+				require.NotNil(t, out.usage)
+				service.PostWssConsumeQuota(c, info, "test", out.usage, nil)
+			} else {
+				require.Nil(t, out.usage, "a fully rejected or cleared session has no billable response, even for per-call pricing")
+			}
+			info.Billing.Refund(c)
+			record, err := model.GetWalletFundingRecord(tc.name)
+			require.NoError(t, err)
+			if tc.held {
+				assert.Equal(t, model.CNYBillingReserved, record.Status)
+				assert.True(t, record.UpstreamPending)
+			} else if tc.used != 0 {
+				assert.Equal(t, model.CNYBillingSettled, record.Status)
+				assert.Equal(t, tc.used, record.Quota)
+			} else {
+				assert.Equal(t, model.CNYBillingRefunded, record.Status)
+				assert.False(t, record.UpstreamPending)
+			}
 		})
 	}
 }

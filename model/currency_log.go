@@ -86,6 +86,16 @@ func (record *CNYBillingRecord) usageLog() (*Log, error) {
 		"currency": billingexpr.CurrencyCNY, "billing_status": status,
 		"quota_per_unit": record.QuotaPerUnit, "reserved_quota": 0,
 	}
+	if record.FundingVersion == 1 {
+		funding, err := GetWalletFundingRecord(record.RequestID)
+		if err != nil {
+			return nil, err
+		}
+		if funding.UserID != record.UserID || funding.Currency != "CNY" {
+			return nil, ErrCNYConflict
+		}
+		metadata["wallet_funding"] = funding.LogSummary()
+	}
 	if status == CNYBillingReserved {
 		metadata["reserved_quota"] = record.ReservedQuota
 	}

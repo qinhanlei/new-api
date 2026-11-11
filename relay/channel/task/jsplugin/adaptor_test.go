@@ -1397,6 +1397,15 @@ export function extractUsageOnComplete(task, result, body) { return (body || {})
 			require.NoError(t, parseErr)
 			assert.Nil(t, result.UsageFacts)
 			assert.Zero(t, result.TotalTokens)
+			for _, currency := range []string{"USD", "CNY"} {
+				task := &model.Task{PrivateData: model.TaskPrivateData{BillingContext: &model.TaskBillingContext{TieredSnapshot: &billingexpr.BillingSnapshot{Currency: currency}}}}
+				if currency == "USD" {
+					task.PrivateData.WalletFundingRequestID = "funded-request"
+				}
+				result, parseErr = adaptor.ParseTaskResult(task, &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}, body)
+				assert.Error(t, parseErr, "%s funded tasks must not settle an invalid completion estimate", currency)
+				assert.Nil(t, result)
+			}
 		})
 	}
 

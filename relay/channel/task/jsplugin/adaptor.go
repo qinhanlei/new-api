@@ -642,6 +642,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 			a.keepReservation = true
 			submitted = &channel.TaskSubmitResponse{UpstreamTaskID: info.PublicTaskID, Immediate: &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Progress: taskcommon.ProgressComplete}}
 			service.MarkCNYTaskUsageUnknown(info, submitted.Immediate)
+			service.MarkWalletTaskUsageUnknown(info, submitted.Immediate)
 			taskErr = nil
 		case acceptedStream:
 			taskErr.NoRetry = true
@@ -755,6 +756,7 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	response.Immediate = immediate
 	if a.keepReservation {
 		service.MarkCNYTaskUsageUnknown(info, immediate)
+		service.MarkWalletTaskUsageUnknown(info, immediate)
 	}
 	if immediate.Status != model.TaskStatusSuccess || !a.hasHook(c.Request.Context(), "extractUsageOnComplete") {
 		return response, nil
@@ -773,17 +775,20 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 	if err != nil {
 		logger.LogWarn(c, common.LogText("task plugin %s completion context failed; retaining reserved quota: %v", a.plugin.Meta.Key, err))
 		service.MarkCNYTaskUsageUnknown(info, immediate)
+		service.MarkWalletTaskUsageUnknown(info, immediate)
 		return response, nil
 	}
 	facts, err := a.plugin.Engine.Call(c.Request.Context(), "extractUsageOnComplete", ctx, jsonValue(immediate), parsed.TaskData)
 	if err != nil {
 		logger.LogWarn(c, common.LogText("task plugin %s completion usage failed; retaining reserved quota: %v", a.plugin.Meta.Key, err))
 		service.MarkCNYTaskUsageUnknown(info, immediate)
+		service.MarkWalletTaskUsageUnknown(info, immediate)
 		return response, nil
 	}
 	if err := a.applyCompletionUsageFacts(immediate, facts, info.UpstreamModelName, info.OriginModelName); err != nil {
 		logger.LogWarn(c, common.LogText("task plugin %s completion usage rejected; retaining reserved quota: %v", a.plugin.Meta.Key, err))
 		service.MarkCNYTaskUsageUnknown(info, immediate)
+		service.MarkWalletTaskUsageUnknown(info, immediate)
 	}
 	return response, nil
 }
@@ -1071,7 +1076,16 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 			if hookErr == nil {
 				upstreamModel, _ := itemCtx["upstreamModel"].(string)
 				originModel, _ := itemCtx["model"].(string)
-				a.applyCompletionUsageFacts(&info, facts, upstreamModel, originModel)
+				hookErr = a.applyCompletionUsageFacts(&info, facts, upstreamModel, originModel)
+			}
+			if hookErr != nil {
+				for _, task := range tasks {
+					if task.GetUpstreamTaskID() == item.TaskID && (service.IsWalletFundedTask(task) || service.IsCNYTask(task)) {
+						info.Status = model.TaskStatusUnknown
+						info.Reason = "Failed to query the upstream task status"
+						break
+					}
+				}
 			}
 		}
 		results[item.TaskID] = &service.BatchTaskResult{TaskInfo: info, Action: item.Action, SubmitTime: item.SubmitTime, StartTime: item.StartTime, FinishTime: item.FinishTime, Data: item.Data}
@@ -1138,7 +1152,10 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 		if hookErr == nil {
 			upstreamModel, _ := ctx["upstreamModel"].(string)
 			originModel, _ := ctx["model"].(string)
-			a.applyCompletionUsageFacts(result, facts, upstreamModel, originModel)
+			hookErr = a.applyCompletionUsageFacts(result, facts, upstreamModel, originModel)
+		}
+		if hookErr != nil && (service.IsWalletFundedTask(task) || service.IsCNYTask(task)) {
+			return nil, hookErr
 		}
 	}
 	taskStatus := model.TaskStatus(result.Status)

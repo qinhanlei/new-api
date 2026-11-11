@@ -72,6 +72,7 @@ import type { UsageLog } from '../../data/schema'
 import {
   parseLogOther,
   getNativeQuotaAdjustment,
+  getWalletFundingDisplay,
   getParamOverrideActionLabel,
   parseAuditLine,
   decodeBillingExprB64,
@@ -545,6 +546,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
   const other = parseLogOther(props.log.other)
   const nativeAdjustment = getNativeQuotaAdjustment(props.log, other)
+  const funding = getWalletFundingDisplay(other?.wallet_funding, t)
   const typeConfig = getLogTypeConfig(props.log.type)
 
   const isViolation = isViolationFeeLog(other)
@@ -1269,6 +1271,54 @@ export function DetailsDialog(props: DetailsDialogProps) {
             other={other}
             isAdmin={props.isAdmin}
           />
+        )}
+
+        {funding && (
+          <section aria-label={t('Wallet funding')}>
+            <DetailSection label={t('Wallet funding')}>
+              <DetailRow label={t('Funding status')} value={funding.status} />
+              {funding.showUsd && (
+                <DetailRow
+                  label={t('USD wallet amount')}
+                  value={funding.usdAmount}
+                  mono
+                />
+              )}
+              {funding.showCny && (
+                <DetailRow
+                  label={t('CNY wallet amount')}
+                  value={funding.cnyAmount}
+                  mono
+                />
+              )}
+              {funding.exchangeRate && (
+                <DetailRow
+                  label={t('Frozen exchange rate')}
+                  value={`1 USD = ${funding.exchangeRate} CNY`}
+                  mono
+                />
+              )}
+              {funding.exchangeTime && (
+                <DetailRow
+                  label={t('Exchange rate source time')}
+                  value={funding.exchangeTime}
+                  mono
+                />
+              )}
+              {funding.hasDebt && (
+                <>
+                  <DetailRow
+                    label={t('Outstanding debt')}
+                    value={funding.debtAmount}
+                    mono
+                  />
+                  <p className='text-muted-foreground text-xs'>
+                    {t('Debt is included in the wallet amounts.')}
+                  </p>
+                </>
+              )}
+            </DetailSection>
+          </section>
         )}
 
         {/* Tiered pricing breakdown (when billing_mode is tiered_expr) */}

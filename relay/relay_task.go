@@ -391,6 +391,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			settlement, facts, err := service.EvaluateTaskCompletionUsage(snap, parsed.Immediate.UsageFacts)
 			if err != nil {
 				logger.LogWarn(c, common.LogText("task immediate usage settlement failed; retaining reserved quota: %v", err))
+				service.MarkWalletTaskUsageUnknown(info, parsed.Immediate)
 				if service.IsCNYBilling(info) {
 					parsed.Immediate.Status = model.TaskStatusAwaitingReview
 					parsed.Immediate.Reason = "CNY billing could not be finalized; the reservation is pending review"

@@ -54,7 +54,7 @@ func TestCNYBillingDatabaseMatrix(t *testing.T) {
 			common.SetMainDatabaseType(dialect)
 			initCol()
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&CNYBillingRecord{}, &CNYTokenBudget{}, &CNYWallet{}, &Task{}, &Token{}, &User{}))
+				require.NoError(t, db.Migrator().DropTable(&CNYBillingRecord{}, &WalletFundingRecord{}, &WalletExchangePolicy{}, &ExchangeRateObservation{}, &CNYTokenBudget{}, &CNYWallet{}, &Task{}, &Token{}, &User{}))
 				DB, common.RedisEnabled, common.BatchUpdateEnabled = oldDB, oldRedis, oldBatch
 				common.SetMainDatabaseType(oldMainType)
 				initCol()
@@ -73,7 +73,7 @@ func TestCNYBillingDatabaseMatrix(t *testing.T) {
 			legacy := User{Username: "legacy", Password: "test", Quota: 321, UsedQuota: 123}
 			require.NoError(t, db.Create(&legacy).Error)
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&CNYWallet{}, &CNYTokenBudget{}, &CNYBillingRecord{}))
+				require.NoError(t, db.AutoMigrate(&CNYWallet{}, &CNYTokenBudget{}, &CNYBillingRecord{}, &WalletFundingRecord{}, &WalletExchangePolicy{}, &ExchangeRateObservation{}))
 			}
 			t.Run("adjustments", testCNYAdjustments)
 			t.Run("adjustment_modes", testCNYAdjustmentModes)
@@ -87,7 +87,7 @@ func TestCNYBillingDatabaseMatrix(t *testing.T) {
 			var recordsBefore, recordsAfter int64
 			require.NoError(t, db.Model(&CNYBillingRecord{}).Count(&recordsBefore).Error)
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&CNYWallet{}, &CNYTokenBudget{}, &CNYBillingRecord{}))
+				require.NoError(t, db.AutoMigrate(&CNYWallet{}, &CNYTokenBudget{}, &CNYBillingRecord{}, &WalletFundingRecord{}, &WalletExchangePolicy{}, &ExchangeRateObservation{}))
 			}
 			require.NoError(t, db.Model(&CNYBillingRecord{}).Count(&recordsAfter).Error)
 			assert.Equal(t, recordsBefore, recordsAfter)

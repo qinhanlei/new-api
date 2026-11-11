@@ -58,24 +58,25 @@ type CNYTokenBudget struct {
 // One main-database record is the durable state of a request, including free
 // requests. Kind separates administrator operation IDs from server request IDs.
 type CNYBillingRecord struct {
-	ID            int64  `json:"id" gorm:"primaryKey"`
-	Kind          string `json:"kind" gorm:"type:varchar(16);uniqueIndex:idx_cny_billing_operation,priority:1;not null"`
-	RequestID     string `json:"request_id" gorm:"type:varchar(128);uniqueIndex:idx_cny_billing_operation,priority:2;not null"`
-	Currency      string `json:"currency" gorm:"type:varchar(3);not null"`
-	QuotaPerUnit  int    `json:"quota_per_unit" gorm:"not null"`
-	UserID        int    `json:"user_id" gorm:"index;not null"`
-	TokenID       int    `json:"token_id" gorm:"index"`
-	OperatorID    int    `json:"operator_id"`
-	Username      string `json:"username" gorm:"type:varchar(191)"`
-	TokenName     string `json:"token_name" gorm:"type:varchar(191)"`
-	ModelName     string `json:"model_name" gorm:"type:varchar(255);index"`
-	ChannelID     int    `json:"channel_id" gorm:"index"`
-	Group         string `json:"group" gorm:"type:varchar(128)"`
-	TaskID        string `json:"task_id" gorm:"type:varchar(191);index"`
-	Status        string `json:"status" gorm:"type:varchar(16);index;not null"`
-	ReservedQuota int    `json:"reserved_quota" gorm:"type:bigint;not null"`
-	Quota         int    `json:"quota" gorm:"type:bigint;not null"`
-	RefundQuota   int    `json:"refund_quota" gorm:"type:bigint;not null"`
+	ID             int64  `json:"id" gorm:"primaryKey"`
+	Kind           string `json:"kind" gorm:"type:varchar(16);uniqueIndex:idx_cny_billing_operation,priority:1;not null"`
+	RequestID      string `json:"request_id" gorm:"type:varchar(128);uniqueIndex:idx_cny_billing_operation,priority:2;not null"`
+	Currency       string `json:"currency" gorm:"type:varchar(3);not null"`
+	QuotaPerUnit   int    `json:"quota_per_unit" gorm:"not null"`
+	UserID         int    `json:"user_id" gorm:"index;not null"`
+	TokenID        int    `json:"token_id" gorm:"index"`
+	OperatorID     int    `json:"operator_id"`
+	Username       string `json:"username" gorm:"type:varchar(191)"`
+	TokenName      string `json:"token_name" gorm:"type:varchar(191)"`
+	ModelName      string `json:"model_name" gorm:"type:varchar(255);index"`
+	ChannelID      int    `json:"channel_id" gorm:"index"`
+	Group          string `json:"group" gorm:"type:varchar(128)"`
+	TaskID         string `json:"task_id" gorm:"type:varchar(191);index"`
+	Status         string `json:"status" gorm:"type:varchar(16);index;not null"`
+	ReservedQuota  int    `json:"reserved_quota" gorm:"type:bigint;not null"`
+	Quota          int    `json:"quota" gorm:"type:bigint;not null"`
+	RefundQuota    int    `json:"refund_quota" gorm:"type:bigint;not null"`
+	FundingVersion int    `json:"-"`
 	// Freeze the actual token allocation, not the token's mutable current policy.
 	TokenLimited       bool   `json:"-"`
 	TokenReservedQuota int    `json:"-" gorm:"type:bigint;not null"`
@@ -353,7 +354,7 @@ func ReserveCNYBilling(params CNYBillingParams, targetQuota int) (*CNYBillingRec
 			return err
 		}
 		var user User
-		if err = tx.First(&user, params.UserID).Error; err != nil {
+		if err = lockForUpdate(tx).First(&user, params.UserID).Error; err != nil {
 			return err
 		}
 		if user.Status != common.UserStatusEnabled {
@@ -362,7 +363,7 @@ func ReserveCNYBilling(params CNYBillingParams, targetQuota int) (*CNYBillingRec
 		var budget CNYTokenBudget
 		var token Token
 		if params.TokenID > 0 {
-			if err = tx.Where("id = ? AND user_id = ?", params.TokenID, params.UserID).First(&token).Error; err != nil {
+			if err = lockForUpdate(tx).Where("id = ? AND user_id = ?", params.TokenID, params.UserID).First(&token).Error; err != nil {
 				return err
 			}
 			if (token.Status != common.TokenStatusEnabled && token.Status != common.TokenStatusExhausted) || (token.ExpiredTime != -1 && token.ExpiredTime < common.GetTimestamp()) {
@@ -388,7 +389,7 @@ func ReserveCNYBilling(params CNYBillingParams, targetQuota int) (*CNYBillingRec
 		} else if errors.Is(err, gorm.ErrRecordNotFound) {
 			record = CNYBillingRecord{Kind: CNYBillingRequest, RequestID: params.RequestID, Currency: "CNY", QuotaPerUnit: CNYQuotaPerUnit,
 				UserID: params.UserID, TokenID: params.TokenID, Username: user.Username, TokenName: token.Name, ModelName: params.ModelName,
-				Status: CNYBillingReserved, TokenLimited: params.TokenID > 0 && !budget.UnlimitedQuota, CreatedAt: common.GetTimestamp()}
+				Status: CNYBillingReserved, FundingVersion: 1, TokenLimited: params.TokenID > 0 && !budget.UnlimitedQuota, CreatedAt: common.GetTimestamp()}
 		} else {
 			return err
 		}
@@ -396,33 +397,40 @@ func ReserveCNYBilling(params CNYBillingParams, targetQuota int) (*CNYBillingRec
 		// spending an exhausted wallet or budget. Existing funded reservations
 		// can still retry without requiring the same money a second time.
 		if !params.Free && record.ReservedQuota == 0 {
-			if wallet.Quota <= 0 {
+			if record.FundingVersion == 0 && wallet.Quota <= 0 {
 				return ErrCNYQuota
-			}
-			if record.TokenLimited && budget.RemainQuota <= 0 {
-				return ErrCNYTokenQuota
 			}
 		}
 		delta := max(0, targetQuota-record.ReservedQuota)
-		if wallet.Quota < delta {
+		if record.FundingVersion == 0 && wallet.Quota < delta {
 			return ErrCNYQuota
 		}
-		if record.TokenLimited && budget.RemainQuota < delta {
-			return ErrCNYTokenQuota
-		}
-		wallet.Quota, err = cnyBalanceAfter(wallet.Quota, -delta)
-		if err != nil {
-			return err
-		}
-		wallet.ReservedQuota, err = cnyBalanceAfter(wallet.ReservedQuota, delta)
-		if err != nil {
-			return err
-		}
-		wallet.Version++
-		if err = tx.Save(wallet).Error; err != nil {
-			return err
+		if record.FundingVersion == 1 {
+			_, err = reserveWalletFunding(tx, wallet, &user, WalletFundingParams{RequestID: params.RequestID, UserID: params.UserID, TokenID: params.TokenID, Currency: "CNY", Free: params.Free}, targetQuota)
+			if errors.Is(err, ErrWalletFundingInsufficient) {
+				return ErrCNYQuota
+			}
+			if err != nil {
+				return err
+			}
+		} else {
+			wallet.Quota, err = cnyBalanceAfter(wallet.Quota, -delta)
+			if err != nil {
+				return err
+			}
+			wallet.ReservedQuota, err = cnyBalanceAfter(wallet.ReservedQuota, delta)
+			if err != nil {
+				return err
+			}
+			wallet.Version++
+			if err = tx.Save(wallet).Error; err != nil {
+				return err
+			}
 		}
 		if params.TokenID > 0 {
+			if record.TokenLimited && (budget.RemainQuota < delta || (!params.Free && record.ReservedQuota == 0 && budget.RemainQuota <= 0)) {
+				return ErrCNYTokenQuota
+			}
 			if record.TokenLimited {
 				budget.RemainQuota, err = cnyBalanceAfter(budget.RemainQuota, -delta)
 				if err != nil {
@@ -440,6 +448,9 @@ func ReserveCNYBilling(params CNYBillingParams, targetQuota int) (*CNYBillingRec
 		record.UpdatedAt = common.GetTimestamp()
 		return tx.Save(&record).Error
 	})
+	if err == nil {
+		InvalidateUserQuotaCache(params.UserID)
+	}
 	return &record, err
 }
 
@@ -461,6 +472,9 @@ func SettleCNYBilling(requestID string, actualQuota int, usage CNYBillingUsage) 
 		}
 		return finalizeCNYBilling(tx, wallet, record, actualQuota, false, usage, "")
 	})
+	if err == nil {
+		InvalidateUserQuotaCache(record.UserID)
+	}
 	return record, err
 }
 
@@ -482,6 +496,9 @@ func RefundCNYBilling(requestID, reason string) (*CNYBillingRecord, error) {
 		}
 		return finalizeCNYBilling(tx, wallet, record, 0, true, CNYBillingUsage{}, reason)
 	})
+	if err == nil {
+		InvalidateUserQuotaCache(record.UserID)
+	}
 	return record, err
 }
 
@@ -521,6 +538,20 @@ func finalizeCNYBilling(tx *gorm.DB, wallet *CNYWallet, record *CNYBillingRecord
 		}
 	}
 	var err error
+	if record.FundingVersion == 1 {
+		var user User
+		if err = lockForUpdate(tx.Unscoped()).First(&user, record.UserID).Error; err != nil {
+			return err
+		}
+		var funding WalletFundingRecord
+		if err = tx.Where("request_id = ? AND user_id = ?", record.RequestID, record.UserID).First(&funding).Error; err != nil {
+			return err
+		}
+		if err = finalizeWalletFunding(tx, wallet, &user, &funding, actualQuota, refund); err != nil {
+			return err
+		}
+		walletDelta, reservedDelta = 0, 0
+	}
 	wallet.Quota, err = cnyBalanceAfter(wallet.Quota, walletDelta)
 	if err != nil {
 		return err

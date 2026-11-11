@@ -24,6 +24,7 @@ import {
 } from '@tanstack/react-table'
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { createInstance } from 'i18next'
+import { useMemo } from 'react'
 import { I18nextProvider } from 'react-i18next'
 import { afterAll, afterEach, beforeEach, expect, test, vi } from 'vitest'
 
@@ -35,8 +36,9 @@ import {
 } from '@/stores/system-config-store'
 
 import type { UsageLog } from '../../data/schema'
-import type { LogOtherData } from '../../types'
+import type { LogOtherData, WalletFundingLog } from '../../types'
 import { useCommonLogsColumns } from '../columns/common-logs-columns'
+import { DetailsDialog } from '../dialogs/details-dialog'
 
 vi.mock('@lobehub/icons', () => ({}))
 vi.hoisted(() => {
@@ -80,8 +82,12 @@ function DetailPreview(props: {
   type?: number
   currency?: 'USD' | 'CNY'
 }) {
+  const data = useMemo(
+    () => [{ ...makeLog(props.other, props.type), currency: props.currency }],
+    [props.other, props.type, props.currency]
+  )
   const table = useReactTable({
-    data: [{ ...makeLog(props.other, props.type), currency: props.currency }],
+    data,
     columns: useCommonLogsColumns(props.isAdmin, false),
     getCoreRowModel: getCoreRowModel(),
   })
@@ -143,6 +149,142 @@ function renderPreview(
   )
   return screen.getByRole('button', { name: /./ })
 }
+
+const walletFunding: WalletFundingLog = {
+  currency: 'CNY',
+  status: 'settled',
+  usd_quota: 250000,
+  cny_quota: 1000000,
+  usd_quota_per_unit: 250000,
+  cny_quota_per_unit: 500000,
+  debt_quota: 0,
+  exchange: {
+    enabled: true,
+    rate_id: 2,
+    rate: '7',
+    source: 'static',
+    source_time: new Date(2026, 9, 12, 8, 0, 0).getTime() / 1000,
+    policy_version: 3,
+  },
+}
+
+function renderFundingDetails(funding?: WalletFundingLog, type = 2) {
+  return render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <DetailsDialog
+          log={{
+            ...makeLog({ model_price: 0.25, wallet_funding: funding }, type),
+            currency: funding?.currency ?? 'CNY',
+          }}
+          open
+          isAdmin={false}
+          isRoot={false}
+          onOpenChange={() => {}}
+        />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+}
+
+test.each(['CNY', 'CUSTOM'] as const)(
+  'wallet funding preserves both recorded currencies and the frozen rate in %s display mode',
+  async (quotaDisplayType) => {
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType,
+        quotaPerUnit: 1000000,
+        usdExchangeRate: 14,
+        customCurrencySymbol: '€',
+        customCurrencyExchangeRate: 3,
+      },
+    })
+    renderFundingDetails(walletFunding)
+
+    const funding = within(
+      await screen.findByRole('region', { name: 'Wallet funding' })
+    )
+    expect(funding.getByText('$1')).toBeVisible()
+    expect(funding.getByText('¥2')).toBeVisible()
+    expect(funding.getByText('Settled')).toBeVisible()
+    expect(funding.getByText('1 USD = 7 CNY')).toBeVisible()
+    expect(funding.getByText('2026-10-12 08:00:00')).toBeVisible()
+    expect(funding.queryByText('Outstanding debt')).not.toBeInTheDocument()
+  }
+)
+
+test.each([
+  { status: 'reserved', label: 'Reserved' },
+  { status: 'submitted', label: 'Held pending settlement' },
+  { status: 'refunded', label: 'Refunded to original wallets' },
+] as const)(
+  'wallet funding labels $status amounts by their actual state',
+  async ({ status, label }) => {
+    renderFundingDetails(
+      { ...walletFunding, status },
+      status === 'refunded' ? 6 : 2
+    )
+    const funding = within(
+      await screen.findByRole('region', { name: 'Wallet funding' })
+    )
+    expect(funding.getByText(label)).toBeVisible()
+    expect(funding.getByText('$1')).toBeVisible()
+    expect(funding.getByText('¥2')).toBeVisible()
+    expect(funding.queryByText('Settled')).not.toBeInTheDocument()
+    expect(funding.queryByText('Outstanding debt')).not.toBeInTheDocument()
+  }
+)
+
+test('wallet funding identifies native debt included in the wallet amounts', async () => {
+  renderFundingDetails({ ...walletFunding, debt_quota: 250000 })
+  const funding = within(
+    await screen.findByRole('region', { name: 'Wallet funding' })
+  )
+  expect(funding.getByText('Outstanding debt')).toBeVisible()
+  expect(funding.getByText('¥0.5')).toBeVisible()
+  expect(funding.getByText('¥2')).toBeVisible()
+  expect(
+    funding.getByText('Debt is included in the wallet amounts.')
+  ).toBeVisible()
+  await act(() => i18n.changeLanguage('zh'))
+  const translatedFunding = within(
+    screen.getByRole('region', { name: '钱包资金来源' })
+  )
+  expect(translatedFunding.getByText('欠费')).toBeVisible()
+  expect(translatedFunding.getByText('¥0.5')).toBeVisible()
+})
+
+test.each([
+  { usd_quota: 250000, amount: '$1' },
+  { usd_quota: 0, amount: '$0' },
+])(
+  'wallet funding omits unused currencies and rates for native amount $amount',
+  async ({ usd_quota, amount }) => {
+    renderFundingDetails({
+      ...walletFunding,
+      currency: 'USD',
+      usd_quota,
+      cny_quota: 0,
+    })
+    const funding = within(
+      await screen.findByRole('region', { name: 'Wallet funding' })
+    )
+    expect(funding.getByText('USD wallet amount')).toBeVisible()
+    expect(funding.getByText(amount)).toBeVisible()
+    expect(funding.queryByText('CNY wallet amount')).not.toBeInTheDocument()
+    expect(funding.queryByText('Frozen exchange rate')).not.toBeInTheDocument()
+  }
+)
+
+test('legacy logs without a wallet receipt do not invent funding details', async () => {
+  renderFundingDetails()
+  expect(await screen.findByRole('dialog')).toBeVisible()
+  expect(
+    screen.queryByRole('region', { name: 'Wallet funding' })
+  ).not.toBeInTheDocument()
+  expect(screen.queryByText('Frozen exchange rate')).not.toBeInTheDocument()
+})
 
 test('keeps log details open when the parent refreshes with unchanged data', async () => {
   const other = { model_price: 0.25 }

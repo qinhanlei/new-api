@@ -115,7 +115,26 @@ export interface ToolSurchargeItem {
   price: number
 }
 
+export interface WalletFundingLog {
+  currency: 'USD' | 'CNY'
+  status: 'reserved' | 'submitted' | 'settled' | 'refunded'
+  usd_quota: number
+  cny_quota: number
+  usd_quota_per_unit: number
+  cny_quota_per_unit: number
+  debt_quota: number
+  exchange: {
+    enabled: boolean
+    rate_id?: number
+    rate?: string
+    source?: string
+    source_time?: number
+    policy_version: number
+  }
+}
+
 export interface LogOtherData {
+  wallet_funding?: WalletFundingLog
   billing_status?: 'reserved' | 'settled' | 'refunded'
   reserved_quota?: number
   quota_per_unit?: number

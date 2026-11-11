@@ -21,6 +21,7 @@ import { formatLogQuota, formatTimestampToDate } from '@/lib/format'
 import type { UsageLog } from '../data/schema'
 import {
   getNativeQuotaAdjustment,
+  getWalletFundingDisplay,
   logTokenName,
   parseLogOther,
   renderLogContent,
@@ -62,6 +63,13 @@ export function getLogCsvHeader(isAdmin: boolean, t: Translate): string[] {
     t('Quota before adjustment'),
     t('Quota after adjustment'),
     t('Reason'),
+    t('USD wallet amount'),
+    t('CNY wallet amount'),
+    t('Frozen exchange rate (CNY per USD)'),
+    t('Exchange rate source time'),
+    t('Funding status'),
+    t('Outstanding debt'),
+    t('Debt currency'),
   ]
 }
 
@@ -73,6 +81,7 @@ export function getLogCsvRow(
 ): string[] {
   const other = parseLogOther(log.other ?? '')
   const adjustment = getNativeQuotaAdjustment(log, other)
+  const funding = getWalletFundingDisplay(other?.wallet_funding, t)
   const usage = isDisplayableLogType(log.type)
   const cacheWrite =
     (other?.cache_creation_tokens_5m ?? 0) +
@@ -124,6 +133,13 @@ export function getLogCsvRow(
     adjustment?.before ?? '',
     adjustment?.after ?? '',
     adjustment?.reason ?? '',
+    funding?.usdAmount ?? '',
+    funding?.cnyAmount ?? '',
+    funding?.exchangeRate ?? '',
+    funding?.exchangeTime ?? '',
+    funding?.status ?? '',
+    funding?.debtAmount ?? '',
+    funding?.debtCurrency ?? '',
   ]
 }
 

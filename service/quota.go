@@ -3,11 +3,9 @@ package service
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
@@ -85,73 +83,68 @@ func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
 	return common.QuotaFromDecimalChecked(quota)
 }
 
-func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
-	if relayInfo.UsePrice {
+// RealtimeQuota evaluates cumulative usage with the admitted model/group prices.
+// It deliberately does not read live ratios while a connection is in flight.
+func RealtimeQuota(info *relaycommon.RelayInfo, usage *dto.RealtimeUsage) int {
+	if ok, quota, _ := TryTieredSettle(info, billingexpr.TokenParams{P: float64(usage.InputTokens), C: float64(usage.OutputTokens), Len: float64(usage.InputTokens)}); ok {
+		return quota
+	}
+	price := info.PriceData
+	var amount decimal.Decimal
+	if price.UsePrice {
+		scale := common.QuotaPerUnit
+		if session, ok := info.Billing.(*BillingSession); ok {
+			session.mu.Lock()
+			if wallet, ok := session.funding.(*WalletFunding); ok && wallet.record != nil {
+				scale = wallet.record.USDQuotaPerUnit
+			}
+			session.mu.Unlock()
+		}
+		amount = decimal.NewFromFloat(price.ModelPrice).Mul(decimal.NewFromFloat(scale)).Mul(decimal.NewFromFloat(price.GroupRatioInfo.GroupRatio))
+	} else {
+		amount = decimal.NewFromInt(int64(usage.InputTokenDetails.TextTokens)).
+			Add(decimal.NewFromInt(int64(usage.OutputTokenDetails.TextTokens)).Mul(decimal.NewFromFloat(price.CompletionRatio))).
+			Add(decimal.NewFromInt(int64(usage.InputTokenDetails.AudioTokens)).Mul(decimal.NewFromFloat(price.AudioRatio))).
+			Add(decimal.NewFromInt(int64(usage.OutputTokenDetails.AudioTokens)).Mul(decimal.NewFromFloat(price.AudioRatio)).Mul(decimal.NewFromFloat(price.AudioCompletionRatio))).
+			Mul(decimal.NewFromFloat(price.ModelRatio)).Mul(decimal.NewFromFloat(price.GroupRatioInfo.GroupRatio))
+		if usage.TotalTokens > 0 && price.ModelRatio != 0 && price.GroupRatioInfo.GroupRatio != 0 && amount.LessThanOrEqual(decimal.Zero) {
+			amount = decimal.NewFromInt(1)
+		}
+	}
+	quota, clamp := common.QuotaFromDecimalChecked(amount)
+	noteQuotaClamp(info, clamp)
+	return quota
+}
+
+// Usage already delivered by the provider is reserved cumulatively, including
+// debt when needed. Final settlement later adjusts this same reservation once.
+func PreWssConsumeQuota(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
+	// A free model has no funding session.
+	if info.Billing == nil {
 		return nil
 	}
-	userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
-	if err != nil {
-		return err
+	return info.Billing.Reserve(RealtimeQuota(info, usage))
+}
+
+// ReserveRealtimeTurn requires fresh funds before another paid turn. The
+// completed usage and outstanding input/response budgets share one frozen ledger.
+func ReserveRealtimeTurn(info *relaycommon.RelayInfo, usage *dto.RealtimeUsage, pendingTurns int) error {
+	if info.Billing == nil {
+		return nil
 	}
-
-	token, err := model.GetTokenByKey(strings.TrimPrefix(relayInfo.TokenKey, "sk-"), false)
-	if err != nil {
-		return err
+	quota := RealtimeQuota(info, usage)
+	if !info.PriceData.UsePrice {
+		target, clamp := common.QuotaFromDecimalChecked(decimal.NewFromInt(int64(quota)).Add(decimal.NewFromInt(int64(max(1, info.PriceData.QuotaToPreConsume))).Mul(decimal.NewFromInt(int64(pendingTurns)))))
+		noteQuotaClamp(info, clamp)
+		if clamp != nil {
+			return clamp
+		}
+		quota = target
 	}
-
-	modelName := relayInfo.OriginModelName
-	textInputTokens := usage.InputTokenDetails.TextTokens
-	textOutTokens := usage.OutputTokenDetails.TextTokens
-	audioInputTokens := usage.InputTokenDetails.AudioTokens
-	audioOutTokens := usage.OutputTokenDetails.AudioTokens
-	groupRatio := ratio_setting.GetGroupRatio(relayInfo.UsingGroup)
-	modelRatio, _, _ := ratio_setting.GetModelRatio(modelName)
-
-	autoGroup, exists := common.GetContextKey(ctx, constant.ContextKeyAutoGroup)
-	if exists {
-		groupRatio = ratio_setting.GetGroupRatio(autoGroup.(string))
-		logger.LogDebug(ctx, "final group ratio: %f", groupRatio)
-		relayInfo.UsingGroup = autoGroup.(string)
+	if session, ok := info.Billing.(*BillingSession); ok {
+		return session.ReserveStreamInput(quota)
 	}
-
-	actualGroupRatio := groupRatio
-	userGroupRatio, ok := ratio_setting.GetGroupGroupRatio(relayInfo.UserGroup, relayInfo.UsingGroup)
-	if ok {
-		actualGroupRatio = userGroupRatio
-	}
-
-	quotaInfo := QuotaInfo{
-		InputDetails: TokenDetails{
-			TextTokens:  textInputTokens,
-			AudioTokens: audioInputTokens,
-		},
-		OutputDetails: TokenDetails{
-			TextTokens:  textOutTokens,
-			AudioTokens: audioOutTokens,
-		},
-		ModelName:  modelName,
-		UsePrice:   relayInfo.UsePrice,
-		ModelRatio: modelRatio,
-		GroupRatio: actualGroupRatio,
-	}
-
-	quota, clamp := calculateAudioQuota(quotaInfo)
-	noteQuotaClamp(relayInfo, clamp)
-
-	if userQuota < quota {
-		return fmt.Errorf("user quota is not enough, user quota: %s, need quota: %s", logger.FormatQuota(userQuota), logger.FormatQuota(quota))
-	}
-
-	if !token.UnlimitedQuota && token.RemainQuota < quota {
-		return fmt.Errorf("token quota is not enough, token remain quota: %s, need quota: %s", logger.FormatQuota(token.RemainQuota), logger.FormatQuota(quota))
-	}
-
-	err = PostConsumeQuota(relayInfo, quota, 0, false)
-	if err != nil {
-		return err
-	}
-	logger.LogInfo(ctx, common.LogText("realtime streaming consume quota success, quota: %d", quota))
-	return nil
+	return info.Billing.ReserveBeforeSubmit(quota)
 }
 
 func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, modelName string,
@@ -168,39 +161,18 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	}
 
 	useTimeSeconds := time.Now().Unix() - relayInfo.StartTime.Unix()
-	textInputTokens := usage.InputTokenDetails.TextTokens
-	textOutTokens := usage.OutputTokenDetails.TextTokens
-
-	audioInputTokens := usage.InputTokenDetails.AudioTokens
-	audioOutTokens := usage.OutputTokenDetails.AudioTokens
 
 	tokenName := ctx.GetString("token_name")
-	completionRatio := decimal.NewFromFloat(ratio_setting.GetCompletionRatio(modelName))
-	audioRatio := decimal.NewFromFloat(ratio_setting.GetAudioRatio(relayInfo.OriginModelName))
-	audioCompletionRatio := decimal.NewFromFloat(ratio_setting.GetAudioCompletionRatio(modelName))
+	completionRatio := decimal.NewFromFloat(relayInfo.PriceData.CompletionRatio)
+	audioRatio := decimal.NewFromFloat(relayInfo.PriceData.AudioRatio)
+	audioCompletionRatio := decimal.NewFromFloat(relayInfo.PriceData.AudioCompletionRatio)
 
 	modelRatio := relayInfo.PriceData.ModelRatio
 	groupRatio := relayInfo.PriceData.GroupRatioInfo.GroupRatio
 	modelPrice := relayInfo.PriceData.ModelPrice
 	usePrice := relayInfo.PriceData.UsePrice
 
-	quotaInfo := QuotaInfo{
-		InputDetails: TokenDetails{
-			TextTokens:  textInputTokens,
-			AudioTokens: audioInputTokens,
-		},
-		OutputDetails: TokenDetails{
-			TextTokens:  textOutTokens,
-			AudioTokens: audioOutTokens,
-		},
-		ModelName:  modelName,
-		UsePrice:   usePrice,
-		ModelRatio: modelRatio,
-		GroupRatio: groupRatio,
-	}
-
-	quota, clamp := calculateAudioQuota(quotaInfo)
-	noteQuotaClamp(relayInfo, clamp)
+	quota := RealtimeQuota(relayInfo, usage)
 	if tieredOk {
 		quota = tieredQuota
 	}
@@ -222,22 +194,23 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		}))
 	}
 
-	// record all the consume log even if quota is 0
-	if totalTokens == 0 {
-		// in this case, must be some error happened
-		// we cannot just return, because we may have to return the pre-consumed quota
+	if totalTokens == 0 && !usePrice && !tieredOk {
 		quota = 0
-		logContent = append(logContent, common.NewMessage("Possibly an upstream timeout"))
-		logger.LogError(ctx, common.LogText("total tokens is 0, cannot consume quota, userId %d, channelId %d, tokenId %d, model %s， pre-consumed quota %d",
-			relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, modelName, relayInfo.FinalPreConsumedQuota))
-	} else {
-		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, quota)
-		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 	}
-
+	if session, ok := relayInfo.Billing.(*BillingSession); ok {
+		session.mu.Lock()
+		settled := session.settled
+		session.mu.Unlock()
+		if settled {
+			return
+		}
+	}
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
 		logger.LogError(ctx, common.LogText("error settling billing: %s", err.Error()))
+		return
 	}
+	model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, quota)
+	model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 
 	logModel := modelName
 	logContent = append(logContent, extraContent...)

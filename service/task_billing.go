@@ -24,7 +24,7 @@ import (
 // LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
 // 实际扣费已由 BillingSession（PreConsumeBilling + SettleBilling）完成。
 func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model.Task) {
-	if IsCNYBilling(info) {
+	if IsCNYBilling(info) || IsWalletFundedTask(task) {
 		return
 	}
 	tokenName := c.GetString("token_name")
@@ -264,8 +264,8 @@ func taskModelName(task *model.Task) string {
 // 当异步任务失败时，退还资金与令牌额度，并回减用户和渠道用量。
 // 返回资金来源是否已成功退还；失败时保留 quota，供显式重试或人工对账。
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
-	if IsCNYTask(task) {
-		// CNY tasks finalize status and funding together in FinalizeCNYTask.
+	if IsCNYTask(task) || IsWalletFundedTask(task) {
+		// Ledger-backed tasks finalize status and funding in one transaction.
 		return false
 	}
 	quota := task.Quota
@@ -315,7 +315,7 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 // reason 写入日志内容（例如按 token 重算或 adaptor 调整）。
 // clamps 可选：若计算 actualQuota 时发生额度饱和，将其记入日志 admin_info（仅管理员可见）。
 func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int, reason *common.Message, clamps ...*common.QuotaClamp) {
-	if IsCNYTask(task) {
+	if IsCNYTask(task) || IsWalletFundedTask(task) {
 		return
 	}
 	if actualQuota < 0 {

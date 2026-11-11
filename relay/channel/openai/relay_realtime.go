@@ -2,241 +2,340 @@ package openai
 
 import (
 	"fmt"
+	"math"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/i18n"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
-
-	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
 
+type realtimeFrame struct {
+	client bool
+	body   []byte
+	err    error
+}
+
+type realtimePendingCreate struct {
+	eventID      string
+	inputBatches int
+}
+
+func readRealtimeFrames(conn *websocket.Conn, client bool, frames chan<- realtimeFrame, done <-chan struct{}) {
+	for {
+		_, body, err := conn.ReadMessage()
+		select {
+		case frames <- realtimeFrame{client: client, body: body, err: err}:
+		case <-done:
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// A single owner processes both directions, so usage and submission state cannot
+// race. Reader goroutines only transfer frames and never mutate billing state.
 func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.NewAPIError, *dto.RealtimeUsage) {
 	if info == nil || info.ClientWs == nil || info.TargetWs == nil {
 		return types.NewError(fmt.Errorf("invalid websocket connection"), types.ErrorCodeBadResponse), nil
 	}
-
 	info.IsStream = true
-	clientConn := info.ClientWs
-	targetConn := info.TargetWs
-
-	clientClosed := make(chan struct{})
-	targetClosed := make(chan struct{})
-	sendChan := make(chan []byte, 100)
-	receiveChan := make(chan []byte, 100)
-	errChan := make(chan error, 2)
-
-	usage := &dto.RealtimeUsage{}
-	localUsage := &dto.RealtimeUsage{}
-	sumUsage := &dto.RealtimeUsage{}
-
-	gopool.Go(func() {
-		defer func() {
-			if r := recover(); r != nil {
-				errChan <- fmt.Errorf("panic in client reader: %v", r)
+	frames, done := make(chan realtimeFrame, 2), make(chan struct{})
+	defer close(done)
+	defer info.ClientWs.Close()
+	defer info.TargetWs.Close()
+	go readRealtimeFrames(info.ClientWs, true, frames, done)
+	go readRealtimeFrames(info.TargetWs, false, frames, done)
+	total := &dto.RealtimeUsage{}
+	active := make(map[string]bool)
+	completed := make(map[string]bool)
+	var waiting []realtimePendingCreate
+	// Committed audio and conversation items remain owed even if a later
+	// response.create is rejected. Only uncommitted audio can be cleared.
+	pendingInputBatches := 0
+	pendingAutoBatches := 0
+	autoResponse := true
+	bufferedAudio := false
+	var audioVersion uint64
+	var pendingClears []uint64
+	clientCommits := 0
+	inFlight, hasUsage, untrackedResponse := false, false, false
+	var relayErr error
+loop:
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			relayErr = c.Request.Context().Err()
+			break loop
+		case frame := <-frames:
+			if frame.err != nil {
+				if !websocket.IsCloseError(frame.err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					relayErr = frame.err
+				}
+				break loop
 			}
-		}()
-		for {
-			select {
-			case <-c.Done():
-				return
-			default:
-				_, message, err := clientConn.ReadMessage()
-				if err != nil {
-					if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-						errChan <- fmt.Errorf("error reading from client: %v", err)
+			var event dto.RealtimeEvent
+			if err := common.Unmarshal(frame.body, &event); err != nil {
+				relayErr = err
+				break loop
+			}
+			if frame.client {
+				paid := event.Type == dto.RealtimeEventTypeResponseCreate || event.Type == dto.RealtimeEventInputAudioBufferAppend || event.Type == dto.RealtimeEventTypeConversationCreate
+				if paid {
+					// Audio chunks share one input batch. response.create cannot
+					// consume uncommitted audio, so that buffer keeps its own hold.
+					pendingTurns := len(active) + len(waiting) + pendingInputBatches + pendingAutoBatches
+					if bufferedAudio {
+						pendingTurns++
 					}
-					close(clientClosed)
-					return
+					reserveInput := false
+					switch event.Type {
+					case dto.RealtimeEventTypeResponseCreate:
+						// One explicit response consumes all committed conversation inputs.
+						pendingTurns += 1 - pendingInputBatches
+						reserveInput = true
+					case dto.RealtimeEventInputAudioBufferAppend:
+						reserveInput = !bufferedAudio
+						if reserveInput {
+							pendingTurns++
+						}
+					default:
+						reserveInput = pendingInputBatches == 0
+						if reserveInput {
+							pendingTurns++
+						}
+					}
+					if reserveInput {
+						if err := service.ReserveRealtimeTurn(info, total, pendingTurns); err != nil {
+							if err = helper.WssObject(c, info.ClientWs, &dto.RealtimeEvent{Type: "error", EventId: event.EventId, Error: &types.OpenAIError{Type: "insufficient_quota", Code: "insufficient_quota", Message: err.Error()}}); err != nil {
+								relayErr = err
+								break loop
+							}
+							continue
+						}
+					}
+					if err := service.MarkCNYUpstreamPending(info, true); err != nil {
+						relayErr = err
+						break loop
+					}
+					inFlight = true
+					switch event.Type {
+					case dto.RealtimeEventTypeResponseCreate:
+						waiting = append(waiting, realtimePendingCreate{eventID: event.EventId, inputBatches: pendingInputBatches})
+						pendingInputBatches = 0
+					case dto.RealtimeEventInputAudioBufferAppend:
+						audioVersion++
+						bufferedAudio = true
+					default:
+						pendingInputBatches = max(1, pendingInputBatches)
+					}
+				}
+				switch event.Type {
+				case "input_audio_buffer.commit":
+					clientCommits++
+					if bufferedAudio {
+						pendingInputBatches++
+						bufferedAudio = false
+						audioVersion++
+					}
+				case "input_audio_buffer.clear":
+					pendingClears = append(pendingClears, audioVersion)
 				}
 
-				realtimeEvent := &dto.RealtimeEvent{}
-				err = common.Unmarshal(message, realtimeEvent)
-				if err != nil {
-					errChan <- fmt.Errorf("error unmarshalling message: %v", err)
-					return
+				if event.Type == dto.RealtimeEventTypeSessionUpdate && event.Session != nil && event.Session.Tools != nil {
+					info.RealtimeTools = event.Session.Tools
 				}
-
-				if realtimeEvent.Type == dto.RealtimeEventTypeSessionUpdate {
-					if realtimeEvent.Session != nil {
-						if realtimeEvent.Session.Tools != nil {
-							info.RealtimeTools = realtimeEvent.Session.Tools
+				if err := helper.WssString(c, info.TargetWs, string(frame.body)); err != nil {
+					relayErr = err
+					break loop
+				}
+				continue
+			}
+			info.SetFirstResponseTime()
+			var envelope struct {
+				Response *struct {
+					ID string `json:"id"`
+				} `json:"response"`
+				Error *struct {
+					Type    string `json:"type"`
+					EventID string `json:"event_id"`
+				} `json:"error"`
+				Session *struct {
+					Audio *struct {
+						Input *struct {
+							TurnDetection any `json:"turn_detection"`
+						} `json:"input"`
+					} `json:"audio"`
+				} `json:"session"`
+			}
+			if err := common.Unmarshal(frame.body, &envelope); err != nil {
+				relayErr = err
+				break loop
+			}
+			responseID := ""
+			if envelope.Response != nil {
+				responseID = envelope.Response.ID
+			}
+			if event.Type == dto.RealtimeEventTypeResponseDone && responseID != "" && completed[responseID] {
+				continue
+			}
+			if strings.HasPrefix(event.Type, "response.") {
+				inFlight = true
+				if event.Type != "response.created" && event.Type != dto.RealtimeEventTypeResponseDone && len(active) == 0 {
+					untrackedResponse = true
+				}
+				if err := service.MarkCNYUpstreamPending(info, true); err != nil {
+					relayErr = err
+					break loop
+				}
+			}
+			switch event.Type {
+			case "error":
+				if envelope.Error != nil && envelope.Error.Type == "invalid_request_error" && envelope.Error.EventID != "" {
+					for i, pending := range waiting {
+						if pending.eventID == envelope.Error.EventID {
+							pendingInputBatches += pending.inputBatches
+							waiting = append(waiting[:i], waiting[i+1:]...)
+							inFlight = len(active) != 0 || len(waiting) != 0 || pendingInputBatches != 0 || pendingAutoBatches != 0 || bufferedAudio || untrackedResponse
+							break
 						}
 					}
 				}
-
-				textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
-				if err != nil {
-					errChan <- fmt.Errorf("error counting text token: %v", err)
-					return
-				}
-				logger.LogInfo(c, common.LogText("type: %s, textToken: %d, audioToken: %d", realtimeEvent.Type, textToken, audioToken))
-				localUsage.TotalTokens += textToken + audioToken
-				localUsage.InputTokens += textToken + audioToken
-				localUsage.InputTokenDetails.TextTokens += textToken
-				localUsage.InputTokenDetails.AudioTokens += audioToken
-
-				err = helper.WssString(c, targetConn, string(message))
-				if err != nil {
-					errChan <- fmt.Errorf("error writing to target: %v", err)
-					return
-				}
-
-				select {
-				case sendChan <- message:
-				default:
-				}
-			}
-		}
-	})
-
-	gopool.Go(func() {
-		defer func() {
-			if r := recover(); r != nil {
-				errChan <- fmt.Errorf("panic in target reader: %v", r)
-			}
-		}()
-		for {
-			select {
-			case <-c.Done():
-				return
-			default:
-				_, message, err := targetConn.ReadMessage()
-				if err != nil {
-					if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-						errChan <- fmt.Errorf("error reading from target: %v", err)
-					}
-					close(targetClosed)
-					return
-				}
-				info.SetFirstResponseTime()
-				realtimeEvent := &dto.RealtimeEvent{}
-				err = common.Unmarshal(message, realtimeEvent)
-				if err != nil {
-					errChan <- fmt.Errorf("error unmarshalling message: %v", err)
-					return
-				}
-
-				if realtimeEvent.Type == dto.RealtimeEventTypeResponseDone {
-					realtimeUsage := realtimeEvent.Response.Usage
-					if realtimeUsage != nil {
-						usage.TotalTokens += realtimeUsage.TotalTokens
-						usage.InputTokens += realtimeUsage.InputTokens
-						usage.OutputTokens += realtimeUsage.OutputTokens
-						usage.InputTokenDetails.AudioTokens += realtimeUsage.InputTokenDetails.AudioTokens
-						usage.InputTokenDetails.CachedTokens += realtimeUsage.InputTokenDetails.CachedTokens
-						usage.InputTokenDetails.TextTokens += realtimeUsage.InputTokenDetails.TextTokens
-						usage.OutputTokenDetails.AudioTokens += realtimeUsage.OutputTokenDetails.AudioTokens
-						usage.OutputTokenDetails.TextTokens += realtimeUsage.OutputTokenDetails.TextTokens
-						err := preConsumeUsage(c, info, usage, sumUsage)
-						if err != nil {
-							errChan <- fmt.Errorf("error consume usage: %v", err)
-							return
-						}
-						// 本次计费完成，清除
-						usage = &dto.RealtimeUsage{}
-
-						localUsage = &dto.RealtimeUsage{}
+			case "input_audio_buffer.committed":
+				if clientCommits > 0 {
+					clientCommits--
+				} else if bufferedAudio {
+					if autoResponse {
+						pendingAutoBatches++
 					} else {
-						textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
-						if err != nil {
-							errChan <- fmt.Errorf("error counting text token: %v", err)
-							return
-						}
-						logger.LogInfo(c, common.LogText("type: %s, textToken: %d, audioToken: %d", realtimeEvent.Type, textToken, audioToken))
-						localUsage.TotalTokens += textToken + audioToken
-						info.IsFirstRequest = false
-						localUsage.InputTokens += textToken + audioToken
-						localUsage.InputTokenDetails.TextTokens += textToken
-						localUsage.InputTokenDetails.AudioTokens += audioToken
-						err = preConsumeUsage(c, info, localUsage, sumUsage)
-						if err != nil {
-							errChan <- fmt.Errorf("error consume usage: %v", err)
-							return
-						}
-						// 本次计费完成，清除
-						localUsage = &dto.RealtimeUsage{}
-						// print now usage
+						pendingInputBatches++
 					}
-					logger.LogInfo(c, common.LogText("realtime streaming sumUsage: %v", sumUsage))
-					logger.LogInfo(c, common.LogText("realtime streaming localUsage: %v", localUsage))
-					logger.LogInfo(c, common.LogText("realtime streaming localUsage: %v", localUsage))
-
-				} else if realtimeEvent.Type == dto.RealtimeEventTypeSessionUpdated || realtimeEvent.Type == dto.RealtimeEventTypeSessionCreated {
-					realtimeSession := realtimeEvent.Session
-					if realtimeSession != nil {
-						// update audio format
-						info.InputAudioFormat = common.GetStringIfEmpty(realtimeSession.InputAudioFormat, info.InputAudioFormat)
-						info.OutputAudioFormat = common.GetStringIfEmpty(realtimeSession.OutputAudioFormat, info.OutputAudioFormat)
+					bufferedAudio = false
+					audioVersion++
+				}
+			case "input_audio_buffer.cleared":
+				if len(pendingClears) != 0 {
+					if pendingClears[0] == audioVersion {
+						bufferedAudio = false
+						inFlight = len(active) != 0 || len(waiting) != 0 || pendingInputBatches != 0 || pendingAutoBatches != 0 || untrackedResponse
 					}
+					pendingClears = pendingClears[1:]
+				}
+			case "response.created":
+				if active[responseID] {
+					break
+				}
+				if pendingAutoBatches > 0 {
+					pendingAutoBatches--
+				} else if len(waiting) > 0 {
+					waiting = waiting[1:]
 				} else {
-					textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
-					if err != nil {
-						errChan <- fmt.Errorf("error counting text token: %v", err)
-						return
+					pendingInputBatches = max(0, pendingInputBatches-1)
+				}
+				active[responseID] = true
+				inFlight = true
+				if err := service.MarkCNYUpstreamPending(info, true); err != nil {
+					relayErr = err
+					break loop
+				}
+			case dto.RealtimeEventTypeResponseDone:
+				if responseID != "" && completed[responseID] {
+					continue
+				}
+				if event.Response == nil || event.Response.Usage == nil {
+					relayErr = fmt.Errorf("%s", i18n.T(c, i18n.MsgBillingUpstreamUsageUnknown))
+					break loop
+				}
+				if err := addRealtimeUsage(total, event.Response.Usage); err != nil {
+					relayErr = fmt.Errorf("%s", i18n.T(c, i18n.MsgBillingRealtimeUsageInvalid))
+					break loop
+				}
+				if err := service.PreWssConsumeQuota(c, info, total); err != nil {
+					relayErr = err
+					break loop
+				}
+				hasUsage = true
+				if !active[responseID] {
+					if pendingAutoBatches > 0 {
+						pendingAutoBatches--
+					} else if len(waiting) > 0 {
+						waiting = waiting[1:]
+					} else {
+						pendingInputBatches = max(0, pendingInputBatches-1)
 					}
-					logger.LogInfo(c, common.LogText("type: %s, textToken: %d, audioToken: %d", realtimeEvent.Type, textToken, audioToken))
-					localUsage.TotalTokens += textToken + audioToken
-					localUsage.OutputTokens += textToken + audioToken
-					localUsage.OutputTokenDetails.TextTokens += textToken
-					localUsage.OutputTokenDetails.AudioTokens += audioToken
 				}
-
-				err = helper.WssString(c, clientConn, string(message))
-				if err != nil {
-					errChan <- fmt.Errorf("error writing to client: %v", err)
-					return
+				delete(active, responseID)
+				if responseID != "" {
+					completed[responseID] = true
 				}
-
-				select {
-				case receiveChan <- message:
-				default:
+				inFlight = len(active) != 0 || len(waiting) != 0 || pendingInputBatches != 0 || pendingAutoBatches != 0 || bufferedAudio || untrackedResponse
+			case dto.RealtimeEventTypeSessionUpdated, dto.RealtimeEventTypeSessionCreated:
+				if event.Session != nil {
+					turnDetection := event.Session.TurnDetection
+					if envelope.Session != nil && envelope.Session.Audio != nil && envelope.Session.Audio.Input != nil {
+						turnDetection = envelope.Session.Audio.Input.TurnDetection
+					}
+					autoResponse = turnDetection != nil
+					if detection, ok := turnDetection.(map[string]any); ok {
+						if enabled, ok := detection["create_response"].(bool); ok {
+							autoResponse = enabled
+						}
+					}
+					info.InputAudioFormat = common.GetStringIfEmpty(event.Session.InputAudioFormat, info.InputAudioFormat)
+					info.OutputAudioFormat = common.GetStringIfEmpty(event.Session.OutputAudioFormat, info.OutputAudioFormat)
 				}
 			}
+			if !inFlight && service.CNYUpstreamPending(info) {
+				if err := service.MarkCNYUpstreamPending(info, false); err != nil {
+					relayErr = err
+					inFlight = true
+					break loop
+				}
+			}
+			if err := helper.WssString(c, info.ClientWs, string(frame.body)); err != nil {
+				relayErr = err
+				break loop
+			}
 		}
-	})
-
-	select {
-	case <-clientClosed:
-	case <-targetClosed:
-	case err := <-errChan:
-		//return service.OpenAIErrorWrapper(err, "realtime_error", http.StatusInternalServerError), nil
-		logger.LogError(c, common.LogText("realtime error: %s", err.Error()))
-	case <-c.Done():
 	}
-
-	if usage.TotalTokens != 0 {
-		_ = preConsumeUsage(c, info, usage, sumUsage)
+	if inFlight {
+		if relayErr == nil {
+			relayErr = fmt.Errorf("%s", i18n.T(c, i18n.MsgBillingUpstreamUsageUnknown))
+		}
+		return types.NewError(relayErr, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry()), nil
 	}
-
-	if localUsage.TotalTokens != 0 {
-		_ = preConsumeUsage(c, info, localUsage, sumUsage)
+	var apiErr *types.NewAPIError
+	if relayErr != nil {
+		apiErr = types.NewError(relayErr, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 	}
-
-	// check usage total tokens, if 0, use local usage
-
-	return nil, sumUsage
+	if !hasUsage {
+		return apiErr, nil
+	}
+	return apiErr, total
 }
 
-func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.RealtimeUsage, totalUsage *dto.RealtimeUsage) error {
-	if usage == nil || totalUsage == nil {
-		return fmt.Errorf("invalid usage pointer")
+func addRealtimeUsage(total, usage *dto.RealtimeUsage) error {
+	for _, field := range []struct {
+		total *int
+		value int
+	}{
+		{&total.TotalTokens, usage.TotalTokens}, {&total.InputTokens, usage.InputTokens}, {&total.OutputTokens, usage.OutputTokens},
+		{&total.InputTokenDetails.CachedTokens, usage.InputTokenDetails.CachedTokens}, {&total.InputTokenDetails.TextTokens, usage.InputTokenDetails.TextTokens},
+		{&total.InputTokenDetails.AudioTokens, usage.InputTokenDetails.AudioTokens}, {&total.OutputTokenDetails.TextTokens, usage.OutputTokenDetails.TextTokens},
+		{&total.OutputTokenDetails.AudioTokens, usage.OutputTokenDetails.AudioTokens},
+	} {
+		if field.value < 0 || *field.total > math.MaxInt-field.value {
+			return fmt.Errorf("invalid realtime usage")
+		}
+		*field.total += field.value
 	}
-
-	totalUsage.TotalTokens += usage.TotalTokens
-	totalUsage.InputTokens += usage.InputTokens
-	totalUsage.OutputTokens += usage.OutputTokens
-	totalUsage.InputTokenDetails.CachedTokens += usage.InputTokenDetails.CachedTokens
-	totalUsage.InputTokenDetails.TextTokens += usage.InputTokenDetails.TextTokens
-	totalUsage.InputTokenDetails.AudioTokens += usage.InputTokenDetails.AudioTokens
-	totalUsage.OutputTokenDetails.TextTokens += usage.OutputTokenDetails.TextTokens
-	totalUsage.OutputTokenDetails.AudioTokens += usage.OutputTokenDetails.AudioTokens
-	// clear usage
-	err := service.PreWssConsumeQuota(ctx, info, usage)
-	return err
+	return nil
 }

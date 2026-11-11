@@ -583,6 +583,11 @@ func executeTaskSubmissionWith(
 
 		stage = "submit"
 		result, taskErr = submit(c, relayInfo)
+		if taskErr == nil && result != nil {
+			if pendingErr := service.MarkWalletTaskSubmitted(relayInfo); pendingErr != nil {
+				taskErr = service.TaskErrorWrapperLocal(pendingErr, "task_billing_pending_failed", http.StatusInternalServerError)
+			}
+		}
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
@@ -637,7 +642,7 @@ func executeTaskSubmissionWith(
 	// after the barrier normally has a zero positive delta. A relayed event
 	// stream is billed even when this reserve fails: settlement then charges
 	// past the available quota, as it does for any usage above its reservation.
-	if relayInfo.Billing != nil && !service.IsCNYBilling(relayInfo) {
+	if relayInfo.Billing != nil && !service.IsCNYBilling(relayInfo) && !service.IsWalletBilling(relayInfo) {
 		stage = "reserve"
 		diagnostics.reserve("reserve_start", result.Quota)
 		if reserveErr := relayInfo.Billing.Reserve(result.Quota); reserveErr != nil {
@@ -724,14 +729,22 @@ func executeTaskSubmissionWith(
 			insertOmits = append(insertOmits, "data")
 		}
 	}
+	service.AttachWalletTaskBilling(c, relayInfo, task)
 	diagnostics.insertStart(task)
 	var insertErr error
+	created := true
 	if service.IsCNYBilling(relayInfo) {
 		var final *model.CNYTaskSettlement
 		if immediateTerminal {
 			final = &model.CNYTaskSettlement{Quota: result.Quota, Refund: task.Status == model.TaskStatusFailure, Usage: service.CNYTaskUsage(task, relayInfo.QuotaClamp)}
 		}
 		insertErr = model.InsertCNYTask(c.Request.Context(), task, final, insertOmits...)
+	} else if service.IsWalletBilling(relayInfo) {
+		var final *model.WalletTaskSettlement
+		if immediateTerminal {
+			final = &model.WalletTaskSettlement{Quota: result.Quota, Refund: task.Status == model.TaskStatusFailure}
+		}
+		created, insertErr = model.InsertWalletTask(c.Request.Context(), task, final, insertOmits...)
 	} else {
 		insertErr = task.InsertWithContext(c.Request.Context(), insertOmits...)
 	}
@@ -741,7 +754,7 @@ func executeTaskSubmissionWith(
 		diagnostics.failed("insert", "database_error", taskErr, false)
 		// The client of a relayed event stream already holds the vendor's
 		// work, so it is settled and logged without a task row.
-		if c.Writer.Written() && !service.IsCNYBilling(relayInfo) {
+		if c.Writer.Written() && !service.IsCNYBilling(relayInfo) && !service.IsWalletBilling(relayInfo) {
 			if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
 				common.SysError(common.LogText("settle task billing error: %s", settleErr.Error()))
 				return nil, taskErr
@@ -755,7 +768,7 @@ func executeTaskSubmissionWith(
 	diagnostics.durable(task)
 	diagnostics.settleStart(task, result.Quota)
 
-	if !service.IsCNYBilling(relayInfo) {
+	if !service.IsCNYBilling(relayInfo) && !service.IsWalletBilling(relayInfo) {
 		if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
 			common.SysError(common.LogText("settle task billing error: %s", settleErr.Error()))
 			taskErr = service.TaskErrorWrapperLocal(errors.New("failed to settle task billing"), "task_billing_settlement_failed", http.StatusInternalServerError)
@@ -763,7 +776,12 @@ func executeTaskSubmissionWith(
 			return nil, taskErr
 		}
 	}
-	perfmetrics.RecordImmediateTaskResult(relayInfo, result.Immediate)
+	if created {
+		perfmetrics.RecordImmediateTaskResult(relayInfo, result.Immediate)
+		if service.IsWalletFundedTask(task) && immediateTerminal {
+			service.LogWalletTaskConsumption(task, relayInfo.QuotaClamp)
+		}
+	}
 	if task.Status != model.TaskStatusFailure {
 		service.MarkRequestPolicySuccess(c, nil)
 	} else {

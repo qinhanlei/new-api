@@ -118,6 +118,11 @@ const (
 
 // Native billing currency admission errors returned to API clients.
 const (
+	MsgBillingUpstreamUsageUnknown       = "billing.upstream_usage_unknown"
+	MsgBillingRealtimeUsageInvalid       = "billing.realtime_usage_invalid"
+	MsgBillingWalletInsufficient         = "billing.wallet_insufficient"
+	MsgBillingWalletUnavailable          = "billing.wallet_unavailable"
+	MsgBillingExchangeUnavailable        = "billing.exchange_unavailable"
 	MsgBillingCurrencyRetryMismatch      = "billing.currency_retry_mismatch"
 	MsgBillingUSDTokenExhausted          = "billing.usd_token_exhausted"
 	MsgBillingCurrencyUnsupported        = "billing.currency_unsupported"

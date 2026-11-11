@@ -44,16 +44,17 @@ import { DEFAULT_CURRENCY_CONFIG } from '@/stores/system-config-store'
 
 import { FormDirtyIndicator } from '../components/form-dirty-indicator'
 import { FormNavigationGuard } from '../components/form-navigation-guard'
+import { SettingsCard } from '../components/settings-card'
 import {
   SettingsForm,
   SettingsSwitchContent,
   SettingsSwitchItem,
 } from '../components/settings-form-layout'
 import { SettingsPageFormActions } from '../components/settings-page-context'
-import { SettingsSection } from '../components/settings-section'
 import { useSettingsForm } from '../hooks/use-settings-form'
 import { useUpdateOption } from '../hooks/use-update-option'
 import { safeNumberFieldProps } from '../utils/numeric-field'
+import { CurrencyBillingSection } from './currency-billing-section'
 
 const createPricingSchema = (t: (key: string) => string) =>
   z
@@ -146,17 +147,15 @@ export function PricingSection({ defaultValues }: PricingSectionProps) {
 
   return (
     <>
+      <CurrencyBillingSection />
       <FormNavigationGuard when={isDirty} />
 
-      <SettingsSection title={t('Pricing & Display')}>
+      <SettingsCard title={t('Pricing & Display')}>
         <Form {...form}>
-          <SettingsForm onSubmit={handleSubmit}>
-            <SettingsPageFormActions
-              onSave={handleSubmit}
-              onReset={handleReset}
-              isSaving={updateOption.isPending || isSubmitting}
-              isResetDisabled={!isDirty}
-            />
+          <SettingsForm
+            aria-label={t('Pricing & Display')}
+            onSubmit={handleSubmit}
+          >
             <FormDirtyIndicator isDirty={isDirty} />
             {showQuotaPerUnit && (
               <FormField
@@ -222,7 +221,9 @@ export function PricingSection({ defaultValues }: PricingSectionProps) {
                     </SelectContent>
                   </Select>
                   <FormDescription>
-                    {t('Choose how quota values are shown to users')}
+                    {t(
+                      'Applies to reference prices. Wallet balances and consumption keep their original currency.'
+                    )}
                   </FormDescription>
                   <FormMessage />
                 </FormItem>
@@ -238,9 +239,7 @@ export function PricingSection({ defaultValues }: PricingSectionProps) {
                     <FormLabel>
                       {displayType === 'CNY'
                         ? t('CNY per USD')
-                        : displayType === 'USD'
-                          ? t('USD Exchange Rate')
-                          : t('USD Exchange Rate')}
+                        : t('USD Exchange Rate')}
                     </FormLabel>
                     <FormControl>
                       <Input
@@ -368,9 +367,16 @@ export function PricingSection({ defaultValues }: PricingSectionProps) {
                 </SettingsSwitchItem>
               )}
             />
+            <SettingsPageFormActions
+              inline
+              onSave={handleSubmit}
+              onReset={handleReset}
+              isSaving={updateOption.isPending || isSubmitting}
+              isResetDisabled={!isDirty}
+            />
           </SettingsForm>
         </Form>
-      </SettingsSection>
+      </SettingsCard>
     </>
   )
 }

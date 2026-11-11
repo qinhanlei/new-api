@@ -468,7 +468,7 @@ When a request arrives and the model uses `tiered_expr` billing:
 4. Converts output to quota: `rawCost / 1,000,000 * QuotaPerUnit`. For token-priced leaves, multiplies this reservation by `quota_setting.pre_consume_multiplier` (default 1; any finite positive decimal). The multiplier does not change context-length tier selection, actual settlement, or request-priced leaves. The snapshot freezes the multiplier for image quantity retries; group retries reuse the multiplied reservation. Older snapshots with no multiplier retain a factor of 1.
 5. Creates `BillingSnapshot` and stores it on `RelayInfo`. Expression, currency, and request state stay frozen for settlement. An auto-group retry refreshes group-dependent fields from the selected group before the next upstream attempt. If a free initial group skipped pre-consume and the retry selects a paid group, the billing session is created before that attempt. If an existing session moves to a more expensive group, its reservation is raised to that group's estimate before sending; cheaper groups are refunded only after actual usage is settled.
 
-Wallet trust bypass uses `quota_setting.trust_quota_usd` (default 10 USD; 0 disables bypass). Both the wallet and any limited API token must exceed the threshold. The wallet must still cover the estimated reservation before bypass is considered. Subscriptions and asynchronous tasks do not use this bypass. Legacy token-ratio pricing also reserves estimated input cost times the multiplier, without the former `PreConsumedQuota` floor or output-token estimate. Task usage pricing is unchanged.
+Wallet trust bypass uses `quota_setting.trust_quota_usd` (default 10 USD; 0 disables bypass). Both the wallet and any limited API token must exceed the threshold. The wallet must still cover the estimated reservation before bypass is considered. Cross-currency funding, subscriptions, and asynchronous tasks do not use this bypass. Legacy token-ratio pricing also reserves estimated input cost times the multiplier, without the former `PreConsumedQuota` floor or output-token estimate. Task usage pricing is unchanged.
 
 ### 4. Settlement (Actual Billing)
 
@@ -615,17 +615,18 @@ native USD or CNY units regardless of the display currency or exchange rate.
 The display preference remains available for reference pricing and payment
 conversion. Historical logs use their recorded quota scale when available.
 
-The CNY wallet is separate from the existing USD wallet and subscriptions.
-USD balances and subscription allowances cannot pay CNY charges, and
-`subscription_only` accounts cannot submit CNY requests. CNY funding currently
-uses administrator adjustments; payment integrations and currency exchange are
-not connected to this wallet.
+The CNY wallet is separate from the USD wallet and subscriptions. By default,
+each request can spend only its pricing currency. Administrators can enable
+cross-currency wallet funding as described below. Subscription allowances cannot
+pay CNY charges, and `subscription_only` accounts cannot submit CNY requests.
+CNY funding currently uses administrator adjustments; payment integrations do
+not credit this wallet.
 
 CNY supports ordinary text HTTP requests (including SSE) and task-usage billing.
 Paid built-in tools, native WebSocket requests, AWS SDK InvokeModel routes, and
 Xunfei are rejected before submission. AWS Mantle HTTP remains supported.
 
-Unknown upstream outcomes retain their CNY reservation. Tasks with unresolved
+Unknown upstream outcomes retain their wallet reservation. Tasks with unresolved
 outcomes can enter `AWAITING_REVIEW`, which stops automatic polling without
 refunding. Check the upstream request/task status and billed usage before manual
 settlement, refund, or resubmission. There is currently no automatic
@@ -637,6 +638,86 @@ and pricing configuration. An older binary cannot interpret CNY task quotas or
 snapshots safely: do not downgrade it against a database containing active CNY
 work. Stop CNY admission and resolve outstanding work first; restore a verified
 pre-CNY backup only when the subsequent transactions have been accounted for.
+
+### Cross-currency wallet funding and exchange rates
+
+An administrator or root user opens **Currency & display** to configure wallet
+funding. Regular users cannot change this policy. The dedicated management API
+is `GET/PUT /api/currency-billing`, with `GET /api/currency-billing/preview` for
+an exchange-rate preview. Scoped personal access tokens additionally require
+`billing:read` or `billing:write`. The version returned by GET must accompany a
+save; a stale version returns HTTP 409 and leaves the saved policy unchanged.
+Legacy display/payment settings remain root-only and are saved separately.
+
+- **Cross-currency funding** defaults to off. When enabled, a request reserves
+  its pricing currency first and covers only the shortfall from the other
+  wallet. For `1 USD = R CNY`, USD costs use `shortfall × R` CNY; CNY costs use
+  `shortfall ÷ R` USD. There is no exchange fee, balance transfer, or synthetic
+  top-up. Existing integer quota scales and rounding are retained; conversion
+  is rounded on the cumulative amount, not on each incremental reservation.
+- API-key limits remain in the model's pricing currency. A CNY-priced request
+  still requires CNY access and sufficient CNY key budget (or unlimited CNY
+  budget), even when the USD wallet pays. It does not also consume the USD key
+  budget. USD requests follow the corresponding USD budget. Subscription
+  selection retains the user's existing billing preference.
+- **Dynamic exchange rates** default to off. Static mode uses the administrator's
+  explicit `1 USD = R CNY` rate. The initial static value copies the existing
+  display rate; subsequent wallet policy saves are independent of display and
+  payment conversion settings. Changing display mode never changes balances,
+  pricing currency, or historical consumption.
+- Dynamic mode uses the fixed Frankfurter v2 USD/CNY reference-rate endpoint.
+  The first enable requires a successful preview and an explicit settings save;
+  the server fetches again and checks the submitted baseline. The default
+  refresh interval is 6 hours (configurable from 1 to 168 hours). The existing
+  system-task scheduler coordinates refreshes across instances. Requests do not
+  fetch rates from the network.
+- Candidates must contain a positive finite rate and a valid source date.
+  Defaults reject changes over 3% from the current accepted rate or any accepted
+  observation in the last 24 hours, and over 10% against accepted observations
+  in the last 7 days. Source dates cannot move backwards. The maximum source
+  age defaults to 168 hours, allowing weekends and holidays; refetching the
+  same quote never extends that age. These limits and maximum age are editable.
+  Explicitly enabling dynamic mode establishes a new confirmed baseline.
+- A failed fetch or rejected candidate preserves the last accepted rate and
+  exposes the failure in settings. Once that rate expires, new requests that
+  need conversion fail; requests fully covered by their native wallet still
+  work. Disabling dynamic mode uses the explicitly saved static rate, rather
+  than silently substituting a rate after a provider failure. A refresh started
+  under an older policy version cannot overwrite an administrator's new choice.
+
+Every new wallet-funded request stores a `WalletFundingRecord` in the main
+database before an upstream send. It freezes the pricing currency, both quota
+scales, funding policy version, rate and source date, and allocation between the
+wallets. Reservation, native API-key budget, final settlement and refund use
+transactions. Retries and asynchronous completion use that original record,
+even after exchange-rate changes or restarts. Refunds return the original
+currencies and amounts. An unexpected final cost can consume additional funds
+at the frozen rate; a remaining shortfall becomes debt in the pricing currency,
+never a free successful request or a newly selected rate.
+
+Ordinary submissions cannot retry an unresolved paid attempt. A live Realtime
+connection can reserve a new input batch while an earlier response is pending,
+but this requires available funds and retains the outstanding submission marker.
+Usage already incurred is reconciled cumulatively; final usage settles once.
+Disconnects without authoritative final usage retain the hold. USD SDK and
+WebSocket paths mark their actual paid send, not merely a connection handshake;
+wallet-funded SDK calls disable implicit transport retries. Midjourney uses an
+atomic task/funding commit and idempotent failure refund.
+
+Model-consumption statistics stay in their original pricing currency. Existing
+USD `used_quota` also includes subscription usage and must not be described as
+actual USD-wallet payments. New logs include a separate wallet funding receipt
+with the actual USD/CNY amounts, status, frozen scales, exchange rate when used,
+and native debt. The detail view and CSV export expose that receipt. Historical
+logs without a funding record remain unchanged; payment sources are not guessed
+or backfilled. The main-database funding record is durable; the existing consume
+log remains a separate best-effort write, not an exactly-once payment ledger.
+
+Existing CNY records with `FundingVersion = 0`, USD tasks without a funding
+reference, and legacy Midjourney tasks retain their original settlement path.
+Do not mix old binaries with the new wallet writers, or downgrade while new
+funding records are active. The database-authority cutover procedure above is
+required independently of whether cross-currency funding is enabled.
 
 ---
 

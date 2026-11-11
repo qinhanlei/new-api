@@ -23,6 +23,7 @@ type ResponsesUsageAccumulator struct {
 	imageCommitted bool
 	started        bool
 	finished       bool
+	providerUsage  bool
 }
 
 func NewResponsesUsageAccumulator(info *relaycommon.RelayInfo) *ResponsesUsageAccumulator {
@@ -43,6 +44,7 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	switch event.Type {
 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 		if event.Response != nil {
+			a.providerUsage = a.providerUsage || event.Response.Usage != nil
 			ApplyResponsesUsage(a.usage, event.Response.Usage)
 			if a.outputText.Len() == 0 {
 				// Some upstreams carry the output only on the terminal event.
@@ -85,6 +87,17 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	}
 }
 
+// WalletUsageUnknown distinguishes an unfinished/failed provider response from
+// a successful terminal that legitimately uses the existing token estimator.
+// A non-nil usage object, including explicit zero, is authoritative.
+func (a *ResponsesUsageAccumulator) WalletUsageUnknown() bool {
+	if a.providerUsage || (!IsWalletBilling(a.info) && !IsCNYBilling(a.info)) {
+		return false
+	}
+	outcome := a.info.StreamStatus.ResponseOutcome()
+	return outcome == string(relaycommon.ResponseOutcomeUnknown) || outcome == string(relaycommon.ResponseOutcomeFailed)
+}
+
 func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	if a.finished {
 		return a.usage
@@ -105,7 +118,7 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 	// that produced any event but no usage still owes its input tokens unless
 	// upstream reported an explicit failure.
 	billsPrompt := a.usage.CompletionTokens != 0 || (a.started && !a.info.StreamStatus.ResponseFailed())
-	if a.usage.PromptTokens == 0 && billsPrompt {
+	if !a.providerUsage && a.usage.PromptTokens == 0 && billsPrompt {
 		a.usage.PromptTokens = a.info.GetEstimatePromptTokens()
 	}
 	a.usage.TotalTokens = a.usage.PromptTokens + a.usage.CompletionTokens

@@ -2,7 +2,6 @@ package aws
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -232,14 +232,30 @@ func getAwsModelID(requestModel string) string {
 	return requestModel
 }
 
+// Wallet requests cannot be replayed by the SDK after an ambiguous paid submit.
+func awsWalletInvokeOptions(info *relaycommon.RelayInfo) []func(*bedrockruntime.Options) {
+	if info.Billing == nil || info.BillingSource != service.BillingSourceWallet {
+		return nil
+	}
+	return []func(*bedrockruntime.Options){func(options *bedrockruntime.Options) { options.RetryMaxAttempts = 1 }}
+}
+
+func awsUnknownUsageError(c *gin.Context) *types.NewAPIError {
+	return types.NewError(errors.New(i18n.T(c, i18n.MsgBillingUpstreamUsageUnknown)), types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+}
+
 func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
 
 	requestContext := c.Request.Context()
 	ctx, cancel := newAwsInvokeContext(requestContext)
 	defer cancel()
 
-	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
+	if err := service.MarkCNYUpstreamPending(info, true); err != nil {
+		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry()), nil
+	}
+	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput), awsWalletInvokeOptions(info)...)
 	if err != nil {
+		service.ObserveCNYHTTPResponse(info, getAwsErrorStatusCode(err))
 		return newAwsInvokeError(requestContext, err, "InvokeModel"), nil
 	}
 
@@ -256,6 +272,12 @@ func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types
 		c.Writer.Header().Set("Content-Type", *awsResp.ContentType)
 	}
 
+	if service.CNYUpstreamPending(info) {
+		var response dto.ClaudeResponse
+		if err := common.Unmarshal(awsResp.Body, &response); err != nil || response.Usage == nil {
+			return awsUnknownUsageError(c), nil
+		}
+	}
 	handlerErr := claude.HandleClaudeResponseData(c, info, claudeInfo, nil, awsResp.Body)
 	if handlerErr != nil {
 		return handlerErr, nil
@@ -268,8 +290,12 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 	ctx, cancel := newAwsInvokeContext(requestContext)
 	defer cancel()
 
-	awsResp, err := a.AwsClient.InvokeModelWithResponseStream(ctx, a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput))
+	if err := service.MarkCNYUpstreamPending(info, true); err != nil {
+		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry()), nil
+	}
+	awsResp, err := a.AwsClient.InvokeModelWithResponseStream(ctx, a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput), awsWalletInvokeOptions(info)...)
 	if err != nil {
+		service.ObserveCNYHTTPResponse(info, getAwsErrorStatusCode(err))
 		return newAwsInvokeError(requestContext, err, "InvokeModelWithResponseStream"), nil
 	}
 	stream := awsResp.GetStream()
@@ -284,6 +310,7 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 	}
 
 	events := stream.Events()
+	inputUsage, outputUsage, terminal := false, false, false
 streamLoop:
 	for {
 		select {
@@ -300,6 +327,24 @@ streamLoop:
 			switch v := event.(type) {
 			case *bedrockruntimeTypes.ResponseStreamMemberChunk:
 				info.SetFirstResponseTime()
+				var event struct {
+					Type    string              `json:"type"`
+					Usage   *dto.ClaudeUsage    `json:"usage"`
+					Message *dto.ClaudeResponse `json:"message"`
+				}
+				if err := common.Unmarshal(v.Value.Bytes, &event); err != nil {
+					return types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry()), nil
+				}
+				if event.Message != nil && event.Message.Usage != nil {
+					inputUsage = true
+				}
+				if event.Type == "message_delta" && event.Usage != nil {
+					outputUsage = true
+				}
+				if event.Type == "message_stop" {
+					terminal = true
+				}
+
 				respErr := claude.HandleStreamResponseData(c, info, claudeInfo, string(v.Value.Bytes))
 				if respErr != nil {
 					return respErr, nil
@@ -315,6 +360,9 @@ streamLoop:
 	}
 
 	_ = stream.Close()
+	if service.CNYUpstreamPending(info) && (!inputUsage || !outputUsage || !terminal || stream.Err() != nil) {
+		return awsUnknownUsageError(c), nil
+	}
 	claude.HandleStreamFinalResponse(c, info, claudeInfo)
 	return nil, claudeInfo.Usage
 }
@@ -326,8 +374,12 @@ func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) 
 	ctx, cancel := newAwsInvokeContext(requestContext)
 	defer cancel()
 
-	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
+	if err := service.MarkCNYUpstreamPending(info, true); err != nil {
+		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry()), nil
+	}
+	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput), awsWalletInvokeOptions(info)...)
 	if err != nil {
+		service.ObserveCNYHTTPResponse(info, getAwsErrorStatusCode(err))
 		return newAwsInvokeError(requestContext, err, "InvokeModel"), nil
 	}
 
@@ -340,15 +392,19 @@ func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) 
 				} `json:"content"`
 			} `json:"message"`
 		} `json:"output"`
-		Usage struct {
+		Usage *struct {
 			InputTokens  int `json:"inputTokens"`
 			OutputTokens int `json:"outputTokens"`
 			TotalTokens  int `json:"totalTokens"`
 		} `json:"usage"`
 	}
 
-	if err := json.Unmarshal(awsResp.Body, &novaResp); err != nil {
+	if err := common.Unmarshal(awsResp.Body, &novaResp); err != nil {
 		return types.NewError(errors.Wrap(err, "unmarshal nova response"), types.ErrorCodeBadResponseBody), nil
+	}
+
+	if novaResp.Usage == nil || len(novaResp.Output.Message.Content) == 0 {
+		return awsUnknownUsageError(c), nil
 	}
 
 	// 构造OpenAI格式响应

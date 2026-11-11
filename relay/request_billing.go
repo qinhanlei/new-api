@@ -77,6 +77,13 @@ func RefundFailedRequestBilling(c *gin.Context, info *relaycommon.RelayInfo, api
 		return nil
 	}
 	apiErr = service.NormalizeViolationFeeError(apiErr)
+	if service.IsWalletBilling(info) {
+		// A known provider fee is the final cost of this failed request. Keep
+		// its frozen wallet allocation until that cost has been settled.
+		service.ChargeViolationFeeIfNeeded(c, info, apiErr)
+		info.Billing.Refund(c)
+		return apiErr
+	}
 	if info.Billing != nil {
 		info.Billing.Refund(c)
 	}

@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -10,14 +12,109 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+type exchangeTestTransport func(*http.Request) (*http.Response, error)
+
+func (transport exchangeTestTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+func TestWalletExchangeAdminEndpoints(t *testing.T) {
+	admin, _ := setupAccessTokenAudit(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}))
+	owner := model.User{Username: "fx-owner", AffCode: "fx-owner", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AuthVersion: 1}
+	require.NoError(t, model.DB.Create(&owner).Error)
+	adminWrite, _ := createScopedAccessToken(t, admin.Id, 0, "billing:read", "billing:write")
+	adminRead, _ := createScopedAccessToken(t, admin.Id, 0, "billing:read")
+	userWrite, _ := createScopedAccessToken(t, owner.Id, 0, "billing:read", "billing:write")
+	router := gin.New()
+	router.Use(middleware.RequestId(), middleware.AccessTokenAudit())
+	router.GET("/api/currency-billing", middleware.AdminAuth(), GetWalletExchangeSettings)
+	router.GET("/api/currency-billing/preview", middleware.AdminAuth(), PreviewWalletExchangeRate)
+	router.PUT("/api/currency-billing", middleware.AdminAuth(), UpdateWalletExchangeSettings)
+	for _, endpoint := range []struct{ method, path string }{{http.MethodGet, "/api/currency-billing"}, {http.MethodGet, "/api/currency-billing/preview"}, {http.MethodPut, "/api/currency-billing"}} {
+		response := accessTokenRequest(router, endpoint.method, endpoint.path, userWrite, "", `{}`)
+		assert.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+		response = accessTokenRequest(router, endpoint.method, endpoint.path, "", "", `{}`)
+		assert.Equal(t, http.StatusUnauthorized, response.Code)
+	}
+	response := accessTokenRequest(router, http.MethodPut, "/api/currency-billing", adminRead, "", `{}`)
+	assert.Equal(t, http.StatusForbidden, response.Code)
+	response = accessTokenRequest(router, http.MethodGet, "/api/currency-billing", adminRead, "", "")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var state struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Policy model.WalletExchangePolicy   `json:"policy"`
+			Rate   model.WalletExchangeSnapshot `json:"rate"`
+			Status string                       `json:"status"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &state))
+	assert.False(t, state.Data.Policy.CrossCurrencyEnabled)
+	assert.False(t, state.Data.Policy.DynamicEnabled)
+	oldDisplayRate := operation_setting.USDExchangeRate
+	state.Data.Policy.StaticRate = "6.7"
+	state.Data.Policy.CrossCurrencyEnabled = true
+	body, err := common.Marshal(map[string]any{"policy": state.Data.Policy})
+	require.NoError(t, err)
+	response = accessTokenRequest(router, http.MethodPut, "/api/currency-billing", adminWrite, "", string(body))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &state))
+	assert.True(t, state.Success)
+	assert.Equal(t, "6.7", state.Data.Rate.Rate)
+	assert.Equal(t, oldDisplayRate, operation_setting.USDExchangeRate, "payment/display rate must not be changed")
+	response = accessTokenRequest(router, http.MethodPut, "/api/currency-billing", adminWrite, "", string(body))
+	assert.Equal(t, http.StatusConflict, response.Code)
+	assert.Contains(t, response.Body.String(), "message_key")
+
+	originalTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	date := time.Now().UTC().Format("2006-01-02")
+	providerBody := fmt.Sprintf(`{"date":%q,"base":"USD","quote":"CNY","rate":6.72}`, date)
+	providerStatus, calls := http.StatusOK, 0
+	http.DefaultTransport = exchangeTestTransport(func(request *http.Request) (*http.Response, error) {
+		calls++
+		assert.Equal(t, "https://api.frankfurter.dev/v2/rate/USD/CNY", request.URL.String())
+		return &http.Response{StatusCode: providerStatus, Body: io.NopCloser(strings.NewReader(providerBody)), Header: make(http.Header), Request: request}, nil
+	})
+	response = accessTokenRequest(router, http.MethodGet, "/api/currency-billing/preview", adminWrite, "", "")
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.Contains(t, response.Body.String(), `"rate":"6.72"`)
+	state.Data.Policy.DynamicEnabled = true
+	body, err = common.Marshal(map[string]any{"policy": state.Data.Policy, "baseline_rate": "6.72"})
+	require.NoError(t, err)
+	response = accessTokenRequest(router, http.MethodPut, "/api/currency-billing", adminWrite, "", string(body))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &state))
+	assert.Equal(t, "6.72", state.Data.Rate.Rate)
+	assert.Equal(t, 2, calls, "the server verifies the administrator's preview independently")
+	providerStatus = http.StatusServiceUnavailable
+	observation, err := service.RefreshWalletExchangeRate(context.Background())
+	require.Error(t, err)
+	assert.False(t, observation.Accepted)
+	response = accessTokenRequest(router, http.MethodGet, "/api/currency-billing", adminRead, "", "")
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &state))
+	assert.Equal(t, "last_good", state.Data.Status)
+	assert.Equal(t, "6.72", state.Data.Rate.Rate)
+	assert.Contains(t, response.Body.String(), "Exchange rate provider is unavailable")
+	providerStatus = http.StatusOK
+	for _, invalidBody := range []string{`{`, `{"date":"invalid","base":"USD","quote":"CNY","rate":6.7}`, fmt.Sprintf(`{"date":%q,"base":"CNY","quote":"USD","rate":6.7}`, date)} {
+		providerBody = invalidBody
+		_, err := service.FetchWalletExchangeRate(context.Background())
+		assert.Error(t, err)
+	}
+}
+
 func TestCNYCurrencyEndpointsAuthorization(t *testing.T) {
 	admin, _ := setupAccessTokenAudit(t)
-	require.NoError(t, model.DB.AutoMigrate(&model.Token{}, &model.CNYWallet{}, &model.CNYTokenBudget{}, &model.CNYBillingRecord{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}, &model.CNYWallet{}, &model.CNYTokenBudget{}, &model.CNYBillingRecord{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}))
 	owner := model.User{Username: "cny-owner", Password: "test", AffCode: "cny-owner", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AuthVersion: 1, Quota: 1234}
 	other := model.User{Username: "cny-other", Password: "test", AffCode: "cny-other", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1}
 	root := model.User{Username: "cny-root", Password: "test", AffCode: "cny-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1}

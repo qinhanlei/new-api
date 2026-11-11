@@ -30,6 +30,39 @@ func CovertMjpActionToModelName(mjAction string) string {
 	return modelName
 }
 
+func ReserveMidjourneyWallet(c *gin.Context, info *relaycommon.RelayInfo, quota int) error {
+	if apiErr := ValidateBillingCurrency(c, info); apiErr != nil {
+		return apiErr
+	}
+	info.ForcePreConsume = true
+	session, apiErr := NewWalletBillingSession(c, info, quota)
+	if apiErr != nil {
+		return apiErr
+	}
+	info.Billing = session
+	return nil
+}
+
+// PersistMidjourneyTaskBilling keeps the legacy path for old callers, while all
+// newly reserved requests bind their task and payment in a single transaction.
+func PersistMidjourneyTaskBilling(info *relaycommon.RelayInfo, task *model.Midjourney, prepared bool) (bool, error) {
+	if task.WalletFundingRequestID != "" {
+		created, err := model.InsertWalletMidjourney(task)
+		if err == nil {
+			if session, ok := info.Billing.(*BillingSession); ok {
+				session.mu.Lock()
+				session.settled, session.fundingSettled = true, true
+				session.mu.Unlock()
+			}
+		}
+		return created, err
+	}
+	if err := task.Insert(); err != nil {
+		return false, err
+	}
+	return SettleMidjourneyTaskBilling(info, task, prepared)
+}
+
 // PrepareMidjourneyTaskBilling sets the durable refund marker before the task is inserted.
 func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.Midjourney, quota int, shouldBill bool) (bool, error) {
 	if task == nil {
@@ -38,6 +71,7 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 	task.Quota = 0
 	task.TokenId = 0
 	task.BillingChannelId = 0
+	task.WalletFundingRequestID = ""
 	if !shouldBill {
 		return false, nil
 	}
@@ -52,6 +86,15 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 	}
 
 	task.Quota = quota
+	if session, ok := relayInfo.Billing.(*BillingSession); ok {
+		if _, wallet := session.funding.(*WalletFunding); wallet {
+			task.WalletFundingRequestID = relayInfo.RequestId
+			task.TokenId = relayInfo.TokenId
+			if relayInfo.IsPlayground {
+				task.TokenId = 0
+			}
+		}
+	}
 	task.BillingChannelId = task.ChannelId
 	if relayInfo.ChannelMeta != nil && relayInfo.ChannelId > 0 {
 		task.BillingChannelId = relayInfo.ChannelId
@@ -98,6 +141,17 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 	if quota == 0 {
 		return true
 	}
+	if task.WalletFundingRequestID != "" {
+		won, err := model.RefundWalletMidjourney(task, task.Status)
+		if err != nil {
+			logger.LogError(ctx, common.LogText("failed to refund Midjourney user quota, task %s: %s", task.MjId, err.Error()))
+			return false
+		}
+		if won {
+			RecordMidjourneyWalletRefund(task, quota, reason)
+		}
+		return true
+	}
 
 	if err := model.IncreaseUserQuota(task.UserId, quota, false); err != nil {
 		logger.LogWarn(ctx, common.LogText("failed to refund Midjourney user quota, task %s: %s", task.MjId, err.Error()))
@@ -134,6 +188,15 @@ func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason s
 		logger.LogError(ctx, common.LogText("Midjourney refund succeeded but clearing the quota failed, task %s: %s", task.MjId, err.Error()))
 	}
 	return true
+}
+
+func RecordMidjourneyWalletRefund(task *model.Midjourney, quota int, reason string) {
+	other := model.NewLogOther()
+	other.SetPublic("task_id", task.MjId)
+	other.SetPublic("reason", reason)
+	model.AppendWalletFundingLog(other, task.WalletFundingRequestID, task.UserId)
+	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{UserId: task.UserId, LogType: model.LogTypeRefund,
+		ChannelId: task.GetBillingChannelId(), ModelName: CovertMjpActionToModelName(task.Action), Quota: quota, TokenId: task.TokenId, Other: other})
 }
 
 func GetMjRequestModel(relayMode int, midjRequest *dto.MidjourneyRequest) (string, *dto.MidjourneyResponse, bool) {
@@ -296,7 +359,7 @@ func RecordMidjourneyPolicyResponse(c *gin.Context, response *dto.MidjourneyResp
 	return false
 }
 
-func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestURL string) (*dto.MidjourneyResponseWithStatusCode, []byte, error) {
+func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestURL string, billingInfo ...*relaycommon.RelayInfo) (*dto.MidjourneyResponseWithStatusCode, []byte, error) {
 	var nullBytes []byte
 	//var requestBody io.Reader
 	//requestBody = c.Request.Body
@@ -345,12 +408,24 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 		req.Header.Set("mj-api-secret", auth)
 	}
 	defer cancel()
-	resp, err := GetHttpClient().Do(req)
+	if len(billingInfo) > 0 {
+		if err = MarkCNYUpstreamPending(billingInfo[0], true); err != nil {
+			return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "reserve_submission_failed", http.StatusInternalServerError), nullBytes, err
+		}
+	}
+	client := *GetHttpClient()
+	if len(billingInfo) > 0 && billingInfo[0].Billing != nil {
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		common.SysLog(common.LogText("do request failed: %s", err.Error()))
 		return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "do_request_failed", http.StatusInternalServerError), nullBytes, err
 	}
 	statusCode := resp.StatusCode
+	if len(billingInfo) > 0 {
+		ObserveCNYHTTPResponse(billingInfo[0], statusCode)
+	}
 	//if statusCode != 200  {
 	//	return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "bad_response_status_code", statusCode), nullBytes, nil
 	//}
@@ -378,6 +453,17 @@ func DoMidjourneyHttpRequest(c *gin.Context, timeout time.Duration, fullRequestU
 			err2 := common.Unmarshal(responseBody, &midjourneyUploadsResponse)
 			if err2 != nil {
 				return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "unmarshal_response_body_failed", statusCode), responseBody, err
+			}
+		}
+	}
+	if len(billingInfo) > 0 && statusCode == http.StatusOK && midjResponse.Code > 0 {
+		definiteReject := midjResponse.Code != 1 && midjResponse.Code != 21 && midjResponse.Code != 22
+		if properties, ok := midjResponse.Properties.(map[string]any); ok && properties["status"] == "FAILURE" {
+			definiteReject = true
+		}
+		if definiteReject {
+			if err = MarkCNYUpstreamPending(billingInfo[0], false); err != nil {
+				return MidjourneyErrorWithStatusCodeWrapper(constant.MjErrorUnknown, "record_rejection_failed", http.StatusInternalServerError), responseBody, err
 			}
 		}
 	}

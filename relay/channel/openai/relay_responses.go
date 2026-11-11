@@ -101,6 +101,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 	common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
 	info.StreamStatus.RequireTerminal()
+	info.BillingUsageUnknown = accumulator.WalletUsageUnknown()
 	return accumulator.Finish(), nil
 }
 
