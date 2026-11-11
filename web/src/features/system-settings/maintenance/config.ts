@@ -63,6 +63,7 @@ export const SIDEBAR_MODULES_DEFAULT: SidebarModulesAdminConfig = {
     enabled: true,
     detail: true,
     token: true,
+    assets: true,
     log: true,
     audit: true,
     midjourney: true,

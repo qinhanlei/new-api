@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { Eye, EyeOff } from 'lucide-react'
 import * as React from 'react'
+import { useTranslation } from 'react-i18next'
 
 import { cn } from '@/lib/utils'
 
@@ -29,34 +30,52 @@ type PasswordInputProps = Omit<
   'type'
 > & {
   ref?: React.Ref<HTMLInputElement>
+  visibilityAction?: {
+    label: string
+    onClick: React.MouseEventHandler<HTMLButtonElement>
+    disabled?: boolean
+  }
 }
 
 export function PasswordInput({
   className,
   disabled,
   ref,
+  visibilityAction,
   ...props
 }: PasswordInputProps) {
+  const { t } = useTranslation()
   const [showPassword, setShowPassword] = React.useState(false)
+  const visible = showPassword && !visibilityAction
+  const visibilityLabel =
+    visibilityAction?.label ?? (visible ? t('Hide input') : t('Show input'))
 
   return (
     <div className={cn('relative rounded-md', className)}>
       <Input
-        type={showPassword ? 'text' : 'password'}
+        type={visible ? 'text' : 'password'}
         ref={ref}
         disabled={disabled}
+        className='pe-9'
         {...props}
+        onChange={(event) => {
+          if (!event.currentTarget.value) setShowPassword(false)
+          props.onChange?.(event)
+        }}
       />
       <Button
         type='button'
         size='icon'
         variant='ghost'
-        disabled={disabled}
+        disabled={disabled || visibilityAction?.disabled}
         className='text-muted-foreground absolute end-1 top-1/2 h-6 w-6 -translate-y-1/2 rounded-md'
-        onClick={() => setShowPassword((prev) => !prev)}
-        aria-label='Toggle password visibility'
+        onClick={
+          visibilityAction?.onClick ?? (() => setShowPassword((prev) => !prev))
+        }
+        aria-label={visibilityLabel}
+        title={visibilityLabel}
       >
-        {showPassword ? (
+        {visible ? (
           <Eye size={18} aria-hidden='true' />
         ) : (
           <EyeOff size={18} aria-hidden='true' />

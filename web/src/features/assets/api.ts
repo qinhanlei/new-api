@@ -1,0 +1,308 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { t } from 'i18next'
+
+import { api } from '@/lib/api'
+import { authRequestOptions } from '@/lib/secure-verification'
+import { requireServerSuccess } from '@/lib/server-error-message'
+
+import type {
+  AssetBatchDeleteItem,
+  AssetChannelConfig,
+  AssetChannelUpdate,
+  AssetReplica,
+  AssetScope,
+  AssetSizeLimits,
+  AssetStorageConfig,
+  AssetStorageUpdate,
+  AssetValidationSummary,
+  AssetValidationRecordFilter,
+  AssetValidationRecords,
+  AssetValidationChannel,
+} from './types'
+
+interface AssetResponse<T> {
+  success: boolean
+  data: T
+  message?: string
+}
+
+export async function deleteAssetsBatch(
+  project: string,
+  ids: string[],
+  scope: AssetScope
+) {
+  const { data } = await api.post<
+    AssetResponse<{ Items: AssetBatchDeleteItem[] }>
+  >(
+    '/api/assets/batch-delete',
+    { ProjectName: project, Ids: ids },
+    {
+      ...authRequestOptions,
+      params: { user_id: scope.userId, all_users: scope.allUsers || undefined },
+    }
+  )
+  const result = requireServerSuccess(data).data
+  if (
+    !Array.isArray(result?.Items) ||
+    result.Items.length !== ids.length ||
+    new Set(result.Items.map((item) => item.Id)).size !== ids.length ||
+    result.Items.some(
+      (item) =>
+        !ids.includes(item.Id) ||
+        !['deleted', 'not_found', 'failed'].includes(item.Status)
+    )
+  ) {
+    throw new Error(t('The batch deletion result could not be verified.'))
+  }
+  return result.Items
+}
+
+export const assetQueryKeys = {
+  all: ['assets'] as const,
+  config: ['assets', 'config'] as const,
+  storage: ['asset-storage'] as const,
+  channel: (id: number) => ['channel-assets', id] as const,
+}
+
+export async function getAssetConfig(signal?: AbortSignal) {
+  const { data } = await api.get<
+    AssetResponse<{ enabled: boolean; size_limits_mb: AssetSizeLimits }>
+  >('/api/assets/config', { ...authRequestOptions, signal })
+  return requireServerSuccess(data).data
+}
+
+export async function executeAssetAction<T>(
+  action: string,
+  body: Record<string, unknown>,
+  scope: AssetScope = {},
+  signal?: AbortSignal
+) {
+  const { data } = await api.post<AssetResponse<T>>(
+    '/api/assets/actions',
+    body,
+    {
+      ...authRequestOptions,
+      signal,
+      params: {
+        Action: action,
+        Version: '2024-01-01',
+        user_id: scope.userId,
+        all_users: scope.allUsers || undefined,
+      },
+    }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function uploadAsset(body: FormData, scope: AssetScope) {
+  const { data } = await api.post<AssetResponse<{ Id: string }>>(
+    '/api/assets/upload',
+    body,
+    {
+      ...authRequestOptions,
+      params: { user_id: scope.userId },
+      headers: { 'Content-Type': undefined },
+    }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function getAssetValidationSessions(
+  project: string,
+  scope: AssetScope,
+  signal?: AbortSignal
+) {
+  const { data } = await api.get<AssetResponse<AssetValidationSummary[]>>(
+    '/api/assets/validation/sessions',
+    {
+      ...authRequestOptions,
+      signal,
+      params: { project_name: project, user_id: scope.userId },
+    }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function getAssetValidationRecords(
+  project: string,
+  scope: AssetScope,
+  filter: AssetValidationRecordFilter,
+  signal?: AbortSignal
+) {
+  const { data } = await api.get<AssetResponse<AssetValidationRecords>>(
+    '/api/assets/validation/records',
+    {
+      ...authRequestOptions,
+      signal,
+      params: { project_name: project, user_id: scope.userId, ...filter },
+    }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function getAssetValidationRecord(
+  id: string,
+  project: string,
+  scope: AssetScope,
+  signal?: AbortSignal
+) {
+  const { data } = await api.get<AssetResponse<AssetValidationSummary>>(
+    `/api/assets/validation/records/${encodeURIComponent(id)}`,
+    {
+      ...authRequestOptions,
+      signal,
+      params: { project_name: project, user_id: scope.userId },
+    }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function archiveAssetValidationRecords(
+  project: string,
+  scope: AssetScope,
+  sessionIds: string[],
+  archived: boolean
+) {
+  const { data } = await api.post<AssetResponse<null>>(
+    '/api/assets/validation/records/archive',
+    { ProjectName: project, SessionIds: sessionIds, Archived: archived },
+    { ...authRequestOptions, params: { user_id: scope.userId } }
+  )
+  requireServerSuccess(data)
+}
+
+export async function getAssetValidationChannels(
+  project: string,
+  scope: AssetScope,
+  signal?: AbortSignal
+) {
+  const { data } = await api.get<AssetResponse<AssetValidationChannel[]>>(
+    '/api/assets/validation/channels',
+    {
+      ...authRequestOptions,
+      signal,
+      params: { project_name: project, user_id: scope.userId },
+    }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function getAssetReplicas(
+  id: string,
+  scope: AssetScope,
+  signal?: AbortSignal
+) {
+  const { data } = await api.get<AssetResponse<AssetReplica[]>>(
+    `/api/assets/${encodeURIComponent(id)}/replicas`,
+    { ...authRequestOptions, signal, params: { user_id: scope.userId } }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function retryAssetReplica(
+  id: string,
+  channelId: number,
+  scope: AssetScope
+) {
+  const { data } = await api.post<AssetResponse<null>>(
+    `/api/assets/${encodeURIComponent(id)}/replicas/${channelId}/retry`,
+    undefined,
+    { ...authRequestOptions, params: { user_id: scope.userId } }
+  )
+  requireServerSuccess(data)
+}
+
+export async function getAssetStorage(signal?: AbortSignal) {
+  const { data } = await api.get<AssetResponse<AssetStorageConfig>>(
+    '/api/option/asset_storage',
+    { ...authRequestOptions, signal }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function getAssetStorageSecret(
+  proofToken: string,
+  signal?: AbortSignal
+) {
+  const { data } = await api.post<AssetResponse<{ secret_key: string }>>(
+    '/api/option/asset_storage/secret',
+    undefined,
+    {
+      ...authRequestOptions,
+      headers: { 'X-Security-Proof': proofToken },
+      singleUseAuthorization: true,
+      signal,
+    }
+  )
+  return requireServerSuccess(data).data.secret_key
+}
+
+export async function saveAssetStorage(values: AssetStorageUpdate) {
+  const { data } = await api.put<AssetResponse<AssetStorageConfig>>(
+    '/api/option/asset_storage',
+    values,
+    authRequestOptions
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function testAssetStorage(values: AssetStorageUpdate) {
+  const { data } = await api.post<AssetResponse<unknown>>(
+    '/api/option/asset_storage/test',
+    values,
+    authRequestOptions
+  )
+  requireServerSuccess(data)
+}
+
+export async function getAssetChannel(id: number, signal?: AbortSignal) {
+  const { data } = await api.get<AssetResponse<AssetChannelConfig>>(
+    `/api/channel/${id}/assets`,
+    { ...authRequestOptions, signal }
+  )
+  return requireServerSuccess(data).data
+}
+
+export async function getAssetChannelSecret(
+  id: number,
+  proofToken: string,
+  signal?: AbortSignal
+) {
+  const { data } = await api.post<AssetResponse<{ secret_key: string }>>(
+    `/api/channel/${id}/assets/secret`,
+    undefined,
+    {
+      ...authRequestOptions,
+      headers: { 'X-Security-Proof': proofToken },
+      singleUseAuthorization: true,
+      signal,
+    }
+  )
+  return requireServerSuccess(data).data.secret_key
+}
+
+export async function saveAssetChannel(id: number, values: AssetChannelUpdate) {
+  const { data } = await api.put<AssetResponse<AssetChannelConfig>>(
+    `/api/channel/${id}/assets`,
+    values,
+    authRequestOptions
+  )
+  return requireServerSuccess(data).data
+}

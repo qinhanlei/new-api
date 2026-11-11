@@ -1,0 +1,400 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { ArrowLeft } from 'lucide-react'
+import { useId, useRef, useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+import type { z } from 'zod'
+
+import { ConfirmDialog } from '@/components/confirm-dialog'
+import { Dialog } from '@/components/dialog'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Button } from '@/components/ui/button'
+import {
+  Form,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
+import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
+import { assetQueryKeys, saveAssetChannel } from '@/features/assets/api'
+import { assetChannelSchema } from '@/features/assets/lib/schemas'
+import type {
+  AssetChannelConfig,
+  AssetChannelUpdate,
+} from '@/features/assets/types'
+import { isMultiKeyChannel } from '@/features/channels/lib'
+import type { Channel } from '@/features/channels/types'
+import { handleServerError } from '@/lib/handle-server-error'
+
+import { AssetSecretInput } from './asset-secret-input'
+
+export function ChannelAssetsForm(props: {
+  config: AssetChannelConfig
+  channel: Channel
+  onBack: () => void
+  onClose: () => void
+}) {
+  const { config, channel } = props
+  const [pendingChange, setPendingChange] = useState<'list' | 'close' | null>(
+    null
+  )
+  const { t } = useTranslation()
+  const id = useId()
+  const restoreFocus = useRef(true)
+  const returnToList = () => {
+    // The list restores its row focus after both editor dialogs unmount.
+    restoreFocus.current = false
+    props.onBack()
+  }
+  const client = useQueryClient()
+  const multiKey = isMultiKeyChannel(channel)
+  const schema = assetChannelSchema(t, config.has_secret, multiKey)
+  const { has_secret: _secret, channel_id: _channelId, ...defaults } = config
+  const form = useForm<z.infer<typeof schema>>({
+    resolver: zodResolver(schema),
+    defaultValues: {
+      ...defaults,
+      size_limits_mb: defaults.size_limits_mb ?? {
+        image: 0,
+        video: 0,
+        audio: 0,
+      },
+      secret_key: '',
+    },
+  })
+  const authType = form.watch('auth_type')
+  const mutation = useMutation({
+    gcTime: 0,
+    mutationFn: (values: AssetChannelUpdate) =>
+      saveAssetChannel(channel.id, values),
+    onSuccess: async (saved) => {
+      await client.cancelQueries({
+        queryKey: assetQueryKeys.channel(channel.id),
+        exact: true,
+      })
+      client.setQueryData(assetQueryKeys.channel(channel.id), saved)
+      void client.invalidateQueries({ queryKey: assetQueryKeys.config })
+      toast.success(t('Saved successfully'))
+      const {
+        has_secret: _savedSecret,
+        channel_id: _savedChannel,
+        ...values
+      } = saved
+      form.reset({
+        ...values,
+        size_limits_mb: values.size_limits_mb ?? {
+          image: 0,
+          video: 0,
+          audio: 0,
+        },
+        secret_key: '',
+      })
+      returnToList()
+    },
+    onError: (error) => handleServerError(error),
+    onSettled: (): void => mutation.reset(),
+  })
+  const busy = mutation.isPending || form.formState.isSubmitting
+  const onSubmit = form.handleSubmit((values) => {
+    const { secret_key, ...fields } = values
+    mutation.mutate({
+      ...fields,
+      ...(authType === 'aksk' && secret_key ? { secret_key } : {}),
+    })
+  })
+  const requestChange = (target: 'list' | 'close') => {
+    if (busy) return
+    if (form.formState.isDirty) {
+      setPendingChange(target)
+      return
+    }
+    if (target === 'close') props.onClose()
+    else returnToList()
+  }
+  return (
+    <>
+      <Dialog
+        open
+        onOpenChange={(open) => !open && requestChange('close')}
+        title={t('Channel settings')}
+        description={`${channel.name} (#${channel.id})`}
+        descriptionClassName='break-words'
+        contentHeight='auto'
+        finalFocus={() => restoreFocus.current}
+        footer={
+          <>
+            <Button
+              variant='outline'
+              onClick={() => requestChange('close')}
+              disabled={busy}
+            >
+              {t('Close')}
+            </Button>
+            <Button
+              form={id}
+              type='submit'
+              disabled={busy || !form.formState.isDirty}
+            >
+              {busy ? t('Saving...') : t('Save')}
+            </Button>
+          </>
+        }
+      >
+        <div className='space-y-4'>
+          <Button
+            variant='outline'
+            onClick={() => requestChange('list')}
+            disabled={busy}
+          >
+            <ArrowLeft className='size-4' aria-hidden='true' />
+            {t('Back to list')}
+          </Button>
+          <Form {...form}>
+            <form id={id} className='space-y-4' onSubmit={onSubmit}>
+              {multiKey && (
+                <Alert>
+                  <AlertDescription>
+                    {t('Asset libraries require a single-key channel.')}
+                  </AlertDescription>
+                </Alert>
+              )}
+              <FormField
+                control={form.control}
+                name='enabled'
+                render={({ field }) => (
+                  <FormItem className='flex min-w-0 items-center justify-between gap-4 py-2.5'>
+                    <div className='min-w-0 space-y-0.5'>
+                      <FormLabel>{t('Enable asset library')}</FormLabel>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                        disabled={busy || (multiKey && !field.value)}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name='endpoint'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Asset API endpoint')}</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type='url'
+                        disabled={busy}
+                        placeholder='https://'
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t(
+                        'Use the upstream asset API endpoint, including its path if required.'
+                      )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name='project_name'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Upstream project name')}</FormLabel>
+                    <FormControl>
+                      <Input {...field} disabled={busy} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <div className='space-y-2'>
+                <div className='grid grid-cols-3 gap-3'>
+                  {[
+                    {
+                      name: 'image' as const,
+                      label: t('Image limit (MB)'),
+                      placeholder: '30',
+                    },
+                    {
+                      name: 'video' as const,
+                      label: t('Video limit (MB)'),
+                      placeholder: '200',
+                    },
+                    {
+                      name: 'audio' as const,
+                      label: t('Audio limit (MB)'),
+                      placeholder: '15',
+                    },
+                  ].map((item) => (
+                    <FormField
+                      key={item.name}
+                      control={form.control}
+                      name={`size_limits_mb.${item.name}`}
+                      render={({ field, fieldState }) => (
+                        <FormItem>
+                          <FormLabel>{item.label}</FormLabel>
+                          <FormControl>
+                            <Input
+                              {...field}
+                              type='number'
+                              min={0}
+                              max={9007199253}
+                              step={1}
+                              value={field.value || ''}
+                              onChange={(event) =>
+                                field.onChange(Number(event.target.value))
+                              }
+                              placeholder={item.placeholder}
+                              disabled={busy}
+                              aria-describedby={
+                                fieldState.error
+                                  ? `${id}-size-limits ${id}-${item.name}-error`
+                                  : `${id}-size-limits`
+                              }
+                            />
+                          </FormControl>
+                          <FormMessage id={`${id}-${item.name}-error`} />
+                        </FormItem>
+                      )}
+                    />
+                  ))}
+                </div>
+                <p
+                  id={`${id}-size-limits`}
+                  className='text-muted-foreground text-xs'
+                >
+                  {t(
+                    'Blank uses official limits. Enabled asset channels share the lowest limit.'
+                  )}{' '}
+                  {t(
+                    'Image < limit; video/audio ≤ limit. 1 MB = 1,000,000 bytes.'
+                  )}
+                </p>
+              </div>
+              <FormField
+                control={form.control}
+                name='auth_type'
+                render={({ field }) => (
+                  <FormItem className='flex min-w-0 items-center justify-between gap-4 py-2.5'>
+                    <div className='min-w-0 space-y-0.5'>
+                      <FormLabel>{t('Use AK/SK authentication')}</FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Enable when the upstream requires AK/SK for material management, including human verification.'
+                        )}
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked={field.value === 'aksk'}
+                        onCheckedChange={(checked) =>
+                          field.onChange(checked ? 'aksk' : 'bearer')
+                        }
+                        disabled={busy}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              {authType === 'bearer' ? (
+                <p className='text-muted-foreground text-sm'>
+                  {t(
+                    'Reuses this channel’s key. No additional credential is needed.'
+                  )}
+                </p>
+              ) : (
+                <>
+                  <FormField
+                    control={form.control}
+                    name='access_key'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Access key')}</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            disabled={busy}
+                            autoComplete='off'
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name='secret_key'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Secret key')}</FormLabel>
+                        <FormControl>
+                          <AssetSecretInput
+                            {...field}
+                            config={config}
+                            disabled={busy}
+                            autoComplete='new-password'
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          {config.has_secret
+                            ? t('A secret is saved. Leave blank to keep it.')
+                            : t('No secret is saved.')}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </>
+              )}
+            </form>
+          </Form>
+        </div>
+      </Dialog>
+      <ConfirmDialog
+        open={pendingChange !== null}
+        finalFocus={() => restoreFocus.current}
+        onOpenChange={(open) => !open && setPendingChange(null)}
+        title={t('Unsaved changes')}
+        desc={t('You have unsaved changes. Are you sure you want to leave?')}
+        confirmText={t('Discard changes')}
+        handleConfirm={() => {
+          const target = pendingChange
+          setPendingChange(null)
+          if (target === 'close') props.onClose()
+          else if (target === 'list') returnToList()
+        }}
+      />
+    </>
+  )
+}

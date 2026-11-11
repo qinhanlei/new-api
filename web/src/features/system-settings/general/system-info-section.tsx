@@ -74,6 +74,40 @@ function normalizeValue(value: unknown): string {
   return typeof value === 'string' ? value : String(value)
 }
 
+// Advisory only: a hostname alone cannot establish external reachability.
+function isLocalServerAddress(value: string): boolean {
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+    const hostname = url.hostname.replaceAll(/^\[|\]$/g, '')
+    if (
+      hostname === 'localhost' ||
+      hostname.endsWith('.localhost') ||
+      hostname.endsWith('.local') ||
+      hostname === '::' ||
+      hostname === '::1' ||
+      /^(?:f[cd][\da-f]{2}|fe[89ab][\da-f]):/.test(hostname)
+    ) {
+      return true
+    }
+    const octets = hostname.split('.').map(Number)
+    return (
+      octets.length === 4 &&
+      octets.every(
+        (octet) => Number.isInteger(octet) && octet >= 0 && octet <= 255
+      ) &&
+      (octets[0] === 0 ||
+        octets[0] === 10 ||
+        octets[0] === 127 ||
+        (octets[0] === 169 && octets[1] === 254) ||
+        (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+        (octets[0] === 192 && octets[1] === 168))
+    )
+  } catch {
+    return false
+  }
+}
+
 export function SystemInfoSection({ defaultValues }: SystemInfoSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
@@ -184,7 +218,14 @@ export function SystemInfoSection({ defaultValues }: SystemInfoSectionProps) {
                     </FormControl>
                     <FormDescription>
                       {t(
-                        'The public URL of your server, used for OAuth callbacks, webhooks, and other external integrations'
+                        'The public HTTP or HTTPS address of this server, including its port if needed. Used for human verification, OAuth callbacks, and webhooks.'
+                      )}
+                      {isLocalServerAddress(field.value ?? '') && (
+                        <span role='status' className='mt-1 block'>
+                          {t(
+                            'This address appears to be local. Human verification providers may reject it; check your public access address.'
+                          )}
+                        </span>
                       )}
                     </FormDescription>
                     <FormMessage />

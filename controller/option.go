@@ -85,6 +85,9 @@ func GetOptions(c *gin.Context) {
 	optionValues := make(map[string]string)
 	common.OptionMapRWMutex.Lock()
 	for k, v := range common.OptionMap {
+		if model.IsAssetOption(k) {
+			continue
+		}
 		if k == "theme.frontend" || k == "billing_setting.billing_mode" || k == "billing_setting.billing_expr" || k == "ResendKeyConfigured" {
 			continue
 		}
@@ -187,6 +190,10 @@ func UpdateOption(c *gin.Context) {
 	err := common.DecodeJson(c.Request.Body, &option)
 	if err != nil {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
+		return
+	}
+	if model.IsAssetOption(option.Key) {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Use the asset settings page to update storage and channel credentials."))
 		return
 	}
 	switch option.Value.(type) {

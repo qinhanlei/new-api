@@ -22,8 +22,11 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	pluginadaptor "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -53,6 +56,41 @@ func TestPrepareTaskPluginSubmitRejectsMissingModel(t *testing.T) {
 	PrepareTaskPluginSubmit()(c)
 	assert.Equal(t, http.StatusBadRequest, recorder.Code)
 	assert.Contains(t, recorder.Body.String(), "model is required")
+}
+
+func TestTaskPluginEntriesRejectUnclaimedGatewayAssets(t *testing.T) {
+	require.NoError(t, appI18n.Init())
+	source := strings.Replace(genericTaskPluginSource, `fetchMode: "per_task"`, `fetchMode: "per_task",routes:[{method:"POST",path:"/asset-test/jobs",type:"submit",decode:"create",render:"created"}]`, 1) + `
+export const native = {
+create(ctx) { return {kind:"submit",model:"doc",requestBody:ctx.body.value}; },
+created(ctx,task) { return task; },
+error(ctx,error) { return {error:error}; }
+};`
+	plugin, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister("generic-entry-test")) })
+	for _, tc := range []struct {
+		name, path string
+		handlers   []gin.HandlerFunc
+	}{
+		{"generic", "/v1/tasks/:key", []gin.HandlerFunc{PrepareTaskPluginSubmit()}},
+		{"native", "/asset-test/jobs", []gin.HandlerFunc{pinTaskPluginRoute(plugin, 0), PrepareTaskPluginRoute()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router := gin.New()
+			reached := false
+			handlers := append(tc.handlers, func(c *gin.Context) { reached = true; c.Status(http.StatusNoContent) })
+			router.POST(tc.path, handlers...)
+			path := strings.Replace(tc.path, ":key", "generic-entry-test", 1)
+			request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"doc","custom":["asset://asset-na-unclaimed"]}`))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			assert.False(t, reached)
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), "InvalidAssetReference")
+		})
+	}
 }
 
 func TestPrepareTaskPluginRouteUsesCanonicalContextAndResolvedSubmit(t *testing.T) {
@@ -2013,10 +2051,13 @@ func insertTaskPluginRouteTask(t *testing.T, task *model.Task) {
 }
 
 func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
+	require.NoError(t, appI18n.Init())
 	for _, tc := range []struct {
 		name, alpha, beta string
+		probe             string
 		wantKeys          []string
 		wantError         string
+		assets            bool
 	}{
 		{name: "first decoder rejects", alpha: `throw new Error("alpha only accepts 720p")`, beta: `return {model:ctx.model,action:"beta",requestBody:{resolution:"1080p"}}`, wantKeys: []string{"decode-beta"}},
 		{name: "second decoder rejects", alpha: `return {model:ctx.model,action:"alpha"}`, beta: `throw new Error("beta rejects")`, wantKeys: []string{"decode-alpha"}},
@@ -2025,16 +2066,34 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 		{name: "duplicate failures are grouped", alpha: `throw new Error("unsupported resolution")`, beta: `throw new Error("unsupported resolution")`, wantError: "decode-alpha, decode-beta: unsupported resolution"},
 		{name: "invalid result is excluded", alpha: `return {kind:"query",model:ctx.model}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
 		{name: "rewritten model is excluded", alpha: `return {model:"another-model"}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
+		{name: "asset candidate cannot drop references", assets: true, alpha: `return {model:ctx.model,requestBody:{}}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
+		{name: "asset candidate cannot invent references", assets: true, alpha: `return {model:ctx.model,requestBody:{asset:"asset://asset-na-other"}}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
+		{name: "asset probe failure excludes only that candidate", assets: true, probe: `throw new Error("unsupported reference field")`, alpha: `return {model:ctx.model,requestBody:ctx.body.value}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
+		{name: "asset probe cannot invent references", assets: true, probe: `return ["asset-na-other"]`, alpha: `return {model:ctx.model,requestBody:ctx.body.value}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
+		{name: "asset probe cannot drop references", assets: true, probe: `return []`, alpha: `return {model:ctx.model,requestBody:ctx.body.value}`, beta: `return {model:ctx.model,requestBody:ctx.body.value}`, wantKeys: []string{"decode-beta"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, spec := range []struct{ key, decode string }{{"decode-alpha", tc.alpha}, {"decode-beta", tc.beta}} {
-				_, err := jsplugin.DefaultRegistry.Register(taskResponsesPluginSource(spec.key, 0, `["decode-shared-model"]`, `["sync"]`, `renderFinal:function(){return {};}`, spec.decode), jsplugin.Options{})
+				source := taskResponsesPluginSource(spec.key, 0, `["decode-shared-model"]`, `["sync"]`, `renderFinal:function(){return {};}`, spec.decode)
+				if tc.assets {
+					probe := ""
+					if spec.key == "decode-alpha" {
+						probe = tc.probe
+					}
+					source = strings.Replace(source, `fetchMode: "per_task",`, `fetchMode: "per_task", requiredCapabilities:["asset-references@1"],`, 1) + fmt.Sprintf(`
+export function extractAssetReferences(ctx) { if (!ctx.normalized) { %s }; return ctx.body.value.asset ? [ctx.body.value.asset.slice(8)] : []; }`, probe)
+				}
+				_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
 				require.NoError(t, err)
 				t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(spec.key)) })
 			}
 			var gotKeys []string
 			router := gin.New()
-			router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+			entry := PinTaskPluginEndpoint()
+			if tc.assets {
+				entry = RouteTaskPluginEndpoint()
+			}
+			router.POST("/v1/responses", entry, PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 				pinned := c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint)
 				for _, candidate := range pinned.Candidates {
 					gotKeys = append(gotKeys, candidate.Plugin.Meta.Key)
@@ -2045,7 +2104,7 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 				assert.Equal(t, tc.wantKeys, service.GetChannelConstraints(c).Filters[0].TaskPluginKeys)
 				c.Status(http.StatusNoContent)
 			})
-			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model","resolution":"1080p"}`))
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model","resolution":"1080p","asset":"asset://asset-na-original"}`))
 			request.Header.Set("Content-Type", "application/json")
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, request)
@@ -2061,8 +2120,160 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 	}
 }
 
+func TestRouteTaskPluginAssetProbePreservesOrdinaryBody(t *testing.T) {
+	require.NoError(t, appI18n.Init())
+	previousFileLimit, previousBodyLimit := constant.MaxFileDownloadMB, constant.MaxRequestBodyMB
+	constant.MaxFileDownloadMB, constant.MaxRequestBodyMB = 1, 4
+	t.Cleanup(func() { constant.MaxFileDownloadMB, constant.MaxRequestBodyMB = previousFileLimit, previousBodyLimit })
+	for _, tc := range []struct {
+		name       string
+		assets     []string
+		fileSize   int
+		fileCount  int
+		fieldCount int
+		wantStatus int
+	}{
+		{name: "ordinary large file", fileSize: 2 << 20, fileCount: 1},
+		{name: "ordinary repeated files and fields", fileSize: 4, fileCount: maxTaskPluginFiles + 1, fieldCount: maxTaskPluginFormFields + 1},
+		{name: "reserved URI in file contents is opaque", fileSize: 32, fileCount: 1},
+		{name: "unclaimed reference is rejected", assets: []string{"asset://asset-na-unclaimed"}, wantStatus: http.StatusBadRequest},
+		{name: "invalid reference is rejected", assets: []string{"asset://asset-na-invalid/path"}, wantStatus: http.StatusBadRequest},
+		{name: "total body limit remains enforced", fileSize: 5 << 20, fileCount: 1, wantStatus: http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			require.NoError(t, writer.WriteField("model", "ordinary-asset-probe-model"))
+			for i := range tc.fieldCount {
+				require.NoError(t, writer.WriteField("tag", fmt.Sprint(i)))
+			}
+			for _, asset := range tc.assets {
+				require.NoError(t, writer.WriteField("reference", asset))
+			}
+			for i := range tc.fileCount {
+				file, err := writer.CreateFormFile("image", fmt.Sprintf("%d.png", i))
+				require.NoError(t, err)
+				content := bytes.Repeat([]byte{'x'}, tc.fileSize)
+				if tc.name == "reserved URI in file contents is opaque" {
+					content = []byte("asset://asset-na-file-payload")
+				}
+				_, err = file.Write(content)
+				require.NoError(t, err)
+			}
+			require.NoError(t, writer.Close())
+			reached := false
+			router := gin.New()
+			router.POST("/v1/images/edits", RouteTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+				reached = true
+				raw, err := io.ReadAll(c.Request.Body)
+				require.NoError(t, err)
+				assert.Equal(t, body.Bytes(), raw)
+				form, err := common.ParseMultipartFormReusable(c)
+				require.NoError(t, err)
+				defer form.RemoveAll()
+				assert.Len(t, form.Value["tag"], tc.fieldCount)
+				assert.Len(t, form.File["image"], tc.fileCount)
+				_, pinned := c.Get(jsplugin.ContextKeyPinnedEndpoint)
+				assert.False(t, pinned)
+				c.Status(http.StatusNoContent)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(body.Bytes()))
+			request.Header.Set("Content-Type", writer.FormDataContentType())
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			status := tc.wantStatus
+			if status == 0 {
+				status = http.StatusNoContent
+			}
+			assert.Equal(t, status, recorder.Code, recorder.Body.String())
+			assert.Equal(t, status == http.StatusNoContent, reached)
+			if status == http.StatusBadRequest {
+				assert.Contains(t, recorder.Body.String(), "InvalidAssetReference")
+			}
+		})
+	}
+}
+
+func TestRouteTaskPluginAssetProbeMultipartContract(t *testing.T) {
+	require.NoError(t, appI18n.Init())
+	previousLimit := constant.MaxFileDownloadMB
+	constant.MaxFileDownloadMB = 1
+	t.Cleanup(func() { constant.MaxFileDownloadMB = previousLimit })
+	source := taskProtocolPluginSource("asset-multipart-probe", "1.0.0", `["asset-multipart-model"]`, "/v1/videos", `return {model:ctx.model, requestBody:{refs:JSON.parse(ctx.body.fields.references[0])}};`)
+	source = strings.Replace(source, `fetchMode: "per_task",`, `fetchMode: "per_task", requiredCapabilities:["asset-references@1"],`, 1) + `
+export function extractAssetReferences(ctx) {
+  if (ctx.normalized) return ctx.body.value.refs.map(value => value.slice(8));
+  if (ctx.body.kind !== "multipart" || ctx.body.fields.tag.join(",") !== "one,two" || ctx.body.files.length !== 2) throw new Error("incomplete multipart body");
+  for (let i = 0; i < 2; i++) {
+    const file = ctx.body.files[i];
+    if (file.field !== "image" || file.ref !== "request_file:image" + (i ? "#1" : "") || file.filename !== i + ".png" || file.mimeType !== "application/octet-stream" || file.size < 3) throw new Error("incomplete file metadata");
+  }
+  return JSON.parse(ctx.body.fields.references[0]).map(value => value.slice(8));
+}`
+	_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister("asset-multipart-probe")) })
+	for _, tc := range []struct {
+		name       string
+		fileSize   int
+		references int
+		cancel     bool
+		wantError  string
+	}{
+		{name: "metadata and repeated fields reach the hook", fileSize: 3, references: 1},
+		{name: "plugin upload limit remains enforced", fileSize: 2 << 20, references: 1, wantError: "multipart file exceeds 1 MB"},
+		{name: "reserved references remain bounded", fileSize: 3, references: 33, wantError: "InvalidAssetReference"},
+		{name: "canceled probe stops preparation", fileSize: 3, references: 1, cancel: true, wantError: "InvalidAssetReference"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			require.NoError(t, writer.WriteField("model", "asset-multipart-model"))
+			require.NoError(t, writer.WriteField("tag", "one"))
+			require.NoError(t, writer.WriteField("tag", "two"))
+			references := make([]string, tc.references)
+			for i := range references {
+				references[i] = fmt.Sprintf("asset://asset-na-%d", i)
+			}
+			encoded, err := common.Marshal(references)
+			require.NoError(t, err)
+			require.NoError(t, writer.WriteField("references", string(encoded)))
+			for i := range 2 {
+				file, err := writer.CreateFormFile("image", fmt.Sprintf("%d.png", i))
+				require.NoError(t, err)
+				_, err = file.Write(bytes.Repeat([]byte{'x'}, tc.fileSize))
+				require.NoError(t, err)
+			}
+			require.NoError(t, writer.Close())
+			router := gin.New()
+			router.POST("/v1/videos", RouteTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+				assert.Equal(t, []string{"asset-na-0"}, service.TaskAssetReferences(c))
+				c.Status(http.StatusNoContent)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/videos", bytes.NewReader(body.Bytes()))
+			request.Header.Set("Content-Type", writer.FormDataContentType())
+			if tc.cancel {
+				ctx, cancel := context.WithCancel(request.Context())
+				cancel()
+				request = request.WithContext(ctx)
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if tc.wantError != "" {
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+				assert.Contains(t, recorder.Body.String(), tc.wantError)
+			} else {
+				assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 	require.NoError(t, appI18n.Init())
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"route-test":1}`))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios)) })
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {
 			dsn := ""
@@ -2082,15 +2293,16 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 			database := model.DB
 			// Every table belongs to this run, including when a developer points
 			// a test DSN at a database shared with another test suite.
-			database.Config.NamingStrategy = schema.NamingStrategy{TablePrefix: "endpoint_route_" + common.GetUUID() + "_"}
-			require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}))
+			database.Config.NamingStrategy = schema.NamingStrategy{TablePrefix: "endpoint_route_" + common.GetUUID()[:8] + "_"}
+			tables := []any{&model.Channel{}, &model.Ability{}, &model.Task{}, &model.User{}, &model.Option{}, &model.Asset{}, &model.AssetGroup{}, &model.AssetReplica{}, &model.AssetGroupReplica{}}
+			require.NoError(t, database.AutoMigrate(tables...))
 			t.Cleanup(func() {
-				for _, table := range []any{&model.Ability{}, &model.Channel{}, &model.Task{}} {
-					require.NoError(t, database.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
+				for _, table := range tables {
+					require.NoError(t, database.Unscoped().Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
 				}
 				common.MemoryCacheEnabled = true
 				model.InitChannelCache()
-				require.NoError(t, database.Migrator().DropTable(&model.Ability{}, &model.Channel{}, &model.Task{}))
+				require.NoError(t, database.Migrator().DropTable(tables...))
 				model.DB = previousDB
 				common.SetDatabaseTypes(previousMain, previousLog)
 				common.SQLitePath, common.IsMasterNode = previousPath, previousMaster
@@ -2114,20 +2326,23 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 				t.Run(fmt.Sprintf("memory_cache=%t", memoryCache), func(t *testing.T) {
 					common.MemoryCacheEnabled = memoryCache
 					for _, tc := range []struct {
-						name, path, model        string
-						pluginType               int
-						ordinaryType             int
-						ordinaryPriority         int64
-						pluginPriority           int64
-						pluginOnly, wantPlugin   bool
-						multipart, stream        bool
-						pinOrdinary, pinPlugin   bool
-						wrongGroup, wrongModel   bool
-						disabled, unrelated      bool
-						decoderRejects, syncOnly bool
-						originPin, retry         bool
-						legacy, mapped, shared   bool
-						wantStatus               int
+						name, path, model                                                   string
+						pluginType                                                          int
+						ordinaryType                                                        int
+						ordinaryPriority                                                    int64
+						pluginPriority                                                      int64
+						pluginOnly, wantPlugin                                              bool
+						multipart, stream                                                   bool
+						largeUpload, probeRejects                                           bool
+						pinOrdinary, pinPlugin                                              bool
+						wrongGroup, wrongModel                                              bool
+						disabled, unrelated                                                 bool
+						decoderRejects, syncOnly                                            bool
+						originPin, retry                                                    bool
+						legacy, mapped, shared                                              bool
+						assets, pendingAssets, readyAlternate, storageDisabled, modelDenied bool
+						oldAssetPlugin                                                      bool
+						wantStatus                                                          int
 					}{
 						{name: "ordinary images bypass plugin decoder", decoderRejects: true},
 						{name: "ordinary images win by priority", ordinaryPriority: 20},
@@ -2148,6 +2363,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 						{name: "mapped plugin alias remains usable", model: "friendly-image", mapped: true, pluginOnly: true, wantPlugin: true},
 						{name: "ordinary alias is not rewritten by plugin", model: "friendly-image", mapped: true, decoderRejects: true},
 						{name: "ordinary multipart edits are preserved", path: "/v1/images/edits", multipart: true, decoderRejects: true},
+						{name: "ordinary multipart keeps its upload limit", path: "/v1/images/edits", multipart: true, largeUpload: true, decoderRejects: true},
 						{name: "plugin multipart edits remain usable", path: "/v1/images/edits", multipart: true, pluginOnly: true, wantPlugin: true},
 						{name: "ordinary Responses bypass unsupported plugin mode", path: "/v1/responses", stream: true, syncOnly: true},
 						{name: "plugin Responses remain usable", path: "/v1/responses", pluginOnly: true, wantPlugin: true},
@@ -2159,10 +2375,19 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 						{name: "ordinary retries stay on ordinary channels", ordinaryPriority: 20, pluginPriority: 10, retry: true},
 						{name: "plugin retries stay on plugin channels", pluginPriority: 20, retry: true, wantPlugin: true},
 						{name: "rejected shared candidate still allows another plugin", pluginOnly: true, shared: true, decoderRejects: true, pluginPriority: 20, wantPlugin: true},
+						{name: "library assets exclude higher priority ordinary channels", path: "/v1/videos", assets: true, ordinaryPriority: 50, wantPlugin: true},
+						{name: "library assets retain mapped aliases", path: "/v1/videos", assets: true, model: "friendly-image", mapped: true, wantPlugin: true},
+						{name: "pending library assets return conflict", path: "/v1/videos", assets: true, pendingAssets: true, wantStatus: http.StatusConflict},
+						{name: "ready library replica wins while preferred is prepared", path: "/v1/videos", assets: true, pendingAssets: true, readyAlternate: true, pluginPriority: 20, wantPlugin: true},
+						{name: "library assets respect explicit channel pins", path: "/v1/videos", assets: true, pendingAssets: true, readyAlternate: true, pinPlugin: true, wantStatus: http.StatusConflict},
+						{name: "disabled storage fails before ordinary relay", path: "/v1/videos", assets: true, storageDisabled: true, wantStatus: http.StatusServiceUnavailable},
+						{name: "library assets preserve model restriction with pin", path: "/v1/videos", assets: true, modelDenied: true, pinPlugin: true, wantStatus: http.StatusForbidden},
+						{name: "old plugin cannot forward gateway asset namespace", path: "/v1/videos", assets: true, oldAssetPlugin: true, ordinaryPriority: 50, wantStatus: http.StatusBadRequest},
+						{name: "rejected asset probe stays excluded on retry", path: "/v1/videos", assets: true, shared: true, probeRejects: true, pluginPriority: 20, retry: true, wantPlugin: true},
 					} {
 						t.Run(tc.name, func(t *testing.T) {
-							for _, table := range []any{&model.Ability{}, &model.Channel{}, &model.Task{}} {
-								require.NoError(t, database.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
+							for _, table := range tables {
+								require.NoError(t, database.Unscoped().Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
 							}
 							key := "channel-route-test"
 							path := common.GetStringIfEmpty(tc.path, "/v1/images/generations")
@@ -2175,8 +2400,17 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 								decode = `throw new Error("plugin rejected this request");`
 							} else if tc.originPin {
 								decode = `return {model: ctx.model, originTaskIds: ["task-route-origin"], requestBody: {normalized: true}};`
+							} else if tc.assets {
+								decode = `return {model: ctx.model, requestBody: ctx.body.value};`
 							}
 							source := taskProtocolPluginSource(key, "1.0.0", `["channel-route-model"]`, path, decode)
+							if tc.assets && !tc.oldAssetPlugin {
+								source = strings.Replace(source, `fetchMode: "per_task",`, `fetchMode: "per_task", requiredCapabilities:["asset-references@1"],`, 1) + `
+export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx.body.value.asset.slice(8)] : []; }`
+								if tc.probeRejects {
+									source = strings.Replace(source, `return ctx.body.value.asset ?`, `if (!ctx.normalized) throw new Error("unsupported reference"); return ctx.body.value.asset ?`, 1)
+								}
+							}
 							if tc.syncOnly {
 								source = taskResponsesPluginSource(key, 0, `["channel-route-model"]`, `["sync"]`, `renderFinal: function() { return {}; },`, decode)
 							}
@@ -2216,7 +2450,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							if !tc.pluginOnly {
 								channels = append(channels, ordinary)
 							}
-							if tc.originPin || tc.retry || tc.shared {
+							if tc.originPin || tc.retry || tc.shared || tc.readyAlternate {
 								alternate := &model.Channel{Type: ordinary.Type, Status: common.ChannelStatusEnabled, Name: "alternate", Key: "alternate-key", Group: "route-test", Models: modelName}
 								if tc.wantPlugin {
 									alternate.Type = plugin.Type
@@ -2225,6 +2459,11 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 								if tc.shared {
 									const alternateKey = "channel-route-ztest"
 									alternateSource := taskProtocolPluginSource(alternateKey, "1.0.0", `["channel-route-model"]`, path, `return {model: ctx.model, requestBody: {normalized: true}};`)
+									if tc.assets {
+										alternateSource = strings.Replace(alternateSource, `requestBody: {normalized: true}`, `requestBody: ctx.body.value`, 1)
+										alternateSource = strings.Replace(alternateSource, `fetchMode: "per_task",`, `fetchMode: "per_task", requiredCapabilities:["asset-references@1"],`, 1) + `
+export function extractAssetReferences(ctx) { return ctx.body.value.asset ? [ctx.body.value.asset.slice(8)] : []; }`
+									}
 									_, err := jsplugin.DefaultRegistry.Register(alternateSource, jsplugin.Options{})
 									require.NoError(t, err)
 									t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(alternateKey)) })
@@ -2235,11 +2474,35 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							for _, channel := range channels {
 								require.NoError(t, channel.Insert())
 							}
+							if tc.assets {
+								require.NoError(t, database.Create(&model.User{Id: 7, Username: "asset-router", Group: "route-test", Status: common.UserStatusEnabled}).Error)
+								config, err := common.Marshal(system_setting.AssetStorageConfig{AssetStorageFields: dto.AssetStorageFields{Enabled: !tc.storageDisabled}})
+								require.NoError(t, err)
+								require.NoError(t, database.Create(&model.Option{Key: system_setting.AssetStorageOption, Value: string(config)}).Error)
+								group := model.AssetGroup{PublicID: "group-na-route", UserID: 7, ProjectName: "default"}
+								require.NoError(t, database.Create(&group).Error)
+								asset := model.Asset{PublicID: "asset-na-route", UserID: 7, ProjectName: "default", GroupID: group.ID, GroupPublicID: group.PublicID, AssetType: "Image", ObjectState: model.AssetReady}
+								require.NoError(t, database.Create(&asset).Error)
+								for _, channel := range channels {
+									if channel.Type != constant.ChannelTypeTaskPlugin {
+										continue
+									}
+									config, err := common.Marshal(system_setting.AssetChannelConfig{AssetChannelFields: dto.AssetChannelFields{Enabled: true, Endpoint: "https://asset-provider.example", ProjectName: "default", AuthType: "bearer"}, ChannelScope: model.AssetChannelScope(channel)})
+									require.NoError(t, err)
+									require.NoError(t, database.Create(&model.Option{Key: model.AssetChannelOptionKey(channel.Id), Value: string(config)}).Error)
+									if channel.Id != plugin.Id || !tc.pendingAssets {
+										require.NoError(t, database.Create(&model.AssetReplica{AssetID: asset.ID, ChannelID: channel.Id, UpstreamID: fmt.Sprintf("upstream-%d", channel.Id), Status: model.AssetActive, State: model.AssetReady}).Error)
+									}
+								}
+							}
 							if tc.originPin {
 								require.NoError(t, database.Create(&model.Task{TaskID: "task-route-origin", UserId: 7, ChannelId: channels[len(channels)-1].Id, Platform: constant.TaskPlatform(key), Status: model.TaskStatusSuccess}).Error)
 							}
 							model.InitChannelCache()
 							body := []byte(fmt.Sprintf(`{"model":%q,"prompt":"a cat","size":"1024x1024","stream":%t}`, modelName, tc.stream))
+							if tc.assets {
+								body = []byte(fmt.Sprintf(`{"model":%q,"asset":"asset://asset-na-route"}`, modelName))
+							}
 							contentType := "application/json"
 							if tc.multipart {
 								var form bytes.Buffer
@@ -2250,6 +2513,13 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 								require.NoError(t, err)
 								_, err = file.Write([]byte("image bytes"))
 								require.NoError(t, err)
+								if tc.largeUpload {
+									previousLimit := constant.MaxFileDownloadMB
+									constant.MaxFileDownloadMB = 1
+									t.Cleanup(func() { constant.MaxFileDownloadMB = previousLimit })
+									_, err = file.Write(bytes.Repeat([]byte{'x'}, 2<<20))
+									require.NoError(t, err)
+								}
 								require.NoError(t, writer.Close())
 								body, contentType = form.Bytes(), writer.FormDataContentType()
 							}
@@ -2258,6 +2528,10 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							router.POST(path, func(c *gin.Context) {
 								common.SetContextKey(c, constant.ContextKeyUsingGroup, "route-test")
 								common.SetContextKey(c, constant.ContextKeyUserId, 7)
+								if tc.modelDenied {
+									common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+									common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"another-model": true})
+								}
 								if tc.pinOrdinary || tc.pinPlugin {
 									id := ordinary.Id
 									if tc.pinPlugin {
@@ -2279,7 +2553,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 									} else {
 										assert.Equal(t, key, c.GetString("task_plugin_key"))
 									}
-									if tc.legacy {
+									if tc.legacy || tc.assets {
 										assert.NotNil(t, c.MustGet("task_request"))
 									} else {
 										assert.Equal(t, map[string]any{"normalized": true}, c.MustGet("task_request"))
@@ -2287,7 +2561,7 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 									if tc.mapped {
 										assert.Equal(t, "channel-route-model", c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint).MappedModel)
 									}
-									if tc.originPin || tc.shared {
+									if tc.originPin || tc.shared || tc.readyAlternate {
 										expected = channels[len(channels)-1]
 									}
 								} else {
@@ -2319,6 +2593,10 @@ func TestRouteTaskPluginEndpointUsesSelectedChannel(t *testing.T) {
 							}
 							assert.Equal(t, status, recorder.Code, recorder.Body.String())
 							assert.Equal(t, status == http.StatusNoContent, reached)
+							if tc.assets && status == http.StatusConflict {
+								assert.Contains(t, recorder.Body.String(), "AssetNotReady")
+								assert.Equal(t, "5", recorder.Header().Get("Retry-After"))
+							}
 							if tc.decoderRejects && status == http.StatusBadRequest {
 								assert.Contains(t, recorder.Body.String(), "plugin rejected this request")
 							}
@@ -2420,6 +2698,55 @@ func TestPrepareTaskPluginRouteDecodesEverySharedSubmitCandidate(t *testing.T) {
 			assert.JSONEq(t, testCase.want, recorder.Body.String())
 		})
 	}
+}
+
+func TestPrepareTaskPluginRouteKeepsOnlyCandidatesPreservingGatewayAssets(t *testing.T) {
+	require.NoError(t, appI18n.Init())
+	var candidates []*jsplugin.LoadedPlugin
+	for _, candidate := range []struct {
+		key, capabilities, reference string
+	}{
+		{key: "asset-legacy", capabilities: `[]`, reference: "ctx.body.value.reference"},
+		{key: "asset-dropper", capabilities: `["asset-references@1"]`, reference: "null"},
+		{key: "asset-changer", capabilities: `["asset-references@1"]`, reference: `"asset://asset-na-replaced"`},
+		{key: "asset-one", capabilities: `["asset-references@1"]`, reference: "ctx.body.value.reference"},
+		{key: "asset-two", capabilities: `["asset-references@1"]`, reference: "ctx.body.value.reference"},
+	} {
+		candidates = append(candidates, compileTaskRoutePlugin(t, fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: "Asset candidate", version: "1.0.0", author: {name: "Test"},
+  models: ["asset-model"], fetchMode: "per_task", requiredCapabilities: %s,
+  routes: [{method: "POST", path: "/probe/assets", type: "submit", decode: "create", render: "created"}]
+};
+export const native = {
+  create(ctx) { return {kind: "submit", model: "asset-model", requestBody: {reference: %s}}; },
+  created(ctx, task) { return task; }
+};
+export function extractAssetReferences(ctx) {
+  const reference = ctx.body.value.reference;
+  return typeof reference === "string" ? [reference.slice("asset://".length)] : [];
+}
+export function buildSubmitRequest() { return {url: "https://example.com"}; }
+export function parseSubmitResponse() { return {taskId: "one"}; }
+export function buildQueryRequest() { return {url: "https://example.com"}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }
+`, candidate.key, candidate.capabilities, candidate.reference)))
+	}
+	const body = `{"model":"asset-model","reference":"asset://asset-na-original"}`
+	t.Run("shared path excludes unsupported dropped and replaced references", func(t *testing.T) {
+		router := sharedTaskPluginRouteRouter(t, candidates...)
+		response := performSharedRouteRequest(router, http.MethodPost, "/probe/assets", body)
+		require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
+		assert.JSONEq(t, `{"plugin":"asset-one","candidates":["asset-one","asset-two"],"model":"asset-model","request":{"reference":"asset://asset-na-original"}}`, response.Body.String())
+	})
+	t.Run("all incompatible candidates reject before distribution", func(t *testing.T) {
+		router := sharedTaskPluginRouteRouter(t, candidates[:3]...)
+		response := performSharedRouteRequest(router, http.MethodPost, "/probe/assets", body)
+		require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), "asset-legacy")
+		assert.Contains(t, response.Body.String(), "asset-dropper")
+		assert.Contains(t, response.Body.String(), "asset-changer")
+	})
 }
 
 // A case variant or a channel alias of a declared model is matched on a
@@ -2668,6 +2995,240 @@ func TestNativeRouteCredentialRewritesOnlyTheVendorsOwnForm(t *testing.T) {
 			if testCase.wantRequestURI != "" {
 				assert.Equal(t, testCase.wantRequestURI, captured.RequestURI)
 				assert.NotContains(t, captured.URL.RawQuery, "key=")
+			}
+		})
+	}
+}
+
+func TestVideoAssetSubmissionCompatibility(t *testing.T) {
+	require.NoError(t, appI18n.Init())
+	plugin, found := jsplugin.DefaultRegistry.Get("doubao")
+	require.True(t, found)
+	const videoModel = "doubao-seedance-1-5-pro-251215"
+	const assetID = "asset-na-video-reference"
+
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			dsn := ""
+			if dialect != "sqlite" {
+				dsn = os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
+				if dsn == "" {
+					t.Skip("database test DSN not configured")
+				}
+			}
+			previousDB, previousMain, previousLog := model.DB, common.MainDatabaseType(), common.LogDatabaseType()
+			previousPath, previousMaster := common.SQLitePath, common.IsMasterNode
+			previousCache, previousRedis := common.MemoryCacheEnabled, common.RedisEnabled
+			common.SQLitePath, common.IsMasterNode = t.TempDir()+"/video-assets.db", false
+			common.RedisEnabled = false
+			t.Setenv("SQL_DSN", dsn)
+			require.NoError(t, model.InitDB())
+			database := model.DB
+			database.Config.NamingStrategy = schema.NamingStrategy{TablePrefix: "video_assets_" + common.GetUUID()[:8] + "_"}
+			tables := append(model.AssetModels(), &model.Channel{}, &model.Ability{}, &model.Task{}, &model.User{}, &model.Token{}, &model.Option{})
+			require.NoError(t, database.AutoMigrate(tables...))
+			t.Cleanup(func() {
+				for _, table := range tables {
+					require.NoError(t, database.Unscoped().Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
+				}
+				common.MemoryCacheEnabled = true
+				model.InitChannelCache()
+				require.NoError(t, database.Migrator().DropTable(tables...))
+				model.DB = previousDB
+				common.SetDatabaseTypes(previousMain, previousLog)
+				common.SQLitePath, common.IsMasterNode = previousPath, previousMaster
+				common.MemoryCacheEnabled, common.RedisEnabled = previousCache, previousRedis
+				if previousDB != nil {
+					model.InitChannelCache()
+				}
+				sqlDB, err := database.DB()
+				require.NoError(t, err)
+				require.NoError(t, sqlDB.Close())
+			})
+			query := "SELECT version()"
+			if dialect == "sqlite" {
+				query = "SELECT sqlite_version()"
+			}
+			var version string
+			require.NoError(t, database.Raw(query).Scan(&version).Error)
+			t.Logf("database version: %s", version)
+
+			for _, memoryCache := range []bool{false, true} {
+				t.Run(fmt.Sprintf("memory_cache=%t", memoryCache), func(t *testing.T) {
+					common.MemoryCacheEnabled = memoryCache
+					for _, entry := range []string{"legacy", "native", "openai"} {
+						t.Run(entry, func(t *testing.T) {
+							for _, tc := range []struct {
+								name                                                 string
+								plainURL, pending, pinned, foreign, denied, tampered bool
+								metadataString, imageField, mapped, unknownField     bool
+								wantStatus                                           int
+								wantCode                                             string
+							}{
+								{name: "ready alternate"},
+								{name: "ordinary image URL", plainURL: true},
+								{name: "all replicas pending", pending: true, wantStatus: http.StatusConflict, wantCode: "AssetNotReady"},
+								{name: "explicit pending channel", pinned: true, wantStatus: http.StatusConflict, wantCode: "AssetNotReady"},
+								{name: "another owner", foreign: true, wantStatus: http.StatusNotFound, wantCode: "ResourceNotFound"},
+								{name: "token model restriction with pin", denied: true, pinned: true, wantStatus: http.StatusForbidden},
+								{name: "reference changed after selection", tampered: true, wantStatus: http.StatusBadRequest, wantCode: "InvalidAssetReference"},
+								{name: "unclaimed top level reference", unknownField: true, wantStatus: http.StatusBadRequest},
+								{name: "legacy string metadata", metadataString: true},
+								{name: "legacy single image field", imageField: true},
+								{name: "legacy model alias", mapped: true},
+							} {
+								if (tc.metadataString || tc.imageField || tc.mapped) && entry != "legacy" {
+									continue
+								}
+								t.Run(tc.name, func(t *testing.T) {
+									for _, table := range tables {
+										require.NoError(t, database.Unscoped().Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
+									}
+									require.NoError(t, database.Create(&model.User{Id: 7, Username: "video-assets", Group: "default", Status: common.UserStatusEnabled}).Error)
+									require.NoError(t, model.SaveAssetStorageConfig(t.Context(), system_setting.AssetStorageConfig{AssetStorageFields: dto.AssetStorageFields{Enabled: true}}))
+									channels := []*model.Channel{
+										{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Name: "preferred", Key: "preferred-key", Group: "default", Models: videoModel, Priority: common.GetPointer(int64(20))},
+										{Type: constant.ChannelTypeDoubaoVideo, Status: common.ChannelStatusEnabled, Name: "ready", Key: "ready-key", Group: "default", Models: videoModel, Priority: common.GetPointer(int64(10))},
+									}
+									modelName := videoModel
+									if tc.mapped {
+										modelName = "friendly-video"
+									}
+									for _, channel := range channels {
+										if tc.mapped {
+											channel.Models = modelName
+											channel.ModelMapping = common.GetPointer(fmt.Sprintf(`{"%s":%q}`, modelName, videoModel))
+										}
+										require.NoError(t, channel.Insert())
+										config := system_setting.AssetChannelConfig{AssetChannelFields: dto.AssetChannelFields{Enabled: true, Endpoint: "https://asset-provider.example", ProjectName: "default", AuthType: "bearer"}, ChannelScope: model.AssetChannelScope(channel)}
+										require.NoError(t, model.SaveAssetChannelConfig(t.Context(), channel.Id, config))
+									}
+									owner := 7
+									if tc.foreign {
+										owner = 8
+									}
+									group := model.AssetGroup{PublicID: "group-na-video", UserID: owner, ProjectName: "default"}
+									require.NoError(t, database.Create(&group).Error)
+									asset := model.Asset{PublicID: assetID, UserID: owner, ProjectName: "default", GroupID: group.ID, GroupPublicID: group.PublicID, AssetType: "Image", ObjectState: model.AssetReady}
+									require.NoError(t, database.Create(&asset).Error)
+									if !tc.pending {
+										require.NoError(t, database.Create(&model.AssetReplica{AssetID: asset.ID, ChannelID: channels[1].Id, UpstreamID: "asset-upstream-ready", Status: model.AssetActive, State: model.AssetReady}).Error)
+									}
+									model.InitChannelCache()
+									url := "asset://" + assetID
+									if tc.plainURL {
+										url = "https://images.example/reference.png"
+									}
+									content := []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}, "role": "reference_image"}}
+									metadata := map[string]any{"content": content, "duration": 4, "watermark": false, "priority": 0}
+									body := map[string]any{"model": modelName, "prompt": "animate this picture", "metadata": metadata}
+									path := "/v1/video/generations"
+									handlers := []gin.HandlerFunc{PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), Distribute()}
+									if entry == "native" {
+										path = "/doubao/api/v3/contents/generations/tasks"
+										body = metadata
+										body["model"] = videoModel
+										body["content"] = append(content, map[string]any{"type": "text", "text": "animate this picture"})
+										handlers = []gin.HandlerFunc{func(c *gin.Context) {
+											c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Generation: jsplugin.DefaultRegistry.Generation(), Plugin: plugin, Route: plugin.Meta.Routes[0]})
+										}, PrepareTaskPluginRoute(), Distribute()}
+									} else if entry == "openai" {
+										path = "/v1/videos"
+										handlers = []gin.HandlerFunc{RouteTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), Distribute()}
+									}
+									if tc.metadataString {
+										encoded, err := common.Marshal(metadata)
+										require.NoError(t, err)
+										body["metadata"] = string(encoded)
+									}
+									if tc.imageField {
+										delete(metadata, "content")
+										body["image"] = url
+									}
+									if tc.unknownField {
+										body["unknown_reference"] = "asset://asset-na-unclaimed"
+									}
+									encoded, err := common.Marshal(body)
+									require.NoError(t, err)
+									reached := false
+									engine := gin.New()
+									engine.Use(func(c *gin.Context) {
+										common.SetContextKey(c, constant.ContextKeyUserId, 7)
+										common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+										if tc.denied {
+											common.SetContextKey(c, constant.ContextKeyTokenModelLimitEnabled, true)
+											common.SetContextKey(c, constant.ContextKeyTokenModelLimit, map[string]bool{"other-model": true})
+										}
+										if tc.pinned {
+											service.GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: channels[0].Id, Source: dto.PinSourceToken, Rank: dto.PinRankToken})
+										}
+									})
+									handlers = append(handlers, func(c *gin.Context) {
+										reached = true
+										if entry == "legacy" {
+											_, pinned := c.Get(jsplugin.ContextKeyPinnedEndpoint)
+											assert.False(t, pinned, "keep the legacy response presenter")
+										}
+										if tc.tampered {
+											c.Set(jsplugin.ContextKeyAssetReferences, []string{"asset-na-different"})
+										}
+										info := &relaycommon.RelayInfo{OriginModelName: modelName, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_asset_video"}}
+										info.InitChannelMeta(c)
+										info.UpstreamModelName = videoModel
+										adaptor := pluginadaptor.New(plugin)
+										adaptor.Init(info)
+										if taskErr := adaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {
+											c.JSON(taskErr.StatusCode, taskErr)
+											return
+										}
+										request, err := adaptor.BuildRequestBody(c, info)
+										require.NoError(t, err)
+										var upstream map[string]any
+										require.NoError(t, common.DecodeJson(request, &upstream))
+										expectedChannel, expectedURL := channels[1].Id, "asset://asset-upstream-ready"
+										if tc.plainURL {
+											expectedChannel, expectedURL = channels[0].Id, url
+										}
+										assert.Equal(t, expectedChannel, info.ChannelId)
+										expectedReference := map[string]any{"type": "image_url", "image_url": map[string]any{"url": expectedURL}, "role": "reference_image"}
+										if tc.imageField {
+											delete(expectedReference, "role")
+										}
+										assert.Equal(t, []any{expectedReference, map[string]any{"type": "text", "text": "animate this picture"}}, upstream["content"])
+										assert.Equal(t, false, upstream["watermark"])
+										assert.EqualValues(t, 0, upstream["priority"])
+										assert.EqualValues(t, 4, upstream["duration"])
+										c.Status(http.StatusNoContent)
+									})
+									engine.POST(path, handlers...)
+									request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded))
+									request.Header.Set("Content-Type", "application/json")
+									recorder := httptest.NewRecorder()
+									engine.ServeHTTP(recorder, request)
+									status := tc.wantStatus
+									if status == 0 {
+										status = http.StatusNoContent
+									}
+									assert.Equal(t, status, recorder.Code, recorder.Body.String())
+									assert.Equal(t, status == http.StatusNoContent || tc.tampered, reached, "reject before task submission")
+									if tc.wantCode != "" {
+										assert.Contains(t, recorder.Body.String(), tc.wantCode)
+									}
+									if status == http.StatusConflict {
+										assert.Equal(t, "5", recorder.Header().Get("Retry-After"))
+									}
+									var uses int64
+									require.NoError(t, database.Model(&model.AssetUse{}).Count(&uses).Error)
+									if status == http.StatusNoContent && !tc.plainURL {
+										assert.EqualValues(t, 1, uses)
+									} else {
+										assert.Zero(t, uses)
+									}
+								})
+							}
+						})
+					}
+				})
 			}
 		})
 	}

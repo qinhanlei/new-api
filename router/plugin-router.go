@@ -42,8 +42,8 @@ type pluginRouteHandlers func(*jsplugin.RoutingGeneration, jsplugin.RouteGroup) 
 
 type pluginGenerationBuilder struct {
 	staticRoutes []gin.RouteInfo
-	// hostSegments are the first path segments the host serves: api and the
-	// literal first segment of every static route.
+	// hostSegments are api and the literal first segment of each static
+	// route, except the asset management endpoint sharing Doubao's prefix.
 	hostSegments   map[string]struct{}
 	trustedProxies []string
 	routeHandlers  pluginRouteHandlers
@@ -91,6 +91,11 @@ func newPluginGenerationBuilder(staticRoutes []gin.RouteInfo, trustedProxies []s
 		routeHandlers:  handlers,
 	}
 	for _, staticRoute := range staticRoutes {
+		if staticRoute.Method == http.MethodPost && staticRoute.Path == assetManagementPath {
+			// Only this management endpoint shares the plugin's namespace.
+			// Keep it in staticRoutes so exact paths and redirects stay protected.
+			continue
+		}
 		first, _, _ := strings.Cut(strings.TrimPrefix(staticRoute.Path, "/"), "/")
 		if first != "" && !strings.HasPrefix(first, ":") && !strings.HasPrefix(first, "*") {
 			builder.hostSegments[first] = struct{}{}

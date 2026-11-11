@@ -349,6 +349,9 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 	engine.key = meta.Key
 	engine.version = meta.Version
 	requiredHooks := []string{"buildSubmitRequest", "parseSubmitResponse", "parseTaskResult"}
+	if slices.Contains(meta.RequiredCapabilities, CapabilityAssetReferences) {
+		requiredHooks = append(requiredHooks, "extractAssetReferences")
+	}
 	if slices.Contains(meta.SubmitResponseTypes, "sse") {
 		if UsesSubmitEventDelta(meta, engine) {
 			requiredHooks = append(requiredHooks, "parseSubmitEventDelta")
