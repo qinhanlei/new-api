@@ -84,6 +84,12 @@ func sweepTimedOutTasks(ctx context.Context) {
 	timedOutCount := 0
 
 	for _, task := range tasks {
+		if IsWalletFundedTask(task) {
+			if err := holdWalletTaskForReview(task, task.Status); err != nil {
+				logger.LogError(ctx, err.Error())
+			}
+			continue
+		}
 		if IsCNYTask(task) {
 			if err := HoldCNYTaskForReview(task, task.Status, "Upstream task status is unknown; the CNY reservation is pending review"); err != nil {
 				logger.LogError(ctx, err.Error())
@@ -176,6 +182,12 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		for _, task := range tasks {
 			upstreamID := task.GetUpstreamTaskID()
 			if upstreamID == "" {
+				if IsWalletFundedTask(task) {
+					if err := holdWalletTaskForReview(task, task.Status); err != nil {
+						logger.LogError(ctx, err.Error())
+					}
+					continue
+				}
 				// 统计失败的未完成任务
 				nullTaskIds = append(nullTaskIds, task.ID)
 				continue
@@ -257,6 +269,12 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
+				if IsWalletFundedTask(t) {
+					if holdErr := holdWalletTaskForReview(t, t.Status); holdErr != nil {
+						logger.LogError(ctx, holdErr.Error())
+					}
+					continue
+				}
 				failedIDs = append(failedIDs, t.ID)
 			}
 		}
@@ -382,6 +400,12 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
+		if terminalTransition && IsWalletFundedTask(task) {
+			if err := finalizeWalletTask(ctx, adaptor, task, snap.Status, &responseItem.TaskInfo); err != nil {
+				logger.LogError(ctx, err.Error())
+			}
+			continue
+		}
 		if terminalTransition && IsCNYTask(task) {
 			if err := finalizeCNYTask(ctx, task, snap.Status, &responseItem.TaskInfo); err != nil {
 				logger.LogError(ctx, err.Error())
@@ -449,6 +473,12 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
+				if IsWalletFundedTask(t) {
+					if holdErr := holdWalletTaskForReview(t, t.Status); holdErr != nil {
+						logger.LogError(ctx, holdErr.Error())
+					}
+					continue
+				}
 				failedIDs = append(failedIDs, t.ID)
 			}
 		}
@@ -624,6 +654,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
+	if isDone && snap.Status != task.Status && IsWalletFundedTask(task) {
+		return finalizeWalletTask(ctx, adaptor, task, snap.Status, taskResult)
+	}
 	if isDone && snap.Status != task.Status && IsCNYTask(task) {
 		return finalizeCNYTask(ctx, task, snap.Status, taskResult)
 	}
@@ -834,6 +867,9 @@ func recordPollFailureForTasks(ctx context.Context, adaptor TaskPollingAdaptor, 
 }
 
 func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, reason string) error {
+	if IsWalletFundedTask(task) {
+		return holdWalletTaskForReview(task, fromStatus)
+	}
 	if IsCNYTask(task) {
 		// Missing channels, polling errors, and local timeouts cannot prove failure.
 		logger.LogWarn(ctx, fmt.Sprintf("CNY task %s remains pending: %s", task.TaskID, reason))

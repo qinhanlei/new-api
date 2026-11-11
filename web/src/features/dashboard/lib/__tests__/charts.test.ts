@@ -16,10 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test } from 'vitest'
 
 import type { QuotaDataItem } from '@/features/dashboard/types'
 import type { TimeGranularity } from '@/lib/time'
+import {
+  DEFAULT_CURRENCY_CONFIG,
+  useSystemConfigStore,
+} from '@/stores/system-config-store'
 
 import { processChartData, processUserChartData } from '../charts'
 
@@ -154,3 +158,25 @@ describe.each(cases)('dashboard $granularity chart chronology', (scenario) => {
     }
   })
 })
+
+afterEach(() => {
+  useSystemConfigStore
+    .getState()
+    .setConfig({ currency: { ...DEFAULT_CURRENCY_CONFIG } })
+})
+
+test.each(['CNY', 'CUSTOM', 'TOKENS'] as const)(
+  'keeps existing USD chart totals independent of %s display mode',
+  (quotaDisplayType) => {
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType,
+        usdExchangeRate: 7,
+        customCurrencyExchangeRate: 0.8,
+      },
+    })
+    const data = unorderedUsage('2026-01-01T00:00:00', 3600)
+    expect(processChartData(data, 'hour').totalQuotaDisplay).toBe('$46')
+  }
+)

@@ -509,10 +509,9 @@ it('reuses the adjustment operation ID after a lost response and sends native CN
   await user.click(screen.getByRole('combobox', { name: 'Billing currency' }))
   await user.click(screen.getByRole('option', { name: 'CNY' }))
   await user.type(screen.getByRole('spinbutton', { name: 'Amount' }), '1.25')
-  await user.type(
-    screen.getByRole('textbox', { name: 'Reason' }),
-    'Manual credit'
-  )
+  expect(
+    screen.queryByRole('textbox', { name: 'Reason' })
+  ).not.toBeInTheDocument()
   const confirm = screen.getByRole('button', { name: 'Confirm' })
   await waitFor(() => expect(confirm).toBeEnabled())
   await user.click(confirm)
@@ -523,8 +522,9 @@ it('reuses the adjustment operation ID after a lost response and sends native CN
   const first = post.mock.calls[0]
   expect(first[0]).toBe('/api/user/9/currency/CNY')
   expect(first[1]).toMatchObject({
-    delta_quota: 625000,
-    reason: 'Manual credit',
+    mode: 'add',
+    value: 625000,
+    operation_id: expect.stringMatching(/^cny-[A-Za-z0-9_-]+$/),
   })
   expect(post.mock.calls[1][1]).toEqual(first[1])
   client.clear()

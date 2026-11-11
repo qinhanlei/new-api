@@ -22,7 +22,8 @@ import { useTranslation } from 'react-i18next'
 
 import { Dialog } from '@/components/dialog'
 import { Label } from '@/components/ui/label'
-import { formatQuota, formatCompactNumber } from '@/lib/format'
+import { formatBillingQuota } from '@/lib/currency'
+import { formatCompactNumber } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { getUserInfo } from '../../api'
@@ -111,11 +112,11 @@ export function UserInfoDialog({
           <div className='grid grid-cols-2 gap-4'>
             <InfoItem
               label={t('Balance')}
-              value={formatQuota(userInfo.quota)}
+              value={formatBillingQuota(userInfo.quota)}
             />
             <InfoItem
               label={t('Used Quota')}
-              value={formatQuota(userInfo.used_quota)}
+              value={formatBillingQuota(userInfo.used_quota)}
             />
           </div>
 
@@ -153,7 +154,7 @@ export function UserInfoDialog({
               {userInfo.aff_quota !== undefined && userInfo.aff_quota > 0 && (
                 <InfoItem
                   label={t('Invitation Quota')}
-                  value={formatQuota(userInfo.aff_quota)}
+                  value={formatBillingQuota(userInfo.aff_quota)}
                 />
               )}
             </>

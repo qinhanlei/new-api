@@ -138,7 +138,12 @@ export function LogCostDisplay(props: LogCostDisplayProps) {
             </Tooltip>
           ) : null}
           <span className='whitespace-nowrap'>
-            {props.adjustmentAmount ?? formatLogQuota(quota, props.currency)}
+            {props.adjustmentAmount ??
+              formatLogQuota(
+                quota,
+                props.currency,
+                props.other?.quota_per_unit
+              )}
           </span>
           {reserved && <span>{t('Reserved')}</span>}
           {props.other?.billing_status === 'refunded' && (

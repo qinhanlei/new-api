@@ -17,9 +17,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { createInstance } from 'i18next'
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test } from 'vitest'
+
+import {
+  DEFAULT_CURRENCY_CONFIG,
+  useSystemConfigStore,
+} from '@/stores/system-config-store'
 
 import type { UsageLog } from '../../data/schema'
+import type { WalletFundingLog } from '../../types'
 import { getLogCsvHeader, getLogCsvRow, toCsvLine } from '../export'
 
 const consumeLog: UsageLog = {
@@ -50,6 +56,24 @@ const consumeLog: UsageLog = {
   upstream_request_id: '',
 }
 
+const walletFunding: WalletFundingLog = {
+  currency: 'CNY',
+  status: 'settled',
+  usd_quota: 250000,
+  cny_quota: 1000000,
+  usd_quota_per_unit: 250000,
+  cny_quota_per_unit: 500000,
+  debt_quota: 250000,
+  exchange: {
+    enabled: true,
+    rate_id: 2,
+    rate: '7',
+    source: 'static',
+    source_time: new Date(2026, 9, 12, 8, 0, 0).getTime() / 1000,
+    policy_version: 3,
+  },
+}
+
 async function chineseTranslator() {
   const i18n = createInstance()
   await i18n.init({
@@ -72,6 +96,168 @@ async function chineseTranslator() {
 }
 
 describe('usage log CSV export', () => {
+  test('wallet funding preserves the existing log precision for tiny charges', () => {
+    const t = (key: string) => key
+    const header = getLogCsvHeader(false, t)
+    const row = getLogCsvRow(
+      {
+        ...consumeLog,
+        other: JSON.stringify({
+          wallet_funding: {
+            ...walletFunding,
+            usd_quota: 1,
+            cny_quota: 1,
+            debt_quota: 1,
+          },
+        }),
+      },
+      false,
+      t
+    )
+    expect(row[header.indexOf('USD wallet amount')]).toBe('$0.000004')
+    expect(row[header.indexOf('CNY wallet amount')]).toBe('¥0.000002')
+    expect(row[header.indexOf('Outstanding debt')]).toBe('¥0.000002')
+  })
+
+  test.each(['CNY', 'CUSTOM'] as const)(
+    'exports wallet funding snapshots without applying %s display conversion',
+    (quotaDisplayType) => {
+      useSystemConfigStore.getState().setConfig({
+        currency: {
+          ...DEFAULT_CURRENCY_CONFIG,
+          quotaDisplayType,
+          quotaPerUnit: 1000000,
+          usdExchangeRate: 14,
+          customCurrencySymbol: '€',
+          customCurrencyExchangeRate: 3,
+        },
+      })
+      const t = (key: string) => key
+      const header = getLogCsvHeader(false, t)
+      const row = getLogCsvRow(
+        {
+          ...consumeLog,
+          currency: 'CNY',
+          quota: 4500000,
+          other: JSON.stringify({
+            quota_per_unit: 500000,
+            wallet_funding: walletFunding,
+          }),
+        },
+        false,
+        t
+      )
+      expect(row).toHaveLength(header.length)
+      expect(row[header.indexOf('Cost')]).toBe('¥9')
+      expect(row[header.indexOf('USD wallet amount')]).toBe('$1')
+      expect(row[header.indexOf('CNY wallet amount')]).toBe('¥2')
+      expect(row[header.indexOf('Frozen exchange rate (CNY per USD)')]).toBe(
+        '7'
+      )
+      expect(row[header.indexOf('Exchange rate source time')]).toBe(
+        '2026-10-12 08:00:00'
+      )
+      expect(row[header.indexOf('Funding status')]).toBe('Settled')
+      expect(row[header.indexOf('Outstanding debt')]).toBe('¥0.5')
+      expect(row[header.indexOf('Debt currency')]).toBe('CNY')
+    }
+  )
+
+  test.each([
+    { status: 'reserved', label: 'Reserved' },
+    { status: 'submitted', label: 'Held pending settlement' },
+    { status: 'refunded', label: 'Refunded to original wallets' },
+  ] as const)(
+    'exports wallet funding $status state without calling it settled',
+    ({ status, label }) => {
+      const t = (key: string) => key
+      const header = getLogCsvHeader(false, t)
+      const row = getLogCsvRow(
+        {
+          ...consumeLog,
+          other: JSON.stringify({
+            wallet_funding: { ...walletFunding, status, debt_quota: 0 },
+          }),
+        },
+        false,
+        t
+      )
+      expect(row[header.indexOf('Funding status')]).toBe(label)
+      expect(row[header.indexOf('USD wallet amount')]).toBe('$1')
+      expect(row[header.indexOf('Outstanding debt')]).toBe('¥0')
+    }
+  )
+
+  test('USD-priced funding reports CNY payment and USD debt using each recorded scale', () => {
+    const t = (key: string) => key
+    const header = getLogCsvHeader(false, t)
+    const row = getLogCsvRow(
+      {
+        ...consumeLog,
+        currency: 'USD',
+        quota: 500000,
+        other: JSON.stringify({
+          quota_per_unit: 250000,
+          wallet_funding: {
+            ...walletFunding,
+            currency: 'USD',
+            cny_quota: 3500000,
+            debt_quota: 125000,
+          },
+        }),
+      },
+      false,
+      t
+    )
+    expect(row[header.indexOf('Cost')]).toBe('$2')
+    expect(row[header.indexOf('USD wallet amount')]).toBe('$1')
+    expect(row[header.indexOf('CNY wallet amount')]).toBe('¥7')
+    expect(row[header.indexOf('Frozen exchange rate (CNY per USD)')]).toBe('7')
+    expect(row[header.indexOf('Outstanding debt')]).toBe('$0.5')
+    expect(row[header.indexOf('Debt currency')]).toBe('USD')
+  })
+
+  test('native wallet funding exports zero accurately and leaves unused exchange fields empty', () => {
+    const t = (key: string) => key
+    const header = getLogCsvHeader(false, t)
+    const row = getLogCsvRow(
+      {
+        ...consumeLog,
+        other: JSON.stringify({
+          wallet_funding: {
+            ...walletFunding,
+            currency: 'USD',
+            usd_quota: 0,
+            cny_quota: 0,
+            debt_quota: 0,
+          },
+        }),
+      },
+      false,
+      t
+    )
+    expect(row[header.indexOf('USD wallet amount')]).toBe('$0')
+    expect(row[header.indexOf('CNY wallet amount')]).toBe('¥0')
+    expect(row[header.indexOf('Frozen exchange rate (CNY per USD)')]).toBe('')
+    expect(row[header.indexOf('Exchange rate source time')]).toBe('')
+  })
+
+  test('legacy logs leave every missing wallet receipt column empty', () => {
+    const t = (key: string) => key
+    const header = getLogCsvHeader(false, t)
+    const row = getLogCsvRow(consumeLog, false, t)
+    for (const column of [
+      'USD wallet amount',
+      'CNY wallet amount',
+      'Frozen exchange rate (CNY per USD)',
+      'Exchange rate source time',
+      'Funding status',
+      'Outstanding debt',
+      'Debt currency',
+    ]) {
+      expect(row[header.indexOf(column)]).toBe('')
+    }
+  })
   test.each([
     { delta: 500000, after: 1000000, amount: '+¥1' },
     { delta: -250000, after: 250000, amount: '-¥0.5' },
@@ -184,6 +370,13 @@ describe('usage log CSV export', () => {
       '',
       '',
       '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
     ])
   })
 
@@ -235,3 +428,35 @@ describe('usage log CSV export', () => {
     ).toBe(`"'=HYPERLINK(""x"")","-12.5","'+cmd","a""b","two\nlines"\r\n`)
   })
 })
+
+afterEach(() => {
+  useSystemConfigStore
+    .getState()
+    .setConfig({ currency: { ...DEFAULT_CURRENCY_CONFIG } })
+})
+
+test.each(['USD', 'CNY'] as const)(
+  'exports %s amounts using their recorded scale without display FX conversion',
+  (currency) => {
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType: 'CNY',
+        usdExchangeRate: 7,
+        quotaPerUnit: 1000000,
+      },
+    })
+    const t = (key: string) => key
+    const header = getLogCsvHeader(false, t)
+    const row = getLogCsvRow(
+      {
+        ...consumeLog,
+        currency,
+        other: JSON.stringify({ quota_per_unit: 250000 }),
+      },
+      false,
+      t
+    )
+    expect(row[header.indexOf('Cost')]).toBe(currency === 'USD' ? '$1' : '¥1')
+  }
+)

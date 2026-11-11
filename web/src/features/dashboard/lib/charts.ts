@@ -24,7 +24,7 @@ import type {
   ProcessedChartData,
   ProcessedUserChartData,
 } from '@/features/dashboard/types'
-import { getCurrencyDisplay } from '@/lib/currency'
+import { formatBillingQuota, getCurrencyDisplay } from '@/lib/currency'
 import { formatChartTime, type TimeGranularity } from '@/lib/time'
 
 type TFunction = (key: string) => string
@@ -51,17 +51,11 @@ export function getDashboardChartColors(domainLength: number): string[] {
 }
 
 function renderQuotaCompat(rawQuota: number, digits = 4): string {
-  const { config, meta } = getCurrencyDisplay()
-  if (meta.kind === 'tokens') return rawQuota.toLocaleString()
-  const usd = rawQuota / config.quotaPerUnit
-  const rate = 'exchangeRate' in meta ? meta.exchangeRate : 1
-  const symbol = 'symbol' in meta ? meta.symbol : '$'
-  const value = usd * rate
-  const fixed = value.toFixed(digits)
-  if (Number.parseFloat(fixed) === 0 && rawQuota > 0 && value > 0) {
-    return symbol + Math.pow(10, -digits).toFixed(digits)
-  }
-  return symbol + fixed
+  return formatBillingQuota(rawQuota, 'USD', {
+    digitsLarge: digits,
+    digitsSmall: digits,
+    abbreviate: false,
+  })
 }
 
 /**

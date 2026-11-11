@@ -42,6 +42,7 @@ import { useTranslation } from 'react-i18next'
 
 import type { SidebarBadges, SidebarData } from '@/components/layout/types'
 import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 
 /**
  * Root navigation groups for the application sidebar.
@@ -51,6 +52,9 @@ import { ROLE } from '@/lib/roles'
  */
 export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
   const { t } = useTranslation()
+  const currencyAdmin = useAuthStore(
+    (state) => state.auth.user?.role === ROLE.ADMIN
+  )
 
   return {
     navGroups: [
@@ -176,11 +180,16 @@ export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
             requiredRole: ROLE.SUPER_ADMIN,
           },
           {
-            title: t('System Settings'),
-            url: '/system-settings/site',
+            title: currencyAdmin
+              ? t('Currency & Display')
+              : t('System Settings'),
+            url: currencyAdmin
+              ? '/system-settings/billing/currency'
+              : '/system-settings/site',
+            configUrls: ['/system-settings'],
             activeUrls: ['/system-settings'],
             icon: Settings,
-            requiredRole: ROLE.SUPER_ADMIN,
+            requiredRole: currencyAdmin ? ROLE.ADMIN : ROLE.SUPER_ADMIN,
             // Model pricing lives in System Settings.
             badge: badges.modelPricing,
           },

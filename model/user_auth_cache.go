@@ -228,8 +228,8 @@ func BumpUserAuthVersion(userId int) (int64, error) {
 	return next, nil
 }
 
-// PublishUserAuthCache refreshes user metadata from the database. Quota stays
-// under the atomic quota-delta paths.
+// PublishUserAuthCache refreshes user metadata from the database. Financial
+// reads obtain the committed balance separately from the database.
 func PublishUserAuthCache(userId int) error {
 	if !common.RedisEnabled {
 		return nil

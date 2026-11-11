@@ -153,7 +153,7 @@ func CNYBodyHasPaidTools(encoded []byte) bool {
 }
 
 // CNYBillingSession persists funding independently of the optional log database.
-// USD sessions retain their existing cache, batching, and rounding behavior.
+// USD and CNY wallets use the same transactional funding ledger.
 type CNYBillingSession struct {
 	info            *relaycommon.RelayInfo
 	params          model.CNYBillingParams
@@ -247,12 +247,26 @@ func (s *CNYBillingSession) NeedsRefund() bool {
 
 // MarkCNYUpstreamPending prevents a second paid submit or a speculative refund
 // while the first submit may have been accepted. A definite rejection clears it.
-func MarkCNYUpstreamPending(info *relaycommon.RelayInfo, pending bool) {
+func MarkCNYUpstreamPending(info *relaycommon.RelayInfo, pending bool) error {
 	if session, ok := info.Billing.(*CNYBillingSession); ok {
 		session.mu.Lock()
+		defer session.mu.Unlock()
+		if err := model.MarkWalletFundingPending(info.RequestId, pending); err != nil {
+			return err
+		}
 		session.upstreamPending = pending
-		session.mu.Unlock()
 	}
+	if session, ok := info.Billing.(*BillingSession); ok {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		if _, wallet := session.funding.(*WalletFunding); wallet {
+			if err := model.MarkWalletFundingPending(info.RequestId, pending); err != nil {
+				return err
+			}
+			session.upstreamPending = pending
+		}
+	}
+	return nil
 }
 
 func CNYUpstreamPending(info *relaycommon.RelayInfo) bool {
@@ -261,7 +275,22 @@ func CNYUpstreamPending(info *relaycommon.RelayInfo) bool {
 		defer session.mu.Unlock()
 		return session.upstreamPending
 	}
+	if session, ok := info.Billing.(*BillingSession); ok {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return session.upstreamPending
+	}
 	return false
+}
+
+// RecordUnknownWalletUsage exposes the durable hold without inventing a final
+// charge or changing the provider's response frames.
+func RecordUnknownWalletUsage(ctx *gin.Context, info *relaycommon.RelayInfo) {
+	other := model.NewLogOther()
+	appendStreamStatus(info, other)
+	model.RecordErrorLog(ctx, info.UserId, info.ChannelId, info.OriginModelName, ctx.GetString("token_name"),
+		"Upstream usage is unknown; the wallet reservation is retained", info.TokenId,
+		int(max(int64(0), time.Now().Unix()-info.StartTime.Unix())), info.IsStream, info.UsingGroup, other)
 }
 
 // PrepareCNYHTTPRequest is the final safety gate after provider conversion and
@@ -402,7 +431,9 @@ func cnyReservationError(c *gin.Context, err error) *types.NewAPIError {
 	key, code, status := i18n.MsgBillingCNYUnavailable, types.ErrorCodeQueryDataError, http.StatusInternalServerError
 	switch {
 	case errors.Is(err, model.ErrCNYQuota):
-		key, code, status = i18n.MsgBillingCNYInsufficientWallet, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden
+		key, code, status = i18n.MsgBillingWalletInsufficient, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden
+	case errors.Is(err, model.ErrExchangeRateUnavailable):
+		key, code, status = i18n.MsgBillingExchangeUnavailable, types.ErrorCodeInsufficientUserQuota, http.StatusServiceUnavailable
 	case errors.Is(err, model.ErrCNYTokenQuota):
 		key, code, status = i18n.MsgBillingCNYInsufficientToken, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden
 	case errors.Is(err, model.ErrTokenInvalid), errors.Is(err, model.ErrUserQuotaPermission):

@@ -98,9 +98,11 @@ func AdjustUserCurrencyWallet(c *gin.Context) {
 		return
 	}
 	var request struct {
-		DeltaQuota  *int   `json:"delta_quota"`
-		OperationID string `json:"operation_id"`
-		Reason      string `json:"reason"`
+		DeltaQuota  *int    `json:"delta_quota"`
+		Mode        *string `json:"mode"`
+		Value       *int    `json:"value"`
+		OperationID string  `json:"operation_id"`
+		Reason      string  `json:"reason"`
 	}
 	params := model.AuditFields{"target_user_id": id, "currency": "CNY", "quota_per_unit": model.CNYQuotaPerUnit}
 	success := false
@@ -109,17 +111,33 @@ func AdjustUserCurrencyWallet(c *gin.Context) {
 			auditOperatorInfo(c), &model.AuditRequestInfo{Method: c.Request.Method, Route: c.FullPath(), Status: c.Writer.Status(), Success: success}, c)
 		markAuditLogged(c)
 	}()
-	if err := c.ShouldBindJSON(&request); err != nil || request.DeltaQuota == nil {
+	if err := c.ShouldBindJSON(&request); err != nil {
 		respondCurrencyBillingError(c, model.ErrCNYInvalid)
 		return
 	}
-	params["delta_quota"] = *request.DeltaQuota
-	adjustment, err := model.AdjustCNYWallet(id, c.GetInt("id"), c.GetInt("role"), *request.DeltaQuota, request.OperationID, request.Reason)
+	var adjustment *model.CNYBillingRecord
+	var err error
+	if request.DeltaQuota != nil {
+		if request.Mode != nil || request.Value != nil {
+			respondCurrencyBillingError(c, model.ErrCNYInvalid)
+			return
+		}
+		params["delta_quota"] = *request.DeltaQuota
+		adjustment, err = model.AdjustCNYWallet(id, c.GetInt("id"), c.GetInt("role"), *request.DeltaQuota, request.OperationID, request.Reason)
+	} else {
+		if request.Mode == nil || request.Value == nil {
+			respondCurrencyBillingError(c, model.ErrCNYInvalid)
+			return
+		}
+		params["mode"], params["requested_quota"] = *request.Mode, *request.Value
+		adjustment, err = model.AdjustCNYWalletByMode(id, c.GetInt("id"), c.GetInt("role"), *request.Mode, *request.Value, request.OperationID, request.Reason)
+	}
 	if err != nil {
 		respondCurrencyBillingError(c, err)
 		return
 	}
 	params["operation_id"], params["target_username"] = adjustment.RequestID, adjustment.Username
+	params["delta_quota"] = adjustment.DeltaQuota
 	params["from"], params["to"] = adjustment.BeforeQuota, adjustment.AfterQuota
 	success = true
 	wallet, err := model.GetCNYWallet(id)

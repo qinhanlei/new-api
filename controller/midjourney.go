@@ -50,7 +50,9 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 	for _, task := range tasks {
 		if task.MjId == "" {
 			// 统计失败的未完成任务
-			nullTaskIds = append(nullTaskIds, task.Id)
+			if task.WalletFundingRequestID == "" {
+				nullTaskIds = append(nullTaskIds, task.Id)
+			}
 			continue
 		}
 		taskM[task.MjId] = task
@@ -90,7 +92,16 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 		midjourneyChannel, err := model.CacheGetChannel(channelId)
 		if err != nil {
 			logger.LogError(ctx, common.LogText("CacheGetChannel: %v", err))
-			err := model.MjBulkUpdate(taskIds, map[string]any{
+			legacyIDs := make([]string, 0, len(taskIds))
+			for _, id := range taskIds {
+				if taskM[id].WalletFundingRequestID == "" {
+					legacyIDs = append(legacyIDs, id)
+				}
+			}
+			if len(legacyIDs) == 0 {
+				continue
+			}
+			err := model.MjBulkUpdate(legacyIDs, map[string]any{
 				"fail_reason": "Failed to get the channel information. Please contact the administrator",
 				"status":      "FAILURE",
 				"progress":    "100%",
@@ -159,7 +170,7 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 
 			useTime := (time.Now().UnixNano() / int64(time.Millisecond)) - task.SubmitTime
 			// 如果时间超过一小时，且进度不是100%，则认为任务失败
-			if useTime > 3600000 && task.Progress != "100%" {
+			if task.WalletFundingRequestID == "" && useTime > 3600000 && task.Progress != "100%" {
 				responseItem.FailReason = "Upstream task timed out (over 1 hour)"
 				responseItem.Status = "FAILURE"
 			}
@@ -202,12 +213,26 @@ func runMidjourneyTaskUpdateOnce(ctx context.Context, report func(processed, tot
 			}
 
 			shouldReturnQuota := false
-			if (task.Progress != "100%" && responseItem.FailReason != "") || (task.Progress == "100%" && task.Status == "FAILURE") {
+			failed := task.Status == "FAILURE"
+			if task.WalletFundingRequestID == "" {
+				failed = (task.Progress != "100%" && responseItem.FailReason != "") || (task.Progress == "100%" && task.Status == "FAILURE")
+			}
+			if failed {
 				logger.LogInfo(ctx, common.LogText("%s failed: %s", task.MjId, task.FailReason))
 				task.Progress = "100%"
 				if task.Quota != 0 {
 					shouldReturnQuota = true
 				}
+			}
+			if shouldReturnQuota && task.WalletFundingRequestID != "" {
+				quota := task.Quota
+				won, err := model.RefundWalletMidjourney(task, preStatus)
+				if err != nil {
+					logger.LogError(ctx, common.LogText("UpdateMidjourneyTask task error: %s", err.Error()))
+				} else if won {
+					service.RecordMidjourneyWalletRefund(task, quota, "Composition failed")
+				}
+				continue
 			}
 			won, err := task.UpdateWithStatus(preStatus)
 			if err != nil {

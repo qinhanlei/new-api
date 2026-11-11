@@ -66,9 +66,11 @@ func TestAuthCacheIntegrityDatabaseMatrix(t *testing.T) {
 			require.NoError(t, DB.Create(&user).Error)
 			t.Cleanup(func() { assert.NoError(t, db.Unscoped().Delete(&user).Error) })
 			require.NoError(t, populateUserCache(user))
-			quotaResult, err := cacheApplyUserQuotaDelta(user.Id, -70)
+			reserved, err := TryReserveUserQuota(user.Id, 70)
 			require.NoError(t, err)
-			require.Equal(t, cacheQuotaOK, quotaResult)
+			require.True(t, reserved)
+			_, err = GetUserCache(user.Id)
+			require.NoError(t, err)
 
 			t.Run("user_metadata_and_partial_refresh", func(t *testing.T) {
 				for _, fields := range []map[string]any{
@@ -110,9 +112,11 @@ func TestAuthCacheIntegrityDatabaseMatrix(t *testing.T) {
 			t.Cleanup(func() { assert.NoError(t, db.Unscoped().Delete(&token).Error) })
 			_, err = GetTokenByKey(token.Key, false)
 			require.NoError(t, err)
-			quotaResult, err = cacheTryReserveTokenQuota(token.Id, token.Key, 70)
+			reserved, err = TryReserveTokenQuota(token.Id, token.Key, 70, false)
 			require.NoError(t, err)
-			require.Equal(t, cacheQuotaOK, quotaResult)
+			require.True(t, reserved)
+			_, err = GetTokenByKey(token.Key, false)
+			require.NoError(t, err)
 
 			t.Run("token_identity_and_permissions", func(t *testing.T) {
 				for _, fields := range []map[string]any{
@@ -228,12 +232,12 @@ func TestAuthCacheIntegrityDatabaseMatrix(t *testing.T) {
 					done <- err
 				}()
 				<-snapshotRead
-				result, err := cacheTryReserveTokenQuota(token.Id, token.Key, 10)
+				reserved, err := TryReserveTokenQuota(token.Id, token.Key, 10, false)
 				require.NoError(t, err)
-				require.Equal(t, cacheQuotaOK, result)
+				require.True(t, reserved)
 				releaseRepair <- struct{}{}
 				require.NoError(t, <-done)
-				cached, err := cacheGetTokenByKey(token.Key)
+				cached, err := GetTokenByKey(token.Key, false)
 				require.NoError(t, err)
 				assert.Equal(t, 20, cached.RemainQuota)
 				assert.Equal(t, 80, cached.UsedQuota)
@@ -262,7 +266,7 @@ func TestAuthCacheIntegrityDatabaseMatrix(t *testing.T) {
 				}))
 				defer func() { require.NoError(t, DB.Callback().Query().Remove("auth_cache_db_failure")) }()
 				_, err = GetTokenByKey(token.Key, false)
-				require.NoError(t, err, "valid token cache must not query the database")
+				require.Error(t, err, "cached token quota must not authorize spending while the database is unavailable")
 				_, err = GetUserSessionCached(session.SID)
 				require.NoError(t, err, "valid session cache must not query the database")
 				require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "CacheMAC", "invalid").Err())
@@ -292,10 +296,10 @@ func TestAuthCacheIntegrityDatabaseMatrix(t *testing.T) {
 				require.NoError(t, err)
 				cachedUser, err := cacheGetUserBase(user.Id)
 				require.NoError(t, err)
-				assert.Equal(t, user.Quota, cachedUser.Quota)
+				assert.Equal(t, 30, cachedUser.Quota)
 				cachedToken, err := cacheGetTokenByKey(token.Key)
 				require.NoError(t, err)
-				assert.Equal(t, token.RemainQuota, cachedToken.RemainQuota)
+				assert.Equal(t, 20, cachedToken.RemainQuota)
 				assert.Equal(t, 80, cachedToken.UsedQuota)
 			})
 		})

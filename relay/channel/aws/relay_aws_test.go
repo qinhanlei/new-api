@@ -19,9 +19,12 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream"
@@ -30,8 +33,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 const awsTestModel = "anthropic.claude-3-5-sonnet-20240620-v1:0"
@@ -1054,5 +1059,95 @@ func TestAWSApiKeyTypeInvokesThroughSDKWithBearerToken(t *testing.T) {
 			assert.Equal(t, "/model/us."+awsTestModel+"/"+action, seen.URL.Path)
 			assert.Equal(t, "Bearer test-api-key", seen.Header.Get("Authorization"))
 		})
+	}
+}
+
+func TestAWSWalletSubmitIsSingleAttemptAndRetainsUnknown(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	oldDB, oldType := model.DB, common.MainDatabaseType()
+	oldRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = oldRedis })
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() { model.DB = oldDB; common.SetMainDatabaseType(oldType); require.NoError(t, sqlDB.Close()) })
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.CNYWallet{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}))
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "aws-wallet", Status: common.UserStatusEnabled}).Error)
+	require.NoError(t, db.Create(&model.CNYWallet{UserID: 1, Quota: 100000, QuotaPerUnit: 500000}).Error)
+	policy := model.DefaultWalletExchangePolicy()
+	policy.StaticRate, policy.CrossCurrencyEnabled = "7", true
+	require.NoError(t, db.Create(&policy).Error)
+	for _, variant := range []struct {
+		name    string
+		request any
+		handler func(*gin.Context, *relaycommon.RelayInfo, *Adaptor) (*relaytypes.NewAPIError, *dto.Usage)
+	}{
+		{"invoke", newAwsInvokeModelInput(), awsHandler}, {"stream", newAwsStreamInput(), awsStreamHandler}, {"nova", newAwsInvokeModelInput(), handleNovaRequest},
+	} {
+		for _, response := range []struct {
+			status int
+			zero   bool
+		}{{500, false}, {400, false}, {200, false}, {200, true}} {
+			status := response.status
+			t.Run(fmt.Sprintf("%s-%d-zero-%t", variant.name, status, response.zero), func(t *testing.T) {
+				c := newAwsTestContext(httptest.NewRecorder(), context.Background())
+				info := newAwsTestRelayInfo()
+				info.RequestId, info.UserId, info.IsPlayground = fmt.Sprintf("%s-%d-zero-%t", variant.name, status, response.zero), 1, true
+				info.ForcePreConsume = true
+				session, apiErr := service.NewWalletBillingSession(c, info, 100)
+				require.Nil(t, apiErr)
+				info.Billing = session
+				attempts := 0
+				client := bedrockruntime.New(bedrockruntime.Options{Region: "us-east-1", BaseEndpoint: aws.String("https://bedrock.test"), Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("test", "test", "")), RetryMaxAttempts: 3,
+					HTTPClient: awsHTTPClientFunc(func(request *http.Request) (*http.Response, error) {
+						attempts++
+						body := `{"message":"test"}`
+						if response.zero {
+							body = `{"id":"msg_test","type":"message","role":"assistant","content":[],"usage":{"input_tokens":0,"output_tokens":0}}`
+							if variant.name == "nova" {
+								body = `{"output":{"message":{"content":[{"text":""}]}},"usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0}}`
+							}
+							if variant.name == "stream" {
+								var stream bytes.Buffer
+								for _, event := range []string{`{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"usage":{"input_tokens":0,"output_tokens":0}}}`, `{"type":"message_delta","usage":{"output_tokens":0}}`, `{"type":"message_stop"}`} {
+									if err := writeAwsStreamEvent(&stream, event); err != nil {
+										return nil, err
+									}
+								}
+								return newAwsStreamResponse(request, io.NopCloser(bytes.NewReader(stream.Bytes()))), nil
+							}
+						}
+						return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+					}),
+				})
+				apiErr, usage := variant.handler(c, info, &Adaptor{AwsClient: client, AwsReq: variant.request})
+				if response.zero {
+					require.Nil(t, apiErr)
+					require.NotNil(t, usage)
+					require.NoError(t, service.SettleBilling(c, info, 0))
+				} else {
+					require.NotNil(t, apiErr)
+					assert.Nil(t, usage)
+				}
+				assert.Equal(t, 1, attempts)
+				info.Billing.Refund(c)
+				record, err := model.GetWalletFundingRecord(info.RequestId)
+				require.NoError(t, err)
+				if response.zero {
+					assert.Equal(t, model.CNYBillingSettled, record.Status)
+					assert.Zero(t, record.Quota)
+				} else if status != 400 {
+					assert.Equal(t, model.CNYBillingReserved, record.Status)
+					assert.True(t, record.UpstreamPending)
+				} else {
+					assert.Equal(t, model.CNYBillingRefunded, record.Status)
+				}
+			})
+		}
 	}
 }

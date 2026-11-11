@@ -105,12 +105,13 @@ func TestRealtimeRateReservationsUseCumulativeUsageOnceOnClose(t *testing.T) {
 				}
 			}
 			result := <-completed
-			require.NoError(t, result.err)
-			require.NotNil(t, result.usage)
 			if fail {
+				require.Error(t, result.err)
+				assert.Nil(t, result.usage, "failed accounting retains the funding hold instead of settling a partial total")
 				assert.Equal(t, []int{6}, billing.targets)
-				assert.Equal(t, 10, result.usage.TotalTokens)
 			} else {
+				require.NoError(t, result.err)
+				require.NotNil(t, result.usage)
 				assert.Equal(t, []int{6, 18}, billing.targets)
 				assert.Equal(t, 30, result.usage.TotalTokens)
 			}

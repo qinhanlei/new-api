@@ -23,10 +23,14 @@ import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
 export const Route = createFileRoute('/_authenticated/system-settings')({
-  beforeLoad: () => {
+  beforeLoad: ({ location }) => {
     const { auth } = useAuthStore.getState()
 
-    if (auth.user?.role !== ROLE.SUPER_ADMIN) {
+    const currencyAdmin =
+      auth.user?.role === ROLE.ADMIN &&
+      location.pathname === '/system-settings/billing/currency'
+
+    if (auth.user?.role !== ROLE.SUPER_ADMIN && !currencyAdmin) {
       throw redirect({
         to: '/403',
       })

@@ -62,7 +62,7 @@ import { BILLING_PRICING_VARS } from '@/features/pricing/lib/billing-expr'
 import { pluginUsageSchema } from '@/features/pricing/lib/plugin-pricing'
 import { PolicyDecisionRecord } from '@/features/system-settings/request-policies/decision-record'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
-import { formatBillingCurrencyFromUSD, formatNativeMoney } from '@/lib/currency'
+import { formatNativeMoney } from '@/lib/currency'
 import { formatLogQuota, formatTokens, formatUseTime } from '@/lib/format'
 import { translateServerText } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
@@ -72,6 +72,7 @@ import type { UsageLog } from '../../data/schema'
 import {
   parseLogOther,
   getNativeQuotaAdjustment,
+  getWalletFundingDisplay,
   getParamOverrideActionLabel,
   parseAuditLine,
   decodeBillingExprB64,
@@ -184,9 +185,7 @@ function BillingBreakdown(props: {
   const rows: Array<{ label: string; value: string }> = []
   const priceOpts = { digitsLarge: 4, digitsSmall: 6, abbreviate: false }
   const fmtPrice = (amount: number) =>
-    log.currency === 'CNY'
-      ? formatNativeMoney(amount, 'CNY', priceOpts)
-      : formatBillingCurrencyFromUSD(amount, priceOpts)
+    formatNativeMoney(amount, log.currency ?? 'USD', priceOpts)
   const baseInputUSD = other.model_ratio != null ? other.model_ratio * 2.0 : 0
 
   if (isTieredExpr) {
@@ -398,7 +397,7 @@ function BillingBreakdown(props: {
       )}
       <DetailRow
         label={t('Total Cost')}
-        value={formatLogQuota(log.quota, log.currency)}
+        value={formatLogQuota(log.quota, log.currency, other?.quota_per_unit)}
         mono
       />
       {other.billing_status && (
@@ -414,7 +413,11 @@ function BillingBreakdown(props: {
       {other.billing_status === 'reserved' && (
         <DetailRow
           label={t('Reserved')}
-          value={formatLogQuota(other.reserved_quota ?? 0, log.currency)}
+          value={formatLogQuota(
+            other.reserved_quota ?? 0,
+            log.currency,
+            other?.quota_per_unit
+          )}
           mono
         />
       )}
@@ -554,6 +557,7 @@ export function DetailsDialog(props: DetailsDialogProps) {
   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
   const other = parseLogOther(props.log.other)
   const nativeAdjustment = getNativeQuotaAdjustment(props.log, other)
+  const funding = getWalletFundingDisplay(other?.wallet_funding, t)
   const typeConfig = getLogTypeConfig(props.log.type)
 
   const isViolation = isViolationFeeLog(other)
@@ -951,7 +955,8 @@ export function DetailsDialog(props: DetailsDialogProps) {
               label={t('Fee Amount')}
               value={formatLogQuota(
                 other.fee_quota ?? props.log.quota,
-                props.log.currency
+                props.log.currency,
+                other.quota_per_unit
               )}
               mono
             />
@@ -1277,6 +1282,54 @@ export function DetailsDialog(props: DetailsDialogProps) {
             other={other}
             isAdmin={props.isAdmin}
           />
+        )}
+
+        {funding && (
+          <section aria-label={t('Wallet funding')}>
+            <DetailSection label={t('Wallet funding')}>
+              <DetailRow label={t('Funding status')} value={funding.status} />
+              {funding.showUsd && (
+                <DetailRow
+                  label={t('USD wallet amount')}
+                  value={funding.usdAmount}
+                  mono
+                />
+              )}
+              {funding.showCny && (
+                <DetailRow
+                  label={t('CNY wallet amount')}
+                  value={funding.cnyAmount}
+                  mono
+                />
+              )}
+              {funding.exchangeRate && (
+                <DetailRow
+                  label={t('Frozen exchange rate')}
+                  value={`1 USD = ${funding.exchangeRate} CNY`}
+                  mono
+                />
+              )}
+              {funding.exchangeTime && (
+                <DetailRow
+                  label={t('Exchange rate source time')}
+                  value={funding.exchangeTime}
+                  mono
+                />
+              )}
+              {funding.hasDebt && (
+                <>
+                  <DetailRow
+                    label={t('Outstanding debt')}
+                    value={funding.debtAmount}
+                    mono
+                  />
+                  <p className='text-muted-foreground text-xs'>
+                    {t('Debt is included in the wallet amounts.')}
+                  </p>
+                </>
+              )}
+            </DetailSection>
+          </section>
         )}
 
         {/* Tiered pricing breakdown (when billing_mode is tiered_expr) */}

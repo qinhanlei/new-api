@@ -17,6 +17,8 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -29,6 +31,46 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 	"gorm.io/gorm/schema"
 )
+
+func TestWalletViolationFeeUsesFrozenFunding(t *testing.T) {
+	truncate(t)
+	seedUser(t, 1, 100)
+	seedToken(t, 1, 1, "fee-key", 10000)
+	seedChannel(t, 1)
+	previousScale, previousSettings := common.QuotaPerUnit, *model_setting.GetGrokSettings()
+	t.Cleanup(func() { common.QuotaPerUnit = previousScale; *model_setting.GetGrokSettings() = previousSettings })
+	common.QuotaPerUnit = 500000
+	*model_setting.GetGrokSettings() = model_setting.GrokSettings{ViolationDeductionEnabled: true, ViolationDeductionAmount: 0.001}
+	_, err := model.AdjustCNYWallet(1, 99, common.RoleRootUser, 67000, "fee-seed", "test")
+	require.NoError(t, err)
+	policy := model.DefaultWalletExchangePolicy()
+	policy.StaticRate, policy.CrossCurrencyEnabled = "6.7", true
+	_, err = model.SaveWalletExchangePolicy(policy, nil)
+	require.NoError(t, err)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{UserId: 1, TokenId: 1, TokenKey: "fee-key", ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 1}, RequestId: "wallet-fee", StartTime: time.Now(), PriceData: hosttypes.PriceData{GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}}}
+	session, apiErr := NewWalletBillingSession(c, info, 1000)
+	require.Nil(t, apiErr)
+	info.Billing = session
+	require.NoError(t, MarkCNYUpstreamPending(info, true))
+	assert.Error(t, session.ReserveBeforeSubmit(1000), "pending retry is blocked even without an increased estimate")
+	common.QuotaPerUnit = 1000000
+	providerErr := types.NewErrorWithStatusCode(io.EOF, types.ErrorCodeViolationFeeGrokCSAM, http.StatusBadRequest)
+	require.True(t, ChargeViolationFeeIfNeeded(c, info, providerErr))
+	session.Refund(c)
+	assert.False(t, ChargeViolationFeeIfNeeded(c, info, providerErr))
+	record, err := model.GetWalletFundingRecord(info.RequestId)
+	require.NoError(t, err)
+	assert.Equal(t, model.CNYBillingSettled, record.Status)
+	assert.Equal(t, 500, record.Quota)
+	assert.Equal(t, 100, record.NativeCharged)
+	assert.Equal(t, 2680, record.AlternateCharged)
+	assert.Equal(t, 9500, getTokenRemainQuota(t, 1))
+	used, count := getUserUsageAccounting(t, 1)
+	assert.Equal(t, 500, used)
+	assert.Equal(t, 1, count)
+}
 
 func TestCNYServiceDatabaseMatrix(t *testing.T) {
 	for _, database := range []struct {
@@ -58,9 +100,9 @@ func TestCNYServiceDatabaseMatrix(t *testing.T) {
 			previousDB, previousLogs, previousEnabled := model.DB, model.LOG_DB, common.LogConsumeEnabled
 			mainKind, logKind := common.MainDatabaseType(), common.LogDatabaseType()
 			previousFX := operation_setting.USDExchangeRate
-			model.DB, model.LOG_DB, common.LogConsumeEnabled = db, nil, false
+			model.DB, model.LOG_DB, common.LogConsumeEnabled = db, db, false
 			common.SetDatabaseTypes(database.kind, database.kind)
-			tables := []any{&model.BillingRateRule{}, &model.CNYBillingRecord{}, &model.CNYTokenBudget{}, &model.CNYWallet{}, &model.Task{}, &model.Channel{}, &model.Token{}, &model.User{}}
+			tables := []any{&model.CNYBillingRecord{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}, &model.CNYTokenBudget{}, &model.CNYWallet{}, &model.Task{}, &model.Channel{}, &model.Token{}, &model.BillingRateRule{}, &model.User{}, &model.Log{}}
 			require.NoError(t, db.Migrator().DropTable(tables...))
 			require.NoError(t, db.AutoMigrate(tables...))
 			t.Cleanup(func() {
@@ -110,6 +152,8 @@ func TestCNYServiceDatabaseMatrix(t *testing.T) {
 			c, info = cnyServiceRequest("unknown", "v2:CNY:p * 10", 500)
 			require.Nil(t, PreConsumeBilling(c, 500, info))
 			MarkCNYUpstreamPending(info, true)
+			info.BillingUsageUnknown = true
+			PostTextConsumeQuota(c, info, &dto.Usage{PromptTokens: 100, CompletionTokens: 100, TotalTokens: 200}, nil)
 			info.Billing.Refund(c)
 			assert.Error(t, info.Billing.ReserveBeforeSubmit(500))
 			record, err = model.GetCNYBillingRecord("unknown")

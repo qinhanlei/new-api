@@ -54,7 +54,7 @@ func TestCNYBillingDatabaseMatrix(t *testing.T) {
 			common.SetMainDatabaseType(dialect)
 			initCol()
 			t.Cleanup(func() {
-				require.NoError(t, db.Migrator().DropTable(&CNYBillingRecord{}, &CNYTokenBudget{}, &CNYWallet{}, &Task{}, &Token{}, &User{}))
+				require.NoError(t, db.Migrator().DropTable(&CNYBillingRecord{}, &WalletFundingRecord{}, &WalletExchangePolicy{}, &ExchangeRateObservation{}, &CNYTokenBudget{}, &CNYWallet{}, &Task{}, &Token{}, &User{}))
 				DB, common.RedisEnabled, common.BatchUpdateEnabled = oldDB, oldRedis, oldBatch
 				common.SetMainDatabaseType(oldMainType)
 				initCol()
@@ -73,9 +73,11 @@ func TestCNYBillingDatabaseMatrix(t *testing.T) {
 			legacy := User{Username: "legacy", Password: "test", Quota: 321, UsedQuota: 123}
 			require.NoError(t, db.Create(&legacy).Error)
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&CNYWallet{}, &CNYTokenBudget{}, &CNYBillingRecord{}))
+				require.NoError(t, db.AutoMigrate(&CNYWallet{}, &CNYTokenBudget{}, &CNYBillingRecord{}, &WalletFundingRecord{}, &WalletExchangePolicy{}, &ExchangeRateObservation{}))
 			}
 			t.Run("adjustments", testCNYAdjustments)
+			t.Run("adjustment_modes", testCNYAdjustmentModes)
+			t.Run("concurrent_adjustment", testCNYAdjustmentConcurrency)
 			t.Run("reservation_and_settlement", testCNYReservation)
 			t.Run("frozen_budget_and_deleted_token", testCNYFrozenBudget)
 			t.Run("authentication_and_ownership", testCNYAuthentication)
@@ -85,7 +87,7 @@ func TestCNYBillingDatabaseMatrix(t *testing.T) {
 			var recordsBefore, recordsAfter int64
 			require.NoError(t, db.Model(&CNYBillingRecord{}).Count(&recordsBefore).Error)
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&CNYWallet{}, &CNYTokenBudget{}, &CNYBillingRecord{}))
+				require.NoError(t, db.AutoMigrate(&CNYWallet{}, &CNYTokenBudget{}, &CNYBillingRecord{}, &WalletFundingRecord{}, &WalletExchangePolicy{}, &ExchangeRateObservation{}))
 			}
 			require.NoError(t, db.Model(&CNYBillingRecord{}).Count(&recordsAfter).Error)
 			assert.Equal(t, recordsBefore, recordsAfter)
@@ -134,6 +136,119 @@ func testCNYAdjustments(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1000, wallet.Quota)
 	assert.Equal(t, CNYQuotaPerUnit, wallet.QuotaPerUnit)
+}
+
+func testCNYAdjustmentModes(t *testing.T) {
+	user, token, _ := newCNYAccount(t, "adjust-modes", 1000, 1000, false)
+	_, err := ReserveCNYBilling(CNYBillingParams{RequestID: "before-adjustment", UserID: user.Id, TokenID: token.Id}, 100)
+	require.NoError(t, err)
+	_, err = SettleCNYBilling("before-adjustment", 60, CNYBillingUsage{})
+	require.NoError(t, err)
+	_, err = ReserveCNYBilling(CNYBillingParams{RequestID: "during-adjustment", UserID: user.Id, TokenID: token.Id}, 200)
+	require.NoError(t, err)
+	first, err := AdjustCNYWalletByMode(user.Id, 1, common.RoleRootUser, "override", 500, "override-available", "")
+	require.NoError(t, err)
+	assert.Equal(t, 740, first.BeforeQuota)
+	assert.Equal(t, 500, first.AfterQuota)
+	assert.Equal(t, -240, first.DeltaQuota)
+	assert.Equal(t, "CNY wallet adjustment", first.Reason)
+	wallet, err := GetCNYWallet(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 500, wallet.Quota)
+	assert.Equal(t, 60, wallet.UsedQuota)
+	assert.Equal(t, 200, wallet.ReservedQuota)
+	budget, err := GetCNYTokenBudget(token.Id, user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 740, budget.RemainQuota)
+
+	_, err = SettleCNYBilling("during-adjustment", 250, CNYBillingUsage{})
+	require.NoError(t, err)
+	replayed, err := AdjustCNYWalletByMode(user.Id, 1, common.RoleRootUser, "override", 500, "override-available", " \t")
+	require.NoError(t, err)
+	assert.Equal(t, first.ID, replayed.ID)
+	assert.Equal(t, 500, replayed.AfterQuota)
+	wallet, err = GetCNYWallet(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 450, wallet.Quota, "retry must preserve spending after the original override")
+	assert.Equal(t, 310, wallet.UsedQuota)
+	assert.Zero(t, wallet.ReservedQuota)
+	_, err = AdjustCNYWalletByMode(user.Id, 1, common.RoleRootUser, "override", 501, "override-available", "")
+	assert.ErrorIs(t, err, ErrCNYConflict)
+	_, err = AdjustCNYWalletByMode(user.Id, 1, common.RoleRootUser, "add", 500, "override-available", "")
+	assert.ErrorIs(t, err, ErrCNYConflict)
+	_, err = AdjustCNYWallet(user.Id, 1, common.RoleRootUser, -240, "override-available", "")
+	assert.ErrorIs(t, err, ErrCNYConflict)
+	_, err = AdjustCNYWalletByMode(user.Id, 2, common.RoleRootUser, "override", 500, "override-available", "")
+	assert.ErrorIs(t, err, ErrCNYConflict)
+
+	for i, step := range []struct {
+		mode        string
+		value, want int
+	}{
+		{"override", 0, 0},
+		{"override", -10, -10},
+		{"add", 20, 10},
+		{"subtract", 30, -20},
+		{"override", -20, -20},
+	} {
+		record, err := AdjustCNYWalletByMode(user.Id, 1, common.RoleRootUser, step.mode, step.value, fmt.Sprintf("mode-step-%d", i), "")
+		require.NoError(t, err)
+		assert.Equal(t, step.want, record.AfterQuota)
+	}
+	for _, input := range []struct {
+		mode  string
+		value int
+	}{
+		{"add", 0}, {"subtract", 0}, {"add", -1}, {"subtract", -1}, {"delta", 1}, {"", 1},
+	} {
+		_, err = AdjustCNYWalletByMode(user.Id, 1, common.RoleRootUser, input.mode, input.value, "invalid-adjustment", "")
+		assert.ErrorIs(t, err, ErrCNYInvalid)
+	}
+	_, err = AdjustCNYWalletByMode(user.Id, 1, common.RoleRootUser, "override", common.MaxWalletQuota+1, "oversized-override", "")
+	assert.ErrorIs(t, err, ErrWalletQuotaLimitExceeded)
+	_, err = AdjustCNYWalletByMode(user.Id, 1, common.RoleRootUser, "override", common.MaxWalletQuota, "oversized-delta", "")
+	assert.ErrorIs(t, err, ErrWalletQuotaLimitExceeded)
+
+	// Older ledger rows have no original-mode metadata and must remain retryable.
+	legacy, err := AdjustCNYWallet(user.Id, 1, common.RoleRootUser, 30, "legacy-adjustment", "legacy reason ")
+	require.NoError(t, err)
+	require.NoError(t, DB.Model(legacy).Update("other", "").Error)
+	legacyRetry, err := AdjustCNYWallet(user.Id, 1, common.RoleRootUser, 30, "legacy-adjustment", "legacy reason ")
+	require.NoError(t, err)
+	assert.Equal(t, legacy.ID, legacyRetry.ID)
+	_, err = AdjustCNYWalletByMode(user.Id, 1, common.RoleRootUser, "add", 30, "legacy-adjustment", "legacy reason ")
+	assert.ErrorIs(t, err, ErrCNYConflict)
+	wallet, err = GetCNYWallet(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 10, wallet.Quota)
+	assert.Equal(t, 310, wallet.UsedQuota)
+	assert.Zero(t, wallet.ReservedQuota)
+}
+
+func testCNYAdjustmentConcurrency(t *testing.T) {
+	user, _, _ := newCNYAccount(t, "concurrent-adjust", 1000, 500, false)
+	start := make(chan struct{})
+	errors := make(chan error, 2)
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Go(func() {
+			<-start
+			_, err := AdjustCNYWalletByMode(user.Id, 1, common.RoleRootUser, "add", 100, "concurrent-adjustment", "")
+			errors <- err
+		})
+	}
+	close(start)
+	workers.Wait()
+	close(errors)
+	for err := range errors {
+		require.NoError(t, err)
+	}
+	wallet, err := GetCNYWallet(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 1100, wallet.Quota)
+	var count int64
+	require.NoError(t, DB.Model(&CNYBillingRecord{}).Where("kind = ? AND request_id = ?", CNYBillingAdjustment, "concurrent-adjustment").Count(&count).Error)
+	assert.Equal(t, int64(1), count)
 }
 
 func testCNYReservation(t *testing.T) {

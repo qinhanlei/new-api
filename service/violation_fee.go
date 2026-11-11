@@ -81,25 +81,21 @@ func shouldChargeViolationFee(err *types.NewAPIError) bool {
 	return HasCSAMViolationMarker(err)
 }
 
-func calcViolationFeeQuota(amount, groupRatio float64) int {
+func calcViolationFeeQuota(amount, groupRatio, quotaPerUnit float64) (int, *common.QuotaClamp) {
 	if amount <= 0 {
-		return 0
+		return 0, nil
 	}
 	if groupRatio <= 0 {
-		return 0
+		return 0, nil
 	}
-	quota := common.QuotaFromDecimal(decimal.NewFromFloat(amount).
-		Mul(decimal.NewFromFloat(common.QuotaPerUnit)).
+	return common.QuotaFromDecimalChecked(decimal.NewFromFloat(amount).
+		Mul(decimal.NewFromFloat(quotaPerUnit)).
 		Mul(decimal.NewFromFloat(groupRatio)).
 		Round(0))
-	if quota <= 0 {
-		return 0
-	}
-	return quota
 }
 
-// ChargeViolationFeeIfNeeded charges an additional fee after the normal flow finishes (including refund).
-// It uses Grok fee settings as the fee policy.
+// ChargeViolationFeeIfNeeded settles a known provider fee through the original
+// wallet reservation, or the legacy subscription path. It uses Grok fee policy.
 func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, apiErr *types.NewAPIError) bool {
 	if IsCNYBilling(relayInfo) {
 		return false
@@ -120,13 +116,44 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 	}
 
 	groupRatio := relayInfo.PriceData.GroupRatioInfo.GroupRatio
-	feeQuota := calcViolationFeeQuota(settings.ViolationDeductionAmount, groupRatio)
+	quotaPerUnit := common.QuotaPerUnit
+	if IsWalletBilling(relayInfo) {
+		session := relayInfo.Billing.(*BillingSession)
+		session.mu.Lock()
+		if wallet := session.funding.(*WalletFunding); wallet.record != nil {
+			quotaPerUnit = wallet.record.USDQuotaPerUnit
+		}
+		session.mu.Unlock()
+	}
+	feeQuota, clamp := calcViolationFeeQuota(settings.ViolationDeductionAmount, groupRatio, quotaPerUnit)
+	noteQuotaClamp(relayInfo, clamp)
 	if feeQuota <= 0 {
 		return false
 	}
 
-	if err := PostConsumeQuota(relayInfo, feeQuota, 0, true); err != nil {
-		logger.LogError(ctx, common.LogText("failed to charge violation fee: %s", err.Error()))
+	var settleErr error
+	if IsWalletBilling(relayInfo) {
+		session := relayInfo.Billing.(*BillingSession)
+		session.mu.Lock()
+		settled := session.settled
+		session.mu.Unlock()
+		if settled {
+			return false
+		}
+		settleErr = SettleBilling(ctx, relayInfo, feeQuota)
+		if settleErr != nil {
+			// A failed ledger commit is not evidence that the provider waived
+			// its fee. Prevent the outer failure handler from refunding it.
+			session.mu.Lock()
+			session.upstreamPending = true
+			session.mu.Unlock()
+			_ = model.MarkWalletFundingPending(relayInfo.RequestId, true)
+		}
+	} else {
+		settleErr = PostConsumeQuota(relayInfo, feeQuota, 0, true)
+	}
+	if settleErr != nil {
+		logger.LogError(ctx, common.LogText("failed to charge violation fee: %s", settleErr.Error()))
 		return false
 	}
 
@@ -138,6 +165,7 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 	oai := apiErr.ToOpenAIError(common.UpstreamAddresses(ctx)...)
 
 	other := model.NewLogOther()
+	attachQuotaSaturation(ctx, relayInfo, other)
 	other.MergePublic(map[string]any{
 		"violation_fee":        true,
 		"violation_fee_code":   string(types.ErrorCodeViolationFeeGrokCSAM),

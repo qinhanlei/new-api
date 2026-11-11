@@ -320,3 +320,72 @@ describe('model pricing badge', () => {
     expect(badgedEntries()).toHaveLength(0)
   })
 })
+
+describe('currency settings navigation', () => {
+  function CurrencyLinks() {
+    const { navGroups } = useSidebarView()
+    const items = navGroups
+      .flatMap((group) => group.items)
+      .flatMap((item) => item.items ?? [item])
+    return (
+      <nav>
+        {items.map((item) => (
+          <a key={item.title} href={item.url}>
+            {item.title}
+          </a>
+        ))}
+      </nav>
+    )
+  }
+
+  it.each([
+    [ROLE.USER, '/dashboard/overview', false],
+    [ROLE.ADMIN, '/dashboard/overview', true],
+    [ROLE.ADMIN, '/system-settings/billing/currency', true],
+  ])(
+    'shows only the permitted currency entry for role %s at %s',
+    async (role, path, visible) => {
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      })
+      client.setQueryData(['status'], { SidebarModulesAdmin: '' })
+      useAuthStore.getState().auth.setUser({ id: 9, username: 'admin', role })
+      const get = vi
+        .spyOn(api, 'get')
+        .mockResolvedValue({ data: { success: true, data: {} } })
+      const router = createRouter({
+        routeTree: createRootRoute({ component: CurrencyLinks }),
+        history: createMemoryHistory({ initialEntries: [path] }),
+      })
+      await router.load()
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>
+      )
+      await screen.findByRole('navigation')
+      const link = screen.queryByRole('link', { name: 'Currency & Display' })
+      if (visible) {
+        expect(link).toHaveAttribute(
+          'href',
+          '/system-settings/billing/currency'
+        )
+      } else {
+        expect(link).not.toBeInTheDocument()
+      }
+      expect(
+        screen.queryByRole('link', { name: 'System Settings' })
+      ).not.toBeInTheDocument()
+      expect(
+        screen.queryByRole('link', { name: 'Payment Gateway' })
+      ).not.toBeInTheDocument()
+      if (path.startsWith('/system-settings')) {
+        expect(screen.getAllByRole('link')).toHaveLength(1)
+      }
+      expect(
+        get.mock.calls.some(([url]) => url.startsWith('/api/option'))
+      ).toBe(false)
+      client.clear()
+    }
+  )
+})

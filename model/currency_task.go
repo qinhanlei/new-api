@@ -28,6 +28,12 @@ func attachCNYTask(tx *gorm.DB, record *CNYBillingRecord, task *Task) error {
 		return ErrCNYState
 	}
 	record.TaskID, record.Status, record.UpdatedAt = task.TaskID, CNYBillingSubmitted, common.GetTimestamp()
+	if record.FundingVersion == 1 {
+		if err := tx.Model(&WalletFundingRecord{}).Where("request_id = ? AND user_id = ? AND status = ?", record.RequestID, record.UserID, CNYBillingReserved).
+			Updates(map[string]any{"task_id": task.TaskID, "status": CNYBillingSubmitted, "updated_at": record.UpdatedAt}).Error; err != nil {
+			return err
+		}
+	}
 	return tx.Save(record).Error
 }
 
@@ -115,6 +121,7 @@ func InsertCNYTask(ctx context.Context, task *Task, final *CNYTaskSettlement, om
 	})
 	if err == nil {
 		*task = candidate
+		InvalidateUserQuotaCache(record.UserID)
 	}
 	return err
 }
@@ -164,6 +171,7 @@ func FinalizeCNYTask(task *Task, fromStatus TaskStatus, final CNYTaskSettlement)
 	if updated && err == nil {
 		candidate.Currency = "CNY"
 		*task = candidate
+		InvalidateUserQuotaCache(record.UserID)
 	}
 	return updated && err == nil, err
 }

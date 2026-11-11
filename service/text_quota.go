@@ -398,9 +398,22 @@ func usageSemanticFromUsage(relayInfo *relaycommon.RelayInfo, usage *dto.Usage) 
 }
 
 func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []*common.Message) {
+	if relayInfo.BillingUsageUnknown {
+		RecordUnknownWalletUsage(ctx, relayInfo)
+		return
+	}
 	if IsCNYBilling(relayInfo) {
 		postCNYTextUsage(ctx, relayInfo, usage)
 		return
+	}
+	if IsWalletBilling(relayInfo) {
+		session := relayInfo.Billing.(*BillingSession)
+		session.mu.Lock()
+		settled := session.settled
+		session.mu.Unlock()
+		if settled {
+			return
+		}
 	}
 	originUsage := usage
 	billingUsage := effectiveBillingUsage(usage)
@@ -462,13 +475,15 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	if !summary.hasBillableUsage() {
 		extraContent = append(extraContent, common.NewMessage("Upstream returned no usage, so nothing was charged (possibly an upstream timeout)"))
 		logger.LogError(ctx, common.LogText("total tokens is 0, cannot consume quota, userId %d, channelId %d, tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, summary.ModelName, relayInfo.FinalPreConsumedQuota))
-	} else {
-		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, summary.Quota)
-		model.UpdateChannelUsedQuota(relayInfo.ChannelId, summary.Quota)
 	}
 
 	if err := SettleBilling(ctx, relayInfo, summary.Quota); err != nil {
 		logger.LogError(ctx, common.LogText("error settling billing: %s", err.Error()))
+		return
+	}
+	if summary.hasBillableUsage() {
+		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, summary.Quota)
+		model.UpdateChannelUsedQuota(relayInfo.ChannelId, summary.Quota)
 	}
 
 	logModel := summary.ModelName

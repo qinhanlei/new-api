@@ -36,9 +36,9 @@ export async function getCurrencyWallet(
 export async function adjustCurrencyWallet(
   userId: number,
   adjustment: {
-    delta_quota: number
+    mode: 'add' | 'subtract' | 'override'
+    value: number
     operation_id: string
-    reason: string
   }
 ): Promise<CurrencyWallet> {
   const response = await api.post(

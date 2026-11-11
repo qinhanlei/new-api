@@ -89,7 +89,7 @@ func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 		setting.ModelRequestRateLimitMutex.Unlock()
 		require.NoError(t, sqlDB.Close())
 	})
-	require.NoError(t, db.AutoMigrate(&model.BillingRateRule{}, &model.User{}, &model.Token{}, &model.CNYTokenBudget{}))
+	require.NoError(t, db.AutoMigrate(&model.BillingRateRule{}, &model.User{}, &model.Token{}, &model.CNYTokenBudget{}, &model.CNYWallet{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}))
 	// The shared in-memory limiter outlives each database fixture. Give every
 	// user a separate quota bucket, including when the tests run with -count.
 	user := &model.User{Id: 5062000 + int(responsesWSTestUserSequence.Add(1)), Username: "responses-ws-user", Status: common.UserStatusEnabled, Group: "default", Quota: 1000, AuthVersion: 1}
@@ -486,7 +486,7 @@ func TestResponsesInterruptedStreamHealth(t *testing.T) {
 				}
 			}
 			fixture.closeAndWait(t)
-			assertResponsesWSAccounting(t, fixture, []int{1000})
+			assertResponsesWSAccounting(t, fixture, nil, 1000)
 			if scenario == "sse client cancel" {
 				keys, err := common.RDB.Keys(context.Background(), "perf:ws-billing:*").Result()
 				require.NoError(t, err)
@@ -510,7 +510,7 @@ func readResponsesWSTestEvent(t *testing.T, client *websocket.Conn) map[string]a
 	return event
 }
 
-func assertResponsesWSAccounting(t *testing.T, fixture *responsesWSBillingTest, expectedQuotas []int) {
+func assertResponsesWSAccounting(t *testing.T, fixture *responsesWSBillingTest, expectedQuotas []int, pendingQuotas ...int) {
 	t.Helper()
 	var logs []model.Log
 	require.NoError(t, model.LOG_DB.Where("type = ?", model.LogTypeConsume).Order("id").Find(&logs).Error)
@@ -520,11 +520,19 @@ func assertResponsesWSAccounting(t *testing.T, fixture *responsesWSBillingTest, 
 		assert.Equal(t, quota, logs[index].Quota)
 		charged += quota
 	}
+	var pending []model.WalletFundingRecord
+	require.NoError(t, model.DB.Where("user_id = ? AND status = ? AND upstream_pending = ?", fixture.user.Id, model.CNYBillingReserved, true).Order("id").Find(&pending).Error)
+	require.Len(t, pending, len(pendingQuotas))
+	held := 0
+	for index, quota := range pendingQuotas {
+		assert.Equal(t, quota, pending[index].ReservedQuota)
+		held += quota
+	}
 	require.NoError(t, model.DB.First(fixture.token, fixture.token.Id).Error)
 	require.NoError(t, model.DB.First(fixture.user, fixture.user.Id).Error)
-	assert.Equal(t, 3000-charged, fixture.token.RemainQuota)
-	assert.Equal(t, charged, fixture.token.UsedQuota)
-	assert.Equal(t, 100000-charged, fixture.user.Quota)
+	assert.Equal(t, 3000-charged-held, fixture.token.RemainQuota)
+	assert.Equal(t, charged+held, fixture.token.UsedQuota)
+	assert.Equal(t, 100000-charged-held, fixture.user.Quota)
 	assert.Equal(t, charged, fixture.user.UsedQuota)
 }
 
@@ -722,7 +730,7 @@ func TestResponsesWebSocketDialsNativeResponsesChannelTypes(t *testing.T) {
 	}
 }
 
-func TestResponsesWebSocketDisconnectSettlesDeliveredOutputOnce(t *testing.T) {
+func TestResponsesWebSocketDisconnectRetainsUnknownUsage(t *testing.T) {
 	fixture := newResponsesWSBillingTest(t, `tier("output", c * 2)`, func(ws *websocket.Conn, _ *http.Request) {
 		if _, _, err := ws.ReadMessage(); !assert.NoError(t, err) {
 			return
@@ -743,7 +751,7 @@ func TestResponsesWebSocketDisconnectSettlesDeliveredOutputOnce(t *testing.T) {
 	require.Equal(t, "response.output_text.delta", delta["type"])
 	assert.Equal(t, "hello", delta["delta"])
 	fixture.closeAndWait(t)
-	assertResponsesWSAccounting(t, fixture, []int{1})
+	assertResponsesWSAccounting(t, fixture, nil, 0)
 	keys, err := common.RDB.Keys(context.Background(), "perf:ws-billing:*").Result()
 	require.NoError(t, err)
 	assert.Empty(t, keys, "client cancellation must not affect model health")
@@ -806,7 +814,7 @@ func TestResponsesWebSocketCancelErrorDoesNotFinishActiveRequest(t *testing.T) {
 	assertResponsesWSAccounting(t, fixture, []int{1000})
 }
 
-func TestResponsesWebSocketInitialUpstreamRejectionRefundsReservation(t *testing.T) {
+func TestResponsesWebSocketInitialErrorRefundsOnlyConfirmedRejection(t *testing.T) {
 	for _, tc := range []struct {
 		name, upstream, wantType, wantMessage string
 		status                                int
@@ -853,6 +861,11 @@ func TestResponsesWebSocketInitialUpstreamRejectionRefundsReservation(t *testing
 			assert.Equal(t, tc.wantType, rejectionError["type"])
 			assert.Equal(t, tc.wantMessage, rejectionError["message"])
 			assert.Equal(t, 2000, <-preConsumed, "the rejected request reserved quota before contacting upstream")
+			if tc.status >= 500 {
+				fixture.closeAndWait(t)
+				assertResponsesWSAccounting(t, fixture, nil, 1000)
+				return
+			}
 			deadline := time.NewTimer(3 * time.Second)
 			defer deadline.Stop()
 			for {
@@ -895,6 +908,7 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 			{name: "completed-zero-fixed", expression: `tier("request", fixed(0.002))`, terminal: `{"type":"response.completed","response":{"id":"first","status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`},
 		} {
 			t.Run(transport+"/"+tc.name, func(t *testing.T) {
+				unknownWalletUsage := tc.failed && tc.name != "failed-actual-usage"
 				events := []string{`{"type":"response.created","response":{"id":"first","status":"in_progress"}}`}
 				if tc.delta {
 					events = append(events, `{"type":"response.output_text.delta","delta":"hello"}`)
@@ -952,6 +966,14 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 					}
 				}
 				quotas := []int{1000}
+				var pendingQuotas []int
+				if unknownWalletUsage {
+					quotas = nil
+					pendingQuotas = []int{1000}
+					if tc.delta {
+						pendingQuotas[0] = 0
+					}
+				}
 				if tc.failed {
 					// The first terminal must complete settlement and middleware before
 					// admitting this immediately following request.
@@ -965,14 +987,14 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 				assert.Equal(t, "planner", limited["stream_id"])
 				assert.Equal(t, "limited", limited["event_id"])
 				fixture.closeAndWait(t)
-				assertResponsesWSAccounting(t, fixture, quotas)
+				assertResponsesWSAccounting(t, fixture, quotas, pendingQuotas...)
 				var logs []model.Log
 				require.NoError(t, model.LOG_DB.Where("token_id = ? AND type = ?", fixture.token.Id, model.LogTypeConsume).Order("id").Find(&logs).Error)
 				require.Len(t, logs, len(quotas))
 				var other map[string]any
 				require.NoError(t, common.UnmarshalJsonStr(logs[0].Other, &other))
 				stream := other["stream_status"].(map[string]any)
-				if tc.failed {
+				if tc.failed && !unknownWalletUsage {
 					assert.Equal(t, "error", stream["status"])
 					assert.Equal(t, "failed", stream["response_status"])
 				} else {
@@ -985,6 +1007,9 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 				}
 				assert.NotContains(t, logs[0].Other, "sensitive upstream detail")
 				expectedRequests := int64(len(quotas))
+				if unknownWalletUsage {
+					expectedRequests++
+				}
 				if tc.ignored {
 					expectedRequests--
 				}
@@ -1005,7 +1030,7 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 	}{
 		{"business rejection", "context_length_exceeded", 400, 1, false, true},
 		{"credentials rejected as 400", "invalid_api_key", 400, 1, false, false},
-		{"retry succeeds", "server_error", 500, 2, true, false},
+		{"server error retains unknown attempt", "server_error", 500, 1, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newResponsesWSBillingTest(t, `tier("request", fixed(0.002))`, func(*websocket.Conn, *http.Request) {})
@@ -1082,7 +1107,7 @@ func TestResponsesWebSocketLocalErrorsKeepStreamIdentity(t *testing.T) {
 	assertResponsesWSAccounting(t, fixture, nil)
 }
 
-func TestResponsesWebSocketAmbiguousControlErrorClosesAndSettlesOnce(t *testing.T) {
+func TestResponsesWebSocketAmbiguousControlErrorClosesAndRetainsHold(t *testing.T) {
 	const terminal = `{"type":"error","status":500,"error":{"type":"server_error","code":"server_error","message":"Internal server error"}}`
 	fixture := newResponsesWSBillingTest(t, `tier("request", fixed(0.002))`, func(ws *websocket.Conn, _ *http.Request) {
 		if _, _, err := ws.ReadMessage(); !assert.NoError(t, err) {
@@ -1113,7 +1138,7 @@ func TestResponsesWebSocketAmbiguousControlErrorClosesAndSettlesOnce(t *testing.
 	require.ErrorAs(t, err, &closeErr, "an unattributed error must close the connection instead of remaining busy")
 	assert.Equal(t, websocket.CloseInternalServerErr, closeErr.Code)
 	fixture.closeAndWait(t)
-	assertResponsesWSAccounting(t, fixture, []int{1000})
+	assertResponsesWSAccounting(t, fixture, nil, 1000)
 }
 
 // Every way a session ends sends the client a close frame whose code says
@@ -1212,7 +1237,11 @@ func TestResponsesWebSocketCloseCodes(t *testing.T) {
 			assert.Equal(t, tc.code, closeErr.Code)
 			assert.Equal(t, tc.reason, closeErr.Text)
 			fixture.closeAndWait(t)
-			assertResponsesWSAccounting(t, fixture, []int{1000})
+			if tc.events[len(tc.events)-1] == completed {
+				assertResponsesWSAccounting(t, fixture, []int{1000})
+			} else {
+				assertResponsesWSAccounting(t, fixture, nil, 1000)
+			}
 			if tc.upstreamCode != 0 {
 				require.Len(t, upstreamCodes, 1)
 				assert.Equal(t, tc.upstreamCode, <-upstreamCodes)
@@ -1343,7 +1372,11 @@ func TestResponsesWebSocketIgnoresLateErrorForPreviousResponse(t *testing.T) {
 			require.Equal(t, "response.created", created["type"], "the late error must not reach the client or end the request: %v", created)
 			assert.Equal(t, "response.completed", readResponsesWSTestEvent(t, fixture.client)["type"])
 			fixture.closeAndWait(t)
-			assertResponsesWSAccounting(t, fixture, []int{1000, 1000})
+			if tc.firstTerminalType == "error" {
+				assertResponsesWSAccounting(t, fixture, []int{1000}, 1000)
+			} else {
+				assertResponsesWSAccounting(t, fixture, []int{1000, 1000})
+			}
 		})
 	}
 }

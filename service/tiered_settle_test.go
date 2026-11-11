@@ -457,7 +457,9 @@ func TestPrepareBillingForSelectedGroupTopUpArrearsAllowsNegativeBalance(t *test
 	// The top-up must NOT abort the request: the full delta is deducted, the
 	// uncovered 30k becomes arrears (negative balance), mirroring how
 	// settlement charges a positive delta unconditionally.
-	seedUser(t, userID, 20_000)
+	seedUser(t, userID, 70_000)
+	funding := &WalletFunding{userId: userID, params: model.WalletFundingParams{RequestID: "tiered-topup-debt", UserID: userID, Currency: "USD"}}
+	require.NoError(t, funding.PreConsume(50_000))
 
 	relayInfo := &relaycommon.RelayInfo{
 		UserId:                userID,
@@ -478,7 +480,7 @@ func TestPrepareBillingForSelectedGroupTopUpArrearsAllowsNegativeBalance(t *test
 	}
 	session := &BillingSession{
 		relayInfo:        relayInfo,
-		funding:          &WalletFunding{userId: userID, consumed: 50_000},
+		funding:          funding,
 		preConsumedQuota: 50_000,
 	}
 	relayInfo.Billing = session
@@ -505,7 +507,9 @@ func TestBillingSessionReserveWalletTopUpDecrementsBalance(t *testing.T) {
 	truncate(t)
 
 	const userID = 702
-	seedUser(t, userID, 500_000)
+	seedUser(t, userID, 550_000)
+	funding := &WalletFunding{userId: userID, params: model.WalletFundingParams{RequestID: "tiered-topup", UserID: userID, Currency: "USD"}}
+	require.NoError(t, funding.PreConsume(50_000))
 
 	relayInfo := &relaycommon.RelayInfo{
 		UserId:       userID,
@@ -513,7 +517,7 @@ func TestBillingSessionReserveWalletTopUpDecrementsBalance(t *testing.T) {
 	}
 	session := &BillingSession{
 		relayInfo:        relayInfo,
-		funding:          &WalletFunding{userId: userID, consumed: 50_000},
+		funding:          funding,
 		preConsumedQuota: 50_000,
 	}
 
@@ -1385,24 +1389,27 @@ func TestRealtimeBillingRateReservesCumulativeUsageAndSettlesOnce(t *testing.T) 
 			if tc.insufficient {
 				initialBalance = 100
 			}
-			walletBalance := initialBalance - 30
+			walletBalance := initialBalance
+			tokenBalance := 10000
 			if tc.subscription {
 				walletBalance = 0
+				tokenBalance = 9970
 			}
 			seedUser(t, userID, walletBalance)
-			seedToken(t, tokenID, userID, "realtime-rate-token", 9970)
+			seedToken(t, tokenID, userID, "realtime-rate-token", tokenBalance)
 			seedChannel(t, channelID)
 			rate := &types.BillingRateSnapshot{Rate: 0.6, Source: "user", Version: 4, ModelName: "rate-realtime-test"}
 			info := &relaycommon.RelayInfo{
 				UserId: userID, TokenId: tokenID, TokenKey: "realtime-rate-token",
+				RequestId: common.NewRequestId(), ForcePreConsume: true,
 				ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
 				OriginModelName: "rate-realtime-test", StartTime: time.Now(), IsStream: true,
 				UserQuota: initialBalance, FinalPreConsumedQuota: 30,
 				PriceData: types.PriceData{
-					ModelRatio: 1, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.9}, BillingRate: rate,
+					ModelRatio: 1, QuotaToPreConsume: 50, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.9}, BillingRate: rate,
 				},
 			}
-			var funding FundingSource = &WalletFunding{userId: userID, consumed: 30}
+			var funding FundingSource
 			if tc.subscription {
 				seedSubscription(t, 705, userID, 10000, 30)
 				funding = &SubscriptionFunding{
@@ -1414,7 +1421,9 @@ func TestRealtimeBillingRateReservesCumulativeUsageAndSettlesOnce(t *testing.T) 
 			} else {
 				info.BillingSource = BillingSourceWallet
 			}
-			info.Billing = &BillingSession{relayInfo: info, funding: funding, preConsumedQuota: 30, tokenConsumed: 30}
+			if tc.subscription {
+				info.Billing = &BillingSession{relayInfo: info, funding: funding, preConsumedQuota: 30, tokenConsumed: 30}
+			}
 			if tc.tiered {
 				const expr = `tier("base", p * 2)`
 				info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
@@ -1424,19 +1433,20 @@ func TestRealtimeBillingRateReservesCumulativeUsageAndSettlesOnce(t *testing.T) 
 			}
 			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 			ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+			if !tc.subscription {
+				require.Nil(t, PreConsumeBilling(ctx, 30, info))
+			}
 			usage := &dto.RealtimeUsage{InputTokens: 100, TotalTokens: 100}
 			usage.InputTokenDetails.TextTokens = 100
 			require.NoError(t, PreWssConsumeQuota(ctx, info, usage))
 			assert.Equal(t, 60, info.FinalPreConsumedQuota)
-			usage.InputTokens, usage.TotalTokens, usage.InputTokenDetails.TextTokens = 300, 300, 300
-			err := PreWssConsumeQuota(ctx, info, usage)
 			if tc.insufficient {
-				require.Error(t, err)
-				assert.Equal(t, 60, info.FinalPreConsumedQuota, "failed reservation must not change its accounting")
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, 180, info.FinalPreConsumedQuota)
+				require.Error(t, ReserveRealtimeTurn(info, usage, 1), "a new turn must still have available funds")
+				assert.Equal(t, 60, info.FinalPreConsumedQuota)
 			}
+			usage.InputTokens, usage.TotalTokens, usage.InputTokenDetails.TextTokens = 300, 300, 300
+			require.NoError(t, PreWssConsumeQuota(ctx, info, usage), "confirmed usage is recorded even when it creates debt")
+			assert.Equal(t, 180, info.FinalPreConsumedQuota)
 			PostWssConsumeQuota(ctx, info, info.OriginModelName, usage, nil)
 			require.NoError(t, info.Billing.Settle(180), "settlement retries cannot charge again")
 
@@ -1448,7 +1458,7 @@ func TestRealtimeBillingRateReservesCumulativeUsageAndSettlesOnce(t *testing.T) 
 				require.NoError(t, model.DB.First(&subscription, 705).Error)
 				assert.Equal(t, int64(180), subscription.AmountUsed)
 			} else {
-				assert.Equal(t, initialBalance-180, user.Quota, "failed segment reservation still settles usage already received")
+				assert.Equal(t, initialBalance-180, user.Quota, "confirmed usage settles once, including debt")
 			}
 			assert.Equal(t, 180, user.UsedQuota)
 			var token model.Token

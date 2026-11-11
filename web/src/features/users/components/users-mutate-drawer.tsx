@@ -71,8 +71,7 @@ import {
   normalizeAdminPermissions,
   type AdminPermissionMatrix,
 } from '@/lib/admin-permissions'
-import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
-import { formatQuota, parseQuotaFromDollars } from '@/lib/format'
+import { billingAmountToQuota, formatNativeMoney } from '@/lib/currency'
 import { handleServerError } from '@/lib/handle-server-error'
 import { accountPasswordSchema } from '@/lib/password-policy'
 import { ROLE } from '@/lib/roles'
@@ -160,10 +159,6 @@ export function UsersMutateDrawer({
       form.reset(USER_FORM_DEFAULT_VALUES)
     }
   }, [open, isUpdate, currentRow, form, t])
-
-  const { meta: currencyMeta } = getCurrencyDisplay()
-  const currencyLabel = getCurrencyLabel()
-  const tokensOnly = currencyMeta.kind === 'tokens'
 
   const currentQuotaRaw = form.watch('quota_dollars') || 0
   const selectedRole = form.watch('role')
@@ -445,17 +440,13 @@ export function UsersMutateDrawer({
                       <FormItem>
                         <FormLabel>
                           {t('Remaining Quota ({{currency}})', {
-                            currency: currencyLabel,
+                            currency: 'USD',
                           })}
                         </FormLabel>
                         <div className='flex gap-2'>
                           <FormControl>
                             <Input
-                              value={
-                                tokensOnly
-                                  ? String(field.value || 0)
-                                  : (field.value || 0).toFixed(6)
-                              }
+                              value={(field.value || 0).toFixed(6)}
                               readOnly
                               className='flex-1'
                             />
@@ -470,7 +461,7 @@ export function UsersMutateDrawer({
                           </Button>
                         </div>
                         <FormDescription>
-                          {formatQuota(parseQuotaFromDollars(field.value || 0))}
+                          {formatNativeMoney(field.value || 0, 'USD')}
                         </FormDescription>
                         <FormMessage />
                       </FormItem>
@@ -598,7 +589,7 @@ export function UsersMutateDrawer({
           open={quotaDialogOpen}
           onOpenChange={setQuotaDialogOpen}
           userId={currentRow.id}
-          currentQuota={parseQuotaFromDollars(currentQuotaRaw || 0)}
+          currentQuota={billingAmountToQuota(currentQuotaRaw || 0)}
           onSuccess={refreshUserData}
         />
       )}

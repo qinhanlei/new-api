@@ -4,14 +4,19 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -24,7 +29,10 @@ import (
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 func TestMain(m *testing.M) {
@@ -60,6 +68,7 @@ func TestMain(m *testing.M) {
 		&model.UserSubscription{},
 		&model.SystemTask{},
 		&model.SystemTaskLock{},
+		&model.CNYWallet{}, &model.CNYTokenBudget{}, &model.CNYBillingRecord{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{},
 	); err != nil {
 		panic("failed to migrate: " + err.Error())
 	}
@@ -84,6 +93,9 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM user_subscriptions")
 		model.DB.Exec("DELETE FROM system_task_locks")
 		model.DB.Exec("DELETE FROM system_tasks")
+		for _, table := range []any{&model.CNYWallet{}, &model.CNYTokenBudget{}, &model.CNYBillingRecord{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}} {
+			require.NoError(t, model.DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(table).Error)
+		}
 	})
 }
 
@@ -101,6 +113,7 @@ func seedToken(t *testing.T, id int, userId int, key string, remainQuota int) {
 		Key:         key,
 		Name:        "test_token",
 		Status:      common.TokenStatusEnabled,
+		ExpiredTime: -1,
 		RemainQuota: remainQuota,
 		UsedQuota:   0,
 	}
@@ -1807,6 +1820,313 @@ func TestSettle_TokenRecalcFallsBackToCompletionTokens(t *testing.T) {
 
 			assert.Equal(t, testCase.wantSettled, settled)
 			assert.Equal(t, testCase.wantQuota, task.Quota)
+		})
+	}
+}
+
+// New ledger tasks deliberately share these service-level regressions with the
+// legacy task tests: the reference, rather than current site settings, selects
+// the settlement contract after a restart.
+func TestWalletTaskDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []common.DatabaseType{common.DatabaseTypeSQLite, common.DatabaseTypeMySQL, common.DatabaseTypePostgreSQL} {
+		t.Run(string(dialect), func(t *testing.T) {
+			var driver gorm.Dialector
+			switch dialect {
+			case common.DatabaseTypeSQLite:
+				driver = sqlite.Open(filepath.Join(t.TempDir(), "tasks.db") + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)")
+			case common.DatabaseTypeMySQL:
+				if os.Getenv("TEST_MYSQL_DSN") == "" {
+					t.Skip("TEST_MYSQL_DSN is not configured")
+				}
+				driver = mysql.Open(os.Getenv("TEST_MYSQL_DSN"))
+			case common.DatabaseTypePostgreSQL:
+				if os.Getenv("TEST_POSTGRES_DSN") == "" {
+					t.Skip("TEST_POSTGRES_DSN is not configured")
+				}
+				driver = postgres.New(postgres.Config{DSN: os.Getenv("TEST_POSTGRES_DSN"), PreferSimpleProtocol: true})
+			}
+			db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "wallet_task_matrix_"}})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(4)
+			oldDB, oldLogDB := model.DB, model.LOG_DB
+			oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+			oldRedis, oldMemory, oldBatch, oldExport, oldScale := common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.DataExportEnabled, common.QuotaPerUnit
+			model.DB, model.LOG_DB = db, db
+			common.SetDatabaseTypes(dialect, dialect)
+			common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.DataExportEnabled, common.QuotaPerUnit = false, false, true, false, 500000
+			t.Cleanup(func() {
+				model.DB, model.LOG_DB = oldDB, oldLogDB
+				common.SetDatabaseTypes(oldMain, oldLog)
+				common.RedisEnabled, common.MemoryCacheEnabled, common.BatchUpdateEnabled, common.DataExportEnabled, common.QuotaPerUnit = oldRedis, oldMemory, oldBatch, oldExport, oldScale
+				require.NoError(t, sqlDB.Close())
+			})
+			tables := []any{&model.Task{}, &model.User{}, &model.Token{}, &model.Channel{}, &model.Log{}, &model.CNYWallet{}, &model.CNYTokenBudget{}, &model.CNYBillingRecord{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}}
+			require.NoError(t, db.Migrator().DropTable(tables...))
+			for range 2 {
+				require.NoError(t, db.AutoMigrate(tables...))
+			}
+			var version string
+			query := "SELECT version()"
+			if dialect == common.DatabaseTypeSQLite {
+				query = "SELECT sqlite_version()"
+			}
+			require.NoError(t, db.Raw(query).Scan(&version).Error)
+			t.Logf("database %s %s", dialect, version)
+			t.Run("frozen funding concurrent final and deleted key", testWalletTaskFrozenFinal)
+			t.Run("transaction rollback includes status and statistics", testWalletTaskRollback)
+			t.Run("frozen expression and legacy pricing contracts", testWalletTaskPricing)
+			t.Run("polling terminal and unknown paths", testWalletTaskPolling)
+			for range 2 {
+				require.NoError(t, db.AutoMigrate(tables...))
+			}
+			require.NoError(t, db.Migrator().DropTable(tables...))
+		})
+	}
+}
+
+func seedLedgerTask(t *testing.T, name string, usd, cny, reserved int, bc *model.TaskBillingContext) *model.Task {
+	t.Helper()
+	user := model.User{Username: name, AffCode: name, Status: common.UserStatusEnabled, Quota: usd}
+	require.NoError(t, model.DB.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: name, Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000000}
+	require.NoError(t, model.DB.Create(&token).Error)
+	channel := model.Channel{Name: name, Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	require.NoError(t, model.DB.Create(&model.CNYWallet{UserID: user.Id, Currency: "CNY", QuotaPerUnit: model.CNYQuotaPerUnit, Quota: cny}).Error)
+	_, err := model.ReserveWalletFunding(model.WalletFundingParams{RequestID: name, UserID: user.Id, TokenID: token.Id, Currency: "USD"}, reserved)
+	require.NoError(t, err)
+	require.NoError(t, model.MarkWalletFundingPending(name, true))
+	task := &model.Task{TaskID: "task_" + name, UserId: user.Id, ChannelId: channel.Id, Platform: "wallet-test", Group: "default", Status: model.TaskStatusSubmitted, Quota: reserved, SubmitTime: common.GetTimestamp(),
+		PrivateData: model.TaskPrivateData{WalletFundingRequestID: name, Execution: &model.TaskExecutionSnapshot{RequestID: name}, BillingSource: BillingSourceWallet, TokenId: token.Id, BillingContext: bc}}
+	created, err := model.InsertWalletTask(context.Background(), task, nil)
+	require.NoError(t, err)
+	require.True(t, created)
+	return task
+}
+
+func testWalletTaskFrozenFinal(t *testing.T) {
+	policy := model.DefaultWalletExchangePolicy()
+	policy.StaticRate, policy.CrossCurrencyEnabled = "6.7", true
+	_, err := model.SaveWalletExchangePolicy(policy, nil)
+	require.NoError(t, err)
+	task := seedLedgerTask(t, "frozen", 100000, 3350000, 500000, &model.TaskBillingContext{PerCallBilling: true})
+	created, err := model.InsertWalletTask(context.Background(), task, nil)
+	require.NoError(t, err)
+	assert.False(t, created)
+	var user model.User
+	require.NoError(t, model.DB.First(&user, task.UserId).Error)
+	assert.Zero(t, user.Quota)
+	assert.Zero(t, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+	_, err = model.SettleWalletFunding("frozen", 100000, false)
+	require.Error(t, err, "only the task CAS may settle an attached reservation")
+	policyPtr, err := model.GetWalletExchangePolicy()
+	require.NoError(t, err)
+	policyPtr.StaticRate, policyPtr.CrossCurrencyEnabled = "2", false
+	_, err = model.SaveWalletExchangePolicy(*policyPtr, nil)
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Delete(&model.Token{}, task.PrivateData.TokenId).Error)
+	bad := *task
+	bad.UserId++
+	bad.Status = model.TaskStatusSuccess
+	_, err = model.FinalizeWalletTask(&bad, model.TaskStatusSubmitted, model.WalletTaskSettlement{Quota: 300000})
+	require.ErrorIs(t, err, model.ErrCNYConflict)
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		candidate := *task
+		candidate.Status, candidate.Quota = model.TaskStatusSuccess, 300000
+		wg.Go(func() {
+			errs <- finalizeWalletTask(context.Background(), &mockAdaptor{}, &candidate, model.TaskStatusSubmitted, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess})
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	record, err := model.GetWalletFundingRecord("frozen")
+	require.NoError(t, err)
+	assert.Equal(t, model.CNYBillingSettled, record.Status)
+	assert.Equal(t, 300000, record.Quota)
+	assert.Equal(t, 1340000, record.AlternateCharged)
+	assert.False(t, record.UpstreamPending)
+	wallet, err := model.GetCNYWallet(task.UserId)
+	require.NoError(t, err)
+	assert.Equal(t, 2010000, wallet.Quota)
+	assert.Zero(t, wallet.ReservedQuota)
+	assert.Zero(t, wallet.UsedQuota)
+	require.NoError(t, model.DB.First(&user, task.UserId).Error)
+	assert.Zero(t, user.Quota)
+	assert.Equal(t, 300000, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+	var token model.Token
+	require.NoError(t, model.DB.Unscoped().First(&token, task.PrivateData.TokenId).Error)
+	assert.Equal(t, 700000, token.RemainQuota)
+	assert.True(t, token.DeletedAt.Valid)
+	var logs []model.Log
+	require.NoError(t, model.DB.Where("user_id = ?", task.UserId).Find(&logs).Error)
+	require.Len(t, logs, 1)
+	assert.Equal(t, 300000, logs[0].Quota)
+	var metadata struct {
+		Funding      model.WalletFundingLog `json:"wallet_funding"`
+		QuotaPerUnit float64                `json:"quota_per_unit"`
+	}
+	require.NoError(t, common.UnmarshalJsonStr(logs[0].Other, &metadata))
+	assert.Equal(t, 100000, metadata.Funding.USDQuota)
+	assert.Equal(t, 1340000, metadata.Funding.CNYQuota)
+	assert.Equal(t, "6.7", metadata.Funding.Exchange.Rate)
+	assert.Equal(t, float64(500000), metadata.QuotaPerUnit)
+}
+
+func testWalletTaskRollback(t *testing.T) {
+	task := seedLedgerTask(t, "rollback", 1000000, 0, 5000, &model.TaskBillingContext{PerCallBilling: true})
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("test_wallet_task_rollback", func(tx *gorm.DB) {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "Channel" {
+			tx.AddError(errors.New("injected statistics failure"))
+		}
+	}))
+	task.Status = model.TaskStatusSuccess
+	won, err := model.FinalizeWalletTask(task, model.TaskStatusSubmitted, model.WalletTaskSettlement{Quota: 2000})
+	require.ErrorContains(t, err, "injected statistics failure")
+	assert.False(t, won)
+	require.NoError(t, model.DB.Callback().Update().Remove("test_wallet_task_rollback"))
+	var stored model.Task
+	require.NoError(t, model.DB.First(&stored, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), stored.Status)
+	var user model.User
+	require.NoError(t, model.DB.First(&user, task.UserId).Error)
+	assert.Equal(t, 995000, user.Quota)
+	assert.Zero(t, user.UsedQuota)
+	record, err := model.GetWalletFundingRecord("rollback")
+	require.NoError(t, err)
+	assert.Equal(t, model.CNYBillingSubmitted, record.Status)
+	won, err = model.FinalizeWalletTask(task, model.TaskStatusSubmitted, model.WalletTaskSettlement{Quota: 2000})
+	require.NoError(t, err)
+	assert.True(t, won)
+	require.NoError(t, model.DB.First(&user, task.UserId).Error)
+	assert.Equal(t, 998000, user.Quota)
+	assert.Equal(t, 2000, user.UsedQuota)
+}
+
+func testWalletTaskPricing(t *testing.T) {
+	for i, tc := range []struct {
+		name, status, expr    string
+		facts                 map[string]any
+		adaptor, tokens, want int
+		perCall, hold         bool
+		rate                  *float64
+	}{
+		{name: "explicit zero", expr: `u("units") * 0.01`, facts: map[string]any{"units": float64(0)}},
+		{name: "partial usage", expr: `u("units") * 0.01`, facts: map[string]any{"units": float64(2)}, want: 10000},
+		{name: "unchanged submission quantities", expr: `u("units") * 0.01`, want: 20000},
+		{name: "invalid expression", expr: `u("missing")`, facts: map[string]any{"units": float64(2)}, hold: true},
+		{name: "adaptor actual", adaptor: 2500, want: 2500},
+		{name: "failure with charged actual", status: model.TaskStatusFailure, adaptor: 2500, want: 2500},
+		{name: "adaptor zero sentinel", want: 20000},
+		{name: "per-call keeps submit price", perCall: true, adaptor: 2500, want: 20000},
+		{name: "frozen token price", tokens: 1000, want: 750},
+		{name: "user rate replaces group", tokens: 1000, rate: common.GetPointer(0.6), want: 600},
+		{name: "explicit free rate", tokens: 1000, rate: common.GetPointer(0.0)},
+		{name: "expression uses frozen user rate", expr: `u("units") * 0.01`, facts: map[string]any{"units": float64(2)}, rate: common.GetPointer(0.6), want: 6000},
+		{name: "confirmed failure refunds", status: model.TaskStatusFailure},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bc := &model.TaskBillingContext{ModelRatio: 2, GroupRatio: 0.75, OtherRatios: map[string]float64{"seconds": 0.5}, PerCallBilling: tc.perCall}
+			if tc.expr != "" {
+				bc.TieredSnapshot = &billingexpr.BillingSnapshot{Currency: "USD", BillingMode: "tiered_expr", ExprString: tc.expr, ExprHash: billingexpr.ExprHashString(tc.expr), QuotaPerUnit: 500000, GroupRatio: 1, TaskUsageBilling: true, UsageFacts: map[string]any{"units": float64(4)}}
+			}
+			if tc.rate != nil {
+				bc.BillingRate = &types.BillingRateSnapshot{Rate: *tc.rate, Source: "user", Version: 3, ModelName: "test-model"}
+				if bc.TieredSnapshot != nil {
+					bc.TieredSnapshot.BillingRate = bc.BillingRate
+				}
+			}
+			task := seedLedgerTask(t, fmt.Sprintf("pricing-%d", i), 1000000, 0, 20000, bc)
+			// Reload both snapshots as a worker would after a restart.
+			require.NoError(t, model.DB.First(task, task.ID).Error)
+			status := tc.status
+			if status == "" {
+				status = model.TaskStatusSuccess
+			}
+			task.Status = model.TaskStatus(status)
+			err := finalizeWalletTask(context.Background(), &mockAdaptor{adjustReturn: tc.adaptor}, task, model.TaskStatusSubmitted, &relaycommon.TaskInfo{Status: status, UsageFacts: tc.facts, TotalTokens: tc.tokens})
+			var stored model.Task
+			require.NoError(t, model.DB.First(&stored, task.ID).Error)
+			var user model.User
+			require.NoError(t, model.DB.First(&user, task.UserId).Error)
+			if tc.hold {
+				require.Error(t, err)
+				assert.Equal(t, model.TaskStatus(model.TaskStatusAwaitingReview), stored.Status)
+				assert.Equal(t, 980000, user.Quota)
+				assert.Zero(t, user.UsedQuota)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, stored.Quota)
+			assert.Equal(t, 1000000-tc.want, user.Quota)
+			assert.Equal(t, tc.want, user.UsedQuota)
+			assert.Equal(t, 1, user.RequestCount)
+		})
+	}
+}
+
+func testWalletTaskPolling(t *testing.T) {
+	for i, mode := range []string{"single success", "batch success", "404", "410", "hook error", "timeout", "missing single channel", "missing batch channel"} {
+		t.Run(mode, func(t *testing.T) {
+			task := seedLedgerTask(t, fmt.Sprintf("poll-%d", i), 1000000, 0, 20000, &model.TaskBillingContext{PerCallBilling: true})
+			adaptor := &scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}}
+			ctx := context.Background()
+			taskMap := map[string]*model.Task{task.TaskID: task}
+			switch mode {
+			case "single success", "404", "410", "hook error":
+				if mode == "404" {
+					adaptor.statusCode = 404
+				}
+				if mode == "410" {
+					adaptor.statusCode = 410
+				}
+				if mode == "hook error" {
+					adaptor.parseErr = errors.New("usage hook failed")
+					previous := constant.TaskPollMaxFailures
+					constant.TaskPollMaxFailures = 1
+					t.Cleanup(func() { constant.TaskPollMaxFailures = previous })
+				}
+				require.NoError(t, updateVideoSingleTask(ctx, adaptor, &model.Channel{}, task.TaskID, taskMap))
+			case "batch success":
+				batch := &scriptedBatchPollingAdaptor{results: map[string]*BatchTaskResult{task.TaskID: {TaskInfo: *adaptor.parse}}}
+				require.NoError(t, updateBatchTasks(ctx, batch, task.ChannelId, []string{task.TaskID}, taskMap))
+			case "timeout":
+				previous := constant.TaskTimeoutMinutes
+				constant.TaskTimeoutMinutes = 1
+				t.Cleanup(func() { constant.TaskTimeoutMinutes = previous })
+				require.NoError(t, model.DB.Model(task).UpdateColumn("submit_time", common.GetTimestamp()-120).Error)
+				sweepTimedOutTasks(ctx)
+			case "missing single channel", "missing batch channel":
+				require.NoError(t, model.DB.Delete(&model.Channel{}, task.ChannelId).Error)
+				if mode == "missing single channel" {
+					require.Error(t, updateVideoTasks(ctx, task.Platform, task.ChannelId, []string{task.TaskID}, taskMap))
+				} else {
+					require.NoError(t, updateBatchTasks(ctx, &scriptedBatchPollingAdaptor{}, task.ChannelId, []string{task.TaskID}, taskMap))
+				}
+			}
+			var stored model.Task
+			require.NoError(t, model.DB.First(&stored, task.ID).Error)
+			var user model.User
+			require.NoError(t, model.DB.First(&user, task.UserId).Error)
+			assert.Equal(t, 980000, user.Quota)
+			if mode == "single success" || mode == "batch success" {
+				assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), stored.Status)
+				assert.Equal(t, 20000, user.UsedQuota)
+			} else {
+				assert.Equal(t, model.TaskStatus(model.TaskStatusAwaitingReview), stored.Status)
+				assert.Zero(t, user.UsedQuota)
+				record, err := model.GetWalletFundingRecord(task.PrivateData.WalletFundingRequestID)
+				require.NoError(t, err)
+				assert.Equal(t, model.CNYBillingSubmitted, record.Status)
+			}
 		})
 	}
 }

@@ -12,6 +12,39 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestResponsesWalletUnknownUsagePreservesTerminalFallback(t *testing.T) {
+	for _, currency := range []string{"USD", "CNY"} {
+		for _, tc := range []struct {
+			name, event string
+			usage       *dto.Usage
+			unknown     bool
+		}{
+			{"interrupted", "response.created", nil, true},
+			{"failed missing", "response.failed", nil, true},
+			{"failed explicit zero", "response.failed", &dto.Usage{}, false},
+			{"completed estimator", "response.completed", nil, false},
+			{"incomplete estimator", "response.incomplete", nil, false},
+			{"completed explicit zero", "response.completed", &dto.Usage{}, false},
+		} {
+			t.Run(currency+"/"+tc.name, func(t *testing.T) {
+				info := &relaycommon.RelayInfo{FundingCurrency: currency, StreamStatus: relaycommon.NewStreamStatus()}
+				info.SetEstimatePromptTokens(100)
+				if currency == "CNY" {
+					info.Billing = &CNYBillingSession{}
+				} else {
+					info.Billing = &BillingSession{funding: &WalletFunding{}}
+				}
+				accumulator := NewResponsesUsageAccumulator(info)
+				accumulator.Observe(&dto.ResponsesStreamResponse{Type: tc.event, Response: &dto.OpenAIResponsesResponse{Usage: tc.usage}}, nil)
+				assert.Equal(t, tc.unknown, accumulator.WalletUsageUnknown())
+				if tc.usage != nil {
+					assert.Zero(t, accumulator.Finish().TotalTokens, "explicit provider zero must not be replaced with the prompt estimate")
+				}
+			})
+		}
+	}
+}
+
 func TestResponsesUsageAccumulatorTerminalAccounting(t *testing.T) {
 	operation_setting.SetToolPriceForTest("responses_priced_fn", 5)
 	t.Cleanup(func() { operation_setting.DeleteToolPriceForTest("responses_priced_fn") })

@@ -17,7 +17,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import type { TFunction } from 'i18next'
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test } from 'vitest'
+
+import {
+  DEFAULT_CURRENCY_CONFIG,
+  useSystemConfigStore,
+} from '@/stores/system-config-store'
 
 import { apiKeySchema, type ApiKey } from '../../types'
 import {
@@ -209,3 +214,37 @@ describe('API key user quota query form mapping', () => {
     }
   )
 })
+
+afterEach(() => {
+  useSystemConfigStore.getState().setConfig({
+    currency: { ...DEFAULT_CURRENCY_CONFIG },
+  })
+})
+
+test.each(['USD', 'CNY', 'CUSTOM', 'TOKENS'] as const)(
+  'edits and saves a USD key limit without display conversion in %s mode',
+  (quotaDisplayType) => {
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaPerUnit: 1000000,
+        quotaDisplayType,
+        usdExchangeRate: 7,
+        customCurrencyExchangeRate: 0.8,
+      },
+    })
+    const defaults = transformApiKeyToFormDefaults({
+      ...baseApiKey,
+      unlimited_quota: false,
+      remain_quota: 1250000,
+    })
+    expect(defaults.remain_quota_dollars).toBe(1.25)
+    expect(transformFormDataToPayload(defaults).remain_quota).toBe(1250000)
+    expect(
+      transformFormDataToPayload({
+        ...defaults,
+        remain_quota_dollars: 2.5,
+      }).remain_quota
+    ).toBe(2500000)
+  }
+)

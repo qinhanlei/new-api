@@ -100,6 +100,7 @@ export function SettingsPageActionsPortal(
 }
 
 type SettingsPageFormActionsProps = {
+  inline?: boolean
   onSave: () => void
   onReset?: () => void
   isSaving?: boolean
@@ -118,8 +119,8 @@ export function SettingsPageFormActions(props: SettingsPageFormActionsProps) {
     ? (props.savingLabel ?? 'Saving...')
     : (props.saveLabel ?? 'Save Changes')
 
-  return (
-    <SettingsPageActionsPortal>
+  const buttons = (
+    <>
       {props.onReset && (
         <Button
           type='button'
@@ -142,6 +143,15 @@ export function SettingsPageFormActions(props: SettingsPageFormActionsProps) {
         <Save data-icon='inline-start' />
         <span>{t(saveLabel)}</span>
       </Button>
-    </SettingsPageActionsPortal>
+    </>
   )
+
+  if (props.inline) {
+    return (
+      <div className='flex flex-wrap items-center justify-end gap-2'>
+        {buttons}
+      </div>
+    )
+  }
+  return <SettingsPageActionsPortal>{buttons}</SettingsPageActionsPortal>
 }

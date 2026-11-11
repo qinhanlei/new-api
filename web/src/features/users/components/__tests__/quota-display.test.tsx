@@ -52,7 +52,9 @@ import {
   useSystemConfigStore,
 } from '@/stores/system-config-store'
 
+import { transformUserToFormDefaults } from '../../lib/user-form'
 import type { User } from '../../types'
+import { UserQuotaDialog } from '../user-quota-dialog'
 import { useUsersColumns } from '../users-columns'
 import { UsersProvider } from '../users-provider'
 import { UsersTable } from '../users-table'
@@ -141,7 +143,7 @@ it('shows balance above secondary usage text and opens quota details on click', 
     </I18nextProvider>
   )
   expect(
-    screen.getByRole('columnheader', { name: 'Available Balance ($)' })
+    screen.getByRole('columnheader', { name: 'Available Balance (USD)' })
   ).toHaveAttribute('data-sortable', 'true')
   expect(screen.getAllByRole('columnheader')).toHaveLength(1)
   const cells = screen.getAllByRole('cell')
@@ -162,7 +164,7 @@ it('shows balance above secondary usage text and opens quota details on click', 
     name: 'Available Balance 0.0038; Used amount 0.0022',
   })
   await userEvent.click(trigger)
-  const detail = await screen.findByRole('dialog', { name: 'Quota ($)' })
+  const detail = await screen.findByRole('dialog', { name: 'Quota (USD)' })
   expect(within(detail).getByText('Available Balance')).toBeInTheDocument()
   expect(within(detail).getByText('Total Used')).toBeInTheDocument()
   expect(within(detail).getByText('0.0038')).toBeInTheDocument()
@@ -187,7 +189,7 @@ it.each([0, 500000])(
       expect(screen.getAllByRole('cell')[0]).toHaveTextContent(/^No Quota$/)
       expect(screen.queryByText('Used amount')).not.toBeInTheDocument()
       await userEvent.click(screen.getByRole('button', { name: 'No Quota' }))
-      const detail = await screen.findByRole('dialog', { name: 'Quota ($)' })
+      const detail = await screen.findByRole('dialog', { name: 'Quota (USD)' })
       expect(within(detail).getAllByText('0')).toHaveLength(2)
       return
     }
@@ -216,7 +218,7 @@ it('preserves negative balances in details opened with the keyboard', async () =
   expect(within(detail).getByText('2')).toBeInTheDocument()
 })
 
-it('shows the custom symbol only in the column header', () => {
+it('keeps USD balances in USD when custom display is configured', () => {
   useSystemConfigStore.getState().setConfig({
     currency: {
       ...DEFAULT_CURRENCY_CONFIG,
@@ -231,7 +233,7 @@ it('shows the custom symbol only in the column header', () => {
     </I18nextProvider>
   )
   expect(
-    screen.getByRole('columnheader', { name: 'Available Balance (🐱)' })
+    screen.getByRole('columnheader', { name: 'Available Balance (USD)' })
   ).toBeInTheDocument()
   for (const cell of screen.getAllByRole('cell')) {
     expect(cell).not.toHaveTextContent('🐱')
@@ -322,7 +324,7 @@ it('sends balance sorting to the server and keeps invitation details on two line
     screen.getByRole('columnheader', { name: 'User Group' })
   ).toBeInTheDocument()
   await userEvent.click(
-    screen.getByRole('button', { name: 'Available Balance ($)' })
+    screen.getByRole('button', { name: 'Available Balance (USD)' })
   )
   await userEvent.click(screen.getByRole('menuitem', { name: 'Desc' }))
   await waitFor(() =>
@@ -347,7 +349,7 @@ it('shows balance above usage on mobile cards in Chinese', async () => {
   await i18n.changeLanguage('zh')
   try {
     await renderUsersList()
-    expect(screen.getByText('可用余额 ($)')).toBeInTheDocument()
+    expect(screen.getByText('可用余额 (USD)')).toBeInTheDocument()
     expect(screen.getByText('已用')).toBeInTheDocument()
     expect(screen.getByText('0.0038')).toBeInTheDocument()
     expect(screen.getByText('0.0022')).toBeInTheDocument()
@@ -355,7 +357,7 @@ it('shows balance above usage on mobile cards in Chinese', async () => {
     await userEvent.click(
       screen.getByRole('button', { name: /可用余额 0.0038/ })
     )
-    const detail = await screen.findByRole('dialog', { name: '额度 ($)' })
+    const detail = await screen.findByRole('dialog', { name: '额度 (USD)' })
     expect(within(detail).getByText('累计已用')).toBeInTheDocument()
     expect(within(detail).getByText('0.0022')).toBeInTheDocument()
     await userEvent.keyboard('{Escape}')
@@ -394,7 +396,7 @@ it('combines creation and last login into one column with full dates visible dir
   ).not.toBeInTheDocument()
 })
 
-it('updates the header unit and converted amounts together when currency settings change', () => {
+it('keeps the USD unit and balances unchanged when the display rate changes', () => {
   render(
     <I18nextProvider i18n={i18n}>
       <QuotaTable remaining={500000} used={1000000} />
@@ -410,20 +412,20 @@ it('updates the header unit and converted amounts together when currency setting
     })
   )
   expect(
-    screen.getByRole('columnheader', { name: 'Available Balance (¥)' })
+    screen.getByRole('columnheader', { name: 'Available Balance (USD)' })
   ).toBeInTheDocument()
   expect(
-    within(screen.getAllByRole('cell')[0]).getByText('7')
+    within(screen.getAllByRole('cell')[0]).getByText('1')
   ).toBeInTheDocument()
   expect(
-    within(screen.getAllByRole('cell')[0]).getByText('14')
+    within(screen.getAllByRole('cell')[0]).getByText('2')
   ).toBeInTheDocument()
   for (const cell of screen.getAllByRole('cell')) {
     expect(cell).not.toHaveTextContent('¥')
   }
 })
 
-it('labels raw quota mode as tokens without introducing a currency symbol', () => {
+it('keeps small USD balances in USD when token display is configured', () => {
   useSystemConfigStore.getState().setConfig({
     currency: { ...DEFAULT_CURRENCY_CONFIG, quotaDisplayType: 'TOKENS' },
   })
@@ -433,12 +435,172 @@ it('labels raw quota mode as tokens without introducing a currency symbol', () =
     </I18nextProvider>
   )
   expect(
-    screen.getByRole('columnheader', { name: 'Available Balance (Tokens)' })
+    screen.getByRole('columnheader', { name: 'Available Balance (USD)' })
   ).toBeInTheDocument()
   expect(
-    within(screen.getAllByRole('cell')[0]).getByText('100')
+    within(screen.getAllByRole('cell')[0]).getByText('0.0002')
   ).toBeInTheDocument()
   expect(
-    within(screen.getAllByRole('cell')[0]).getByText('200')
+    within(screen.getAllByRole('cell')[0]).getByText('0.0004')
   ).toBeInTheDocument()
+})
+
+function renderQuotaAdjustment() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  const onSuccess = vi.fn()
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <UserQuotaDialog
+          open
+          userId={42}
+          currentQuota={5000000}
+          onOpenChange={() => undefined}
+          onSuccess={onSuccess}
+        />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  return { onSuccess }
+}
+
+it.each(['CNY', 'CUSTOM', 'TOKENS'] as const)(
+  'submits a USD amount unchanged when display mode is %s',
+  async (quotaDisplayType) => {
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType,
+        usdExchangeRate: 7,
+        customCurrencyExchangeRate: 3,
+      },
+    })
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: { success: true },
+    })
+    expect(
+      transformUserToFormDefaults({ quota: 1000000 } as User).quota_dollars
+    ).toBe(2)
+    renderQuotaAdjustment()
+    expect(screen.getByText('Amount (USD)')).toBeVisible()
+    await userEvent.type(
+      screen.getByRole('spinbutton', { name: 'Amount' }),
+      '2'
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+    await waitFor(() =>
+      expect(post).toHaveBeenCalledWith('/api/user/manage', {
+        id: 42,
+        action: 'add_quota',
+        mode: 'add',
+        value: 1000000,
+      })
+    )
+  }
+)
+
+it('supports CNY add, subtract and override without a reason or randomUUID', async () => {
+  const wallet = {
+    currency: 'CNY',
+    quota: 5000000,
+    used_quota: 0,
+    quota_per_unit: 500000,
+  }
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: wallet },
+  })
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: wallet },
+  })
+  const cryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto')
+  const getRandomValues = globalThis.crypto.getRandomValues.bind(
+    globalThis.crypto
+  )
+  Object.defineProperty(globalThis, 'crypto', {
+    configurable: true,
+    value: { getRandomValues },
+  })
+  try {
+    renderQuotaAdjustment()
+    await userEvent.click(
+      screen.getByRole('combobox', { name: 'Billing currency' })
+    )
+    await userEvent.click(screen.getByRole('option', { name: 'CNY' }))
+    expect(screen.queryByRole('textbox', { name: 'Reason' })).toBeNull()
+    for (const [label, mode, amount, value] of [
+      ['Add', 'add', '2', 1000000],
+      ['Subtract', 'subtract', '1', 500000],
+      ['Override', 'override', '0', 0],
+      ['Override', 'override', '-1', -500000],
+    ] as const) {
+      await userEvent.click(screen.getByRole('button', { name: label }))
+      await userEvent.type(
+        screen.getByRole('spinbutton', { name: 'Amount' }),
+        amount
+      )
+      await userEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+      await waitFor(() =>
+        expect(post).toHaveBeenLastCalledWith('/api/user/42/currency/CNY', {
+          mode,
+          value,
+          operation_id: expect.stringMatching(/^cny-[A-Za-z0-9_-]+$/),
+        })
+      )
+      await waitFor(() =>
+        expect(screen.getByRole('spinbutton', { name: 'Amount' })).toHaveValue(
+          null
+        )
+      )
+    }
+    const ids = post.mock.calls.map(
+      ([, payload]) => (payload as { operation_id: string }).operation_id
+    )
+    expect(new Set(ids).size).toBe(4)
+  } finally {
+    if (cryptoDescriptor) {
+      Object.defineProperty(globalThis, 'crypto', cryptoDescriptor)
+    }
+  }
+})
+
+it('reuses the CNY operation ID for a failed retry and creates a new one after success', async () => {
+  const wallet = {
+    currency: 'CNY',
+    quota: 5000000,
+    used_quota: 0,
+    quota_per_unit: 1000000,
+  }
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: wallet },
+  })
+  const post = vi
+    .spyOn(api, 'post')
+    .mockRejectedValueOnce(new Error('Response lost'))
+    .mockResolvedValue({ data: { success: true, data: wallet } })
+  const { onSuccess } = renderQuotaAdjustment()
+  await userEvent.click(
+    screen.getByRole('combobox', { name: 'Billing currency' })
+  )
+  await userEvent.click(screen.getByRole('option', { name: 'CNY' }))
+  await userEvent.type(screen.getByRole('spinbutton', { name: 'Amount' }), '2')
+  await userEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+  await waitFor(() => expect(post).toHaveBeenCalledTimes(1))
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeEnabled()
+  )
+  expect(screen.getByRole('spinbutton', { name: 'Amount' })).toHaveValue(2)
+  await userEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+  await waitFor(() => expect(onSuccess).toHaveBeenCalledTimes(1))
+  const first = post.mock.calls[0][1] as { operation_id: string }
+  expect(first).toMatchObject({ mode: 'add', value: 2000000 })
+  expect(post.mock.calls[1][1]).toEqual(first)
+  await userEvent.type(screen.getByRole('spinbutton', { name: 'Amount' }), '2')
+  await userEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+  await waitFor(() => expect(onSuccess).toHaveBeenCalledTimes(2))
+  expect(
+    (post.mock.calls[2][1] as { operation_id: string }).operation_id
+  ).not.toBe(first.operation_id)
 })

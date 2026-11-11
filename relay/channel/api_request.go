@@ -492,10 +492,12 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo, submis
 	if err := req.Context().Err(); err != nil {
 		return nil, err
 	}
+	if err := service.MarkCNYUpstreamPending(info, true); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+	}
 	if submissionStarted != nil {
 		submissionStarted(c)
 	}
-	service.MarkCNYUpstreamPending(info, true)
 	resp, err := relayClient.Do(req)
 	if err != nil {
 		logger.LogError(c, common2.LogText("do request failed: %s", err.Error()))

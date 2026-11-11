@@ -80,7 +80,7 @@ func TestFixedPriceBillingDatabaseMatrix(t *testing.T) {
 			model.DB, model.LOG_DB = db, logDB
 			common.SetDatabaseTypes(dialect.name, dialect.name)
 			t.Cleanup(func() { model.DB, model.LOG_DB = oldDB, oldLogDB; common.SetDatabaseTypes(oldMainType, oldLogType) })
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}))
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.CNYWallet{}, &model.WalletFundingRecord{}, &model.WalletExchangePolicy{}, &model.ExchangeRateObservation{}))
 			require.NoError(t, logDB.AutoMigrate(&model.Log{}))
 			versionQuery := "select version()"
 			if dialect.name == common.DatabaseTypeSQLite {
@@ -153,7 +153,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 			}
 			user := model.User{Username: fmt.Sprintf("fixed_billing_%d", index), Quota: quota, Status: common.UserStatusEnabled}
 			require.NoError(t, db.Create(&user).Error)
-			token := model.Token{UserId: user.Id, Key: fmt.Sprintf("fixed-billing-test-%d", index), Name: "fixed-billing", RemainQuota: startingQuota, Status: common.TokenStatusEnabled}
+			token := model.Token{UserId: user.Id, Key: fmt.Sprintf("fixed-billing-test-%d", index), Name: "fixed-billing", ExpiredTime: -1, RemainQuota: startingQuota, Status: common.TokenStatusEnabled}
 			require.NoError(t, db.Create(&token).Error)
 			channel := model.Channel{Name: "fixed-billing", Key: "unused", Status: common.ChannelStatusEnabled}
 			require.NoError(t, db.Create(&channel).Error)
@@ -924,6 +924,7 @@ func TestPostTextConsumeQuotaBillsOpenAI12hCacheWrites(t *testing.T) {
 	truncate(t)
 	const userID, channelID = 63, 63
 	seedUser(t, userID, 1_000_000)
+	seedToken(t, 63, userID, "cache-write-token", 1_000_000)
 	seedChannel(t, channelID)
 	gin.SetMode(gin.TestMode)
 	// The OpenAI prompt caching guide example at gpt-6-astra prices: $10 input,
@@ -947,6 +948,8 @@ func TestPostTextConsumeQuotaBillsOpenAI12hCacheWrites(t *testing.T) {
 			tc.price.GroupRatioInfo = hosttypes.GroupRatioInfo{GroupRatio: 1}
 			info := &relaycommon.RelayInfo{
 				UserId:          userID,
+				TokenId:         63,
+				TokenKey:        "cache-write-token",
 				OriginModelName: "gpt-6-astra",
 				UsingGroup:      "default",
 				StartTime:       time.Now(),

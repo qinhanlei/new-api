@@ -92,8 +92,8 @@ export function CommonLogMobileCard<TData>(props: {
       value:
         adjustment?.amount ??
         (other?.billing_status === 'reserved'
-          ? `${formatLogQuota(other.reserved_quota ?? 0, log.currency)} ${t('Reserved')}`
-          : formatLogQuota(log.quota, log.currency)),
+          ? `${formatLogQuota(other.reserved_quota ?? 0, log.currency, other?.quota_per_unit)} ${t('Reserved')}`
+          : formatLogQuota(log.quota, log.currency, other?.quota_per_unit)),
       visible: (displayable || !!adjustment) && props.cells.has('quota'),
     },
     time: {

@@ -74,10 +74,26 @@ export function useSidebarView(): ResolvedSidebarView {
   const view = resolveSidebarView(pathname)
 
   if (view) {
+    let navGroups = view.getNavGroups(t, badges)
+    if (view.id === 'system-settings' && userRole !== ROLE.SUPER_ADMIN) {
+      navGroups = navGroups
+        .map((group) => ({
+          ...group,
+          items:
+            userRole === ROLE.ADMIN
+              ? group.items.flatMap((item) =>
+                  (item.items ?? []).filter(
+                    (child) => child.url === '/system-settings/billing/currency'
+                  )
+                )
+              : [],
+        }))
+        .filter((group) => group.items.length > 0)
+    }
     return {
       key: view.id,
       view,
-      navGroups: view.getNavGroups(t, badges),
+      navGroups,
     }
   }
 

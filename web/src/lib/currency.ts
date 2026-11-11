@@ -22,12 +22,12 @@ For commercial licensing, please contact support@quantumnous.com
  * ============================================================================
  *
  * This module provides currency formatting utilities that handle the conversion
- * between system USD amounts, local currency, and token displays based on
- * admin-configured settings.
+ * between native billing amounts, optional reference currency displays, and
+ * payment amounts based on admin-configured settings.
  *
  * ## Key Concepts
  *
- * 1. **System USD**: Internal currency unit used throughout the system (e.g., 10 USD)
+ * 1. **Billing currency**: Original USD or CNY denomination of a wallet or model charge
  * 2. **Local Currency**: Admin-configured display currency (e.g., CNY, custom currency)
  * 3. **Exchange Rate (usdExchangeRate)**: Conversion rate from USD to local currency
  *    - Example: usdExchangeRate = 7 means 1 USD = 7 CNY
@@ -37,10 +37,11 @@ For commercial licensing, please contact support@quantumnous.com
  *
  * ## When to Use Each Function
  *
- * - `formatCurrencyFromUSD()`: Use for quota/balance display (stored as USD, converted for display)
- * - `formatBillingCurrencyFromUSD()`: Use for billing/pricing displays (never shows tokens)
+ * - `formatBillingQuota()`: Use for wallet, quota, and consumption amounts in their original currency
+ * - `formatCurrencyFromUSD()`: Use for converted payment/reference displays
+ * - `formatBillingCurrencyFromUSD()`: Use for reference pricing displays (never shows tokens)
  * - `formatLocalCurrencyAmount()`: Use for payment amounts already in local currency
- * - `formatQuotaWithCurrency()`: Use for raw quota values (converts to USD first)
+ * - `formatQuotaWithCurrency()`: Use for legacy reference quota displays (converts to USD first)
  *
  * ## Example Scenario
  *
@@ -56,26 +57,26 @@ For commercial licensing, please contact support@quantumnous.com
  * 2. Payment amount: 10 × 5 = 50 (already in CNY)
  *    - Display: formatLocalCurrencyAmount(50) → "¥50"
  * 3. User receives: 10 USD credit
- *    - Balance display: formatCurrencyFromUSD(10) → "¥70"
+ *    - Balance display: formatNativeMoney(10, 'USD') → "$10"
  *
  * ## Quick Reference Guide
  *
  * | Scenario | Input Type | Function to Use | Why |
  * |----------|-----------|-----------------|-----|
- * | User balance display | USD (from DB) | `formatCurrencyFromUSD()` | Needs conversion to display currency |
+ * | User balance display | Raw quota | `formatBillingQuota()` | Preserve the balance currency |
  * | Recharge option button | USD | `formatCurrencyFromUSD()` | Needs conversion to local currency |
  * | Payment confirmation | Already local currency | `formatLocalCurrencyAmount()` | Already converted via priceRatio |
  * | Billing history Amount | USD (from DB) | `formatCurrencyFromUSD()` | Historical USD needs conversion |
  * | Billing history Payment | Local currency | `formatNumber()` | Just show number, no symbol |
  * | Model pricing | USD | `formatBillingCurrencyFromUSD()` | Never show as tokens |
- * | Raw quota from API | Tokens | `formatQuotaWithCurrency()` | Convert tokens → USD → display |
+ * | Native quota from API | Quota units | `formatBillingQuota()` | Use the recorded currency and scale |
  *
  * ## Critical Rules
  *
  * 1. **Never double-convert**: If you multiply by exchangeRate, use formatLocalCurrencyAmount()
- * 2. **Database USD values**: Always use formatCurrencyFromUSD() for amounts stored as USD
+ * 2. **Accounting amounts**: Use native billing helpers; display FX must not change balances or consumption
  * 3. **Payment amounts**: Always use formatLocalCurrencyAmount() for priceRatio-calculated values
- * 4. **Billing displays**: Use formatBillingCurrencyFromUSD() to avoid token display
+ * 4. **Reference prices**: Use formatBillingCurrencyFromUSD() to avoid token display
  * 5. **Effective exchange rate**: When quotaDisplayType is 'USD', use rate of 1 regardless of config
  */
 import {
@@ -107,6 +108,38 @@ export interface CurrencyFormatOptions {
 
 export type BillingCurrency = 'USD' | 'CNY'
 
+function getBillingQuotaPerUnit(
+  currency: BillingCurrency,
+  quotaPerUnit?: number
+): number {
+  if (
+    quotaPerUnit != null &&
+    Number.isFinite(quotaPerUnit) &&
+    quotaPerUnit > 0
+  ) {
+    return quotaPerUnit
+  }
+  return currency === 'CNY' ? 500000 : getConfig().quotaPerUnit
+}
+
+/** Convert quota using its billing currency and, when available, frozen scale. */
+export function billingQuotaToAmount(
+  quota: number,
+  currency: BillingCurrency = 'USD',
+  quotaPerUnit?: number
+): number {
+  return quota / getBillingQuotaPerUnit(currency, quotaPerUnit)
+}
+
+export function billingAmountToQuota(
+  amount: number,
+  currency: BillingCurrency = 'USD',
+  quotaPerUnit?: number
+): number {
+  if (!Number.isFinite(amount)) return 0
+  return Math.round(amount * getBillingQuotaPerUnit(currency, quotaPerUnit))
+}
+
 /** Native balances and settled amounts must never depend on a display FX rate. */
 export function formatNativeMoney(
   amount: number | null | undefined,
@@ -126,11 +159,10 @@ export function formatBillingQuota(
   quota: number | null | undefined,
   currency: BillingCurrency = 'USD',
   options?: CurrencyFormatOptions,
-  quotaPerUnit = 500000
+  quotaPerUnit?: number
 ): string {
-  if (currency === 'USD') return formatQuotaWithCurrency(quota, options)
   return formatNativeMoney(
-    quota == null ? quota : quota / quotaPerUnit,
+    quota == null ? quota : billingQuotaToAmount(quota, currency, quotaPerUnit),
     currency,
     options
   )
@@ -402,8 +434,8 @@ export function getCurrencyDisplay() {
 /**
  * Format a USD amount according to the admin-configured display settings.
  *
- * This is the PRIMARY function for displaying quota/balance/credit amounts
- * that are stored in the system as USD values.
+ * Intended for converted reference and payment displays. Use native billing
+ * helpers for balances, quota inputs, and settled consumption.
  *
  * @param amountUSD - Amount in system USD units (e.g., user balance, quota)
  * @param options - Optional formatting configuration

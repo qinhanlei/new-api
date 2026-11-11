@@ -51,11 +51,19 @@ func WssHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.
 	}
 
 	usage, newAPIError := adaptor.DoResponse(c, nil, info)
+	realtimeUsage, _ := usage.(*dto.RealtimeUsage)
+	if realtimeUsage != nil {
+		if err := service.MarkCNYUpstreamPending(info, true); err != nil {
+			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+		}
+		service.PostWssConsumeQuota(c, info, info.UpstreamModelName, realtimeUsage, nil)
+	} else if newAPIError == nil && info.Billing != nil {
+		info.Billing.Refund(c)
+	}
 	if newAPIError != nil {
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
 	}
-	service.PostWssConsumeQuota(c, info, info.UpstreamModelName, usage.(*dto.RealtimeUsage), nil)
 	return nil
 }
