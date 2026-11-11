@@ -342,6 +342,9 @@ func migrateDB() error {
 	err := DB.AutoMigrate(
 		&Channel{},
 		&Token{},
+		&CNYWallet{},
+		&CNYTokenBudget{},
+		&CNYBillingRecord{},
 		&User{},
 		&UserSession{},
 		&AuthFlow{},

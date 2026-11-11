@@ -214,6 +214,63 @@ func TestLogExportRules(t *testing.T) {
 	})
 }
 
+func TestCNYLogEndpoints(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, _ := newAuditTestDatabase(t, "sqlite", "")
+	useLogExportDatabases(t, db, nil, common.DatabaseTypeSQLite, common.DatabaseTypeClickHouse)
+	require.NoError(t, db.AutoMigrate(&model.CNYBillingRecord{}))
+	now := time.Now().Unix()
+	require.NoError(t, db.Create(&[]model.CNYBillingRecord{
+		{Kind: model.CNYBillingRequest, RequestID: "own-cny", Currency: "CNY", QuotaPerUnit: model.CNYQuotaPerUnit, UserID: 1, Status: model.CNYBillingSettled, Quota: 10, CreatedAt: now - 10},
+		{Kind: model.CNYBillingRequest, RequestID: "other-cny", Currency: "CNY", QuotaPerUnit: model.CNYQuotaPerUnit, UserID: 2, Status: model.CNYBillingSettled, Quota: 20, CreatedAt: now - 20},
+		{Kind: model.CNYBillingRequest, RequestID: "old-cny", Currency: "CNY", QuotaPerUnit: model.CNYQuotaPerUnit, UserID: 1, Status: model.CNYBillingSettled, Quota: 30, CreatedAt: now - 400*24*3600},
+	}).Error)
+	setting := operation_setting.GetLogSetting()
+	previous := *setting
+	setting.UserExportEnabled, setting.MaxRangeDays = true, 365
+	t.Cleanup(func() { *setting = previous })
+	query := fmt.Sprintf("currency=CNY&start_timestamp=%d&end_timestamp=%d&user_id=2&username=other", now-100, now)
+	listed := callLogHandler(t, GetUserLogs, 1, common.RoleCommonUser, query)[0]
+	require.Equal(t, true, listed["success"])
+	data := listed["data"].(map[string]any)
+	assert.Equal(t, float64(1), data["total"])
+	items := data["items"].([]any)
+	require.Len(t, items, 1)
+	assert.Equal(t, "CNY", items[0].(map[string]any)["currency"])
+	assert.Equal(t, "own-cny", items[0].(map[string]any)["request_id"])
+	stat := callLogHandler(t, GetLogsSelfStat, 1, common.RoleCommonUser, query)[0]
+	require.Equal(t, true, stat["success"])
+	assert.Equal(t, float64(10), stat["data"].(map[string]any)["quota"])
+	assert.Equal(t, "CNY", stat["data"].(map[string]any)["currency"])
+	all := callLogHandler(t, GetLogsStat, 3, common.RoleAdminUser, fmt.Sprintf("currency=CNY&start_timestamp=%d", now-100))[0]
+	require.Equal(t, true, all["success"])
+	assert.Equal(t, float64(30), all["data"].(map[string]any)["quota"])
+	lines := callLogHandler(t, ExportUserLogs, 1, common.RoleCommonUser, query)
+	require.Len(t, lines, 2)
+	assert.Equal(t, "own-cny", lines[0]["request_id"])
+	assert.Equal(t, "CNY", lines[0]["currency"])
+	assert.Equal(t, map[string]any{"success": true, "message": "", "data": map[string]any{"count": float64(1)}}, lines[1])
+	tooLong := fmt.Sprintf("currency=CNY&start_timestamp=%d", now-366*24*3600)
+	for _, handler := range []gin.HandlerFunc{GetUserLogs, GetLogsSelfStat, ExportUserLogs} {
+		assert.Equal(t, "The time range cannot exceed {{days}} days", callLogHandler(t, handler, 1, common.RoleCommonUser, tooLong)[0]["message_key"])
+	}
+	release, acquired, err := service.AcquireLogExportLock(1)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	defer release()
+	assert.Equal(t, "Another log export is running. Try again after it finishes.", callLogHandler(t, ExportUserLogs, 1, common.RoleCommonUser, query)[0]["message_key"])
+	for _, handler := range []gin.HandlerFunc{GetAllLogs, GetUserLogs, GetLogsStat, GetLogsSelfStat, ExportAllLogs, ExportUserLogs} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/api/log?currency=EUR", nil)
+		ctx.Set("id", 1)
+		ctx.Set("role", common.RoleRootUser)
+		handler(ctx)
+		assert.Equal(t, http.StatusBadRequest, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), "Unsupported billing currency")
+	}
+}
+
 func TestAcquireLogExportLock(t *testing.T) {
 	for _, useRedis := range []bool{false, true} {
 		t.Run(fmt.Sprintf("redis=%v", useRedis), func(t *testing.T) {

@@ -56,7 +56,7 @@ export function PricingCurrencySelector(props: {
   return (
     <Field className='mb-4 gap-2'>
       <div className='flex items-center gap-1'>
-        <FieldLabel htmlFor={id}>{t('Pricing currency')}</FieldLabel>
+        <FieldLabel htmlFor={id}>{t('USD display currency')}</FieldLabel>
         <Dialog
           title={t('About pricing currency')}
           contentClassName='sm:max-w-lg'
@@ -73,7 +73,7 @@ export function PricingCurrencySelector(props: {
         >
           <p className='text-sm'>
             {t(
-              'The system always bills in USD. Site currency makes entering and converting prices easier; amounts are converted to USD using the site exchange rate. Switching currencies does not change the actual price. Raw billing expressions always use USD.'
+              'This setting only converts USD price inputs and previews using the site exchange rate. It does not change the billing currency. CNY prices, balances and consumption are shown directly in CNY.'
             )}
           </p>
           {available && props.siteCurrency && (

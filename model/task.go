@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -34,13 +35,14 @@ func (t TaskStatus) ToVideoStatus() string {
 }
 
 const (
-	TaskStatusNotStart   TaskStatus = "NOT_START"
-	TaskStatusSubmitted             = "SUBMITTED"
-	TaskStatusQueued                = "QUEUED"
-	TaskStatusInProgress            = "IN_PROGRESS"
-	TaskStatusFailure               = "FAILURE"
-	TaskStatusSuccess               = "SUCCESS"
-	TaskStatusUnknown               = "UNKNOWN"
+	TaskStatusNotStart       TaskStatus = "NOT_START"
+	TaskStatusSubmitted                 = "SUBMITTED"
+	TaskStatusQueued                    = "QUEUED"
+	TaskStatusInProgress                = "IN_PROGRESS"
+	TaskStatusFailure                   = "FAILURE"
+	TaskStatusSuccess                   = "SUCCESS"
+	TaskStatusUnknown                   = "UNKNOWN"
+	TaskStatusAwaitingReview            = "AWAITING_REVIEW"
 )
 
 // TaskRefundLegacyCutoff separates tasks created before timeout refunds were
@@ -66,9 +68,18 @@ type Task struct {
 	Progress   string                `json:"progress" gorm:"type:varchar(20);index"`
 	Properties Properties            `json:"properties" gorm:"type:json"`
 	Username   string                `json:"username,omitempty" gorm:"-"`
+	Currency   string                `json:"currency" gorm:"-"`
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
+}
+
+func (t *Task) AfterFind(_ *gorm.DB) error {
+	t.Currency = "USD"
+	if billing := t.PrivateData.BillingContext; billing != nil && billing.TieredSnapshot != nil {
+		t.Currency = billing.TieredSnapshot.BillingCurrency()
+	}
+	return nil
 }
 
 func (t *Task) SetData(data any) {
@@ -366,7 +377,7 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	var tasks []*Task
 	err := DB.Where("progress != ?", "100%").
-		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
+		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess, TaskStatusAwaitingReview}).
 		Where("submit_time < ?", cutoffUnix).
 		Order("submit_time").
 		Limit(limit).
@@ -381,7 +392,7 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var tasks []*Task
 	var err error
 	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
+	err = DB.Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Where("status != ?", TaskStatusAwaitingReview).Limit(limit).Order("id").Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
@@ -397,7 +408,7 @@ func HasUnfinishedSyncTasks() bool {
 	err := DB.Model(&Task{}).
 		Where("progress != ?", "100%").
 		Where("status != ?", TaskStatusFailure).
-		Where("status != ?", TaskStatusSuccess).
+		Where("status != ?", TaskStatusSuccess).Where("status != ?", TaskStatusAwaitingReview).
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0

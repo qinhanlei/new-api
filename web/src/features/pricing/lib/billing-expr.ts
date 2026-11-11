@@ -27,6 +27,8 @@ For commercial licensing, please contact support@quantumnous.com
  * stay intact; executable custom expressions do not imply fixed unit prices.
  */
 
+import { splitBillingCurrency } from '@/lib/billing-currency'
+
 import type { BillingUsageSchema } from '../types'
 import {
   readTokenTierChain,
@@ -616,7 +618,8 @@ export function splitBillingExprAndRequestRules(expr: string): {
   const trimmed = (expr || '').trim()
   if (!trimmed) return { billingExpr: '', requestRuleExpr: '' }
 
-  const parts = splitTopLevelMultiply(trimmed)
+  const { prefix, body } = splitBillingCurrency(trimmed)
+  const parts = splitTopLevelMultiply(body)
   if (parts.length <= 1) return { billingExpr: trimmed, requestRuleExpr: '' }
 
   const ruleParts: string[] = []
@@ -643,7 +646,7 @@ export function splitBillingExprAndRequestRules(expr: string): {
   }
 
   return {
-    billingExpr: baseParts.map(unwrapOuterParens).join(' * '),
+    billingExpr: prefix + baseParts.map(unwrapOuterParens).join(' * '),
     requestRuleExpr: ruleParts.join(' * '),
   }
 }
@@ -656,7 +659,8 @@ export function combineBillingExpr(
   const rules = (requestRuleExpr || '').trim()
   if (!base) return ''
   if (!rules) return base
-  return `(${base}) * ${rules}`
+  const { prefix, body } = splitBillingCurrency(base)
+  return `${prefix}(${body}) * ${rules}`
 }
 
 // ---------------------------------------------------------------------------

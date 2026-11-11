@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -36,6 +37,7 @@ type submitEventStream struct {
 // the plugin did not see the end of the vendor's work, so its usage cannot
 // lower the reserved charge, and the client's stream is cut off rather than
 // closed. A result that invalid changes left half applied is never published.
+// CNY requires explicit completion; a clean EOF alone leaves its charge pending.
 func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Response, driverContext map[string]any, stream submitEventStream) (_ any, stopped bool, _ error) {
 	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	if err != nil || mediaType != "text/event-stream" {
@@ -182,6 +184,9 @@ func (a *TaskAdaptor) readSubmitEvents(parent context.Context, resp *http.Respon
 	}
 	if !completed && readErr == nil && scanner.Err() != nil {
 		readErr = fmt.Errorf("read task submit stream: %w", scanner.Err())
+	}
+	if !completed && readErr == nil && service.IsCNYBilling(a.info) {
+		readErr = fmt.Errorf("task submit stream ended before the plugin reported completion")
 	}
 	result := state
 	if accumulated != nil {

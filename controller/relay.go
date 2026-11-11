@@ -228,7 +228,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		service.RecordPolicyFailure(c, channel.Id, newAPIError, decision)
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
 
-		if decision.Action != "retry" {
+		if decision.Action != "retry" || service.CNYUpstreamPending(relayInfo) {
 			break
 		}
 	}
@@ -636,7 +636,7 @@ func executeTaskSubmissionWith(
 				relayInfo)
 		}
 
-		willRetry := decision.Action == "retry"
+		willRetry := decision.Action == "retry" && !service.CNYUpstreamPending(relayInfo)
 		diagnostics.attemptFailed(retryParam.GetRetry()+1, channel, taskErr, willRetry)
 		if !willRetry {
 			break
@@ -668,7 +668,7 @@ func executeTaskSubmissionWith(
 	// after the barrier normally has a zero positive delta. A relayed event
 	// stream is billed even when this reserve fails: settlement then charges
 	// past the available quota, as it does for any usage above its reservation.
-	if relayInfo.Billing != nil {
+	if relayInfo.Billing != nil && !service.IsCNYBilling(relayInfo) {
 		stage = "reserve"
 		diagnostics.reserve("reserve_start", result.Quota)
 		if reserveErr := relayInfo.Billing.Reserve(result.Quota); reserveErr != nil {
@@ -690,6 +690,9 @@ func executeTaskSubmissionWith(
 	stage = "insert"
 	task := model.InitTask(result.Platform, relayInfo)
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
+	if service.IsCNYBilling(relayInfo) {
+		task.PrivateData.Execution.RequestID = relayInfo.RequestId
+	}
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 	task.PrivateData.BillingSource = relayInfo.BillingSource
 	task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
@@ -716,7 +719,7 @@ func executeTaskSubmissionWith(
 		if immediate.Status == model.TaskStatusSuccess || immediate.Status == model.TaskStatusFailure {
 			task.FinishTime = time.Now().Unix()
 		}
-		if immediate.Status == model.TaskStatusFailure {
+		if immediate.Status == model.TaskStatusFailure || immediate.Status == model.TaskStatusAwaitingReview {
 			task.FailReason = immediate.Reason
 		}
 		if immediate.Url != "" {
@@ -753,13 +756,23 @@ func executeTaskSubmissionWith(
 		}
 	}
 	diagnostics.insertStart(task)
-	if insertErr := task.InsertWithContext(c.Request.Context(), insertOmits...); insertErr != nil {
+	var insertErr error
+	if service.IsCNYBilling(relayInfo) {
+		var final *model.CNYTaskSettlement
+		if immediateTerminal {
+			final = &model.CNYTaskSettlement{Quota: result.Quota, Refund: task.Status == model.TaskStatusFailure, Usage: service.CNYTaskUsage(task, relayInfo.QuotaClamp)}
+		}
+		insertErr = model.InsertCNYTask(c.Request.Context(), task, final, insertOmits...)
+	} else {
+		insertErr = task.InsertWithContext(c.Request.Context(), insertOmits...)
+	}
+	if insertErr != nil {
 		common.SysError(common.LogText("insert task error: %s", insertErr.Error()))
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
 		diagnostics.failed("insert", "database_error", taskErr, false)
 		// The client of a relayed event stream already holds the vendor's
 		// work, so it is settled and logged without a task row.
-		if c.Writer.Written() {
+		if c.Writer.Written() && !service.IsCNYBilling(relayInfo) {
 			if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
 				common.SysError(common.LogText("settle task billing error: %s", settleErr.Error()))
 				return nil, taskErr
@@ -782,11 +795,13 @@ func executeTaskSubmissionWith(
 	diagnostics.durable(task)
 	diagnostics.settleStart(task, result.Quota)
 
-	if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
-		common.SysError(common.LogText("settle task billing error: %s", settleErr.Error()))
-		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to settle task billing"), "task_billing_settlement_failed", http.StatusInternalServerError)
-		diagnostics.failed("settle", "billing_error", taskErr, true)
-		return nil, taskErr
+	if !service.IsCNYBilling(relayInfo) {
+		if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+			common.SysError(common.LogText("settle task billing error: %s", settleErr.Error()))
+			taskErr = service.TaskErrorWrapperLocal(errors.New("failed to settle task billing"), "task_billing_settlement_failed", http.StatusInternalServerError)
+			diagnostics.failed("settle", "billing_error", taskErr, true)
+			return nil, taskErr
+		}
 	}
 	perfmetrics.RecordImmediateTaskResult(relayInfo, result.Immediate)
 	if task.Status != model.TaskStatusFailure {

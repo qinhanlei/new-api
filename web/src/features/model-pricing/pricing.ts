@@ -31,6 +31,7 @@ import {
   type ModelPricingSnapshot,
   type ModelRow,
 } from '@/features/system-settings/models/model-pricing-snapshots'
+import { billingExpressionCurrency } from '@/lib/billing-currency'
 
 import type { ModelPricingEntry } from './api'
 
@@ -277,6 +278,24 @@ export function applyPricingDraft(
   if (names.length === 1 && names[0] === data.name) {
     return applyPricingValues(options, values, names)
   }
+  const currentModels = pricingValuesByModel(options)
+  for (const name of names) {
+    const current = currentModels.get(name)
+    const currentExpression = current?.['billing_setting.billing_expr']
+    if (
+      name !== data.name &&
+      current &&
+      billingExpressionCurrency(
+        typeof currentExpression === 'string' ? currentExpression : ''
+      ) !== billingExpressionCurrency(data.billingExpr)
+    ) {
+      throw new Error(
+        t(
+          'Cannot copy prices across billing currencies. Edit the target model billing currency explicitly.'
+        )
+      )
+    }
+  }
   // Provider bindings belong to each model. Copy only the shared model price
   // to other models, while still committing the source provider draft.
   const copied = { ...values }
@@ -366,7 +385,25 @@ export function applyPriceSyncSelections(
   selections: Record<string, Record<string, number | string>>
 ): PricingOptions {
   let result = options
+  const currentModels = pricingValuesByModel(options)
   for (const [name, fields] of Object.entries(selections)) {
+    const current = currentModels.get(name)
+    const currentExpression = current?.['billing_setting.billing_expr']
+    if (
+      current &&
+      billingExpressionCurrency(
+        typeof currentExpression === 'string' ? currentExpression : ''
+      ) !==
+        billingExpressionCurrency(
+          typeof fields.billing_expr === 'string' ? fields.billing_expr : ''
+        )
+    ) {
+      throw new Error(
+        t(
+          'Cannot sync prices across billing currencies. Edit the model billing currency explicitly.'
+        )
+      )
+    }
     const next: PricingValues = {}
     const expression =
       typeof fields.billing_expr === 'string' &&

@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -11,8 +13,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"net/http"
-	"net/http/httptest"
 )
 
 func TestPricingSyncExpressionPriority(t *testing.T) {
@@ -28,6 +28,8 @@ func TestPricingSyncExpressionPriority(t *testing.T) {
 		{"expression imports without legacy conflicts", map[string]any{"model_ratio": map[string]float64{"m": 1}}, map[string]any{"billing_mode": map[string]string{"m": "tiered_expr"}, "billing_expr": map[string]string{"m": expression}, "model_ratio": map[string]float64{"m": 3}, "model_price": map[string]float64{"m": 2}}, []string{"billing_mode", "billing_expr"}},
 		{"inactive expression follows explicit ratio mode", map[string]any{"model_ratio": map[string]float64{"m": 1}}, map[string]any{"billing_mode": map[string]string{"m": "ratio"}, "billing_expr": map[string]string{"m": expression}, "model_ratio": map[string]float64{"m": 3}}, []string{"model_ratio"}},
 		{"empty active expression never imports a false free price", map[string]any{}, map[string]any{"billing_mode": map[string]string{"m": "tiered_expr"}, "billing_expr": map[string]string{"m": " "}, "model_ratio": map[string]float64{"m": 0}}, nil},
+		{"unknown native currency is not imported as USD", map[string]any{}, map[string]any{"billing_mode": map[string]string{"m": "tiered_expr"}, "billing_expr": map[string]string{"m": "v2:EUR:p * 2"}}, nil},
+		{"unknown expression version is not imported", map[string]any{}, map[string]any{"billing_mode": map[string]string{"m": "tiered_expr"}, "billing_expr": map[string]string{"m": "v3:CNY:p * 2"}}, nil},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -42,6 +44,75 @@ func TestPricingSyncExpressionPriority(t *testing.T) {
 			assert.ElementsMatch(t, tt.wantFields, fields)
 		})
 	}
+}
+
+func TestPricingSyncPreservesNativeCurrency(t *testing.T) {
+	before := config.GlobalConfig.ExportAllConfigs()
+	oldRatios := ratio_setting.ModelRatio2JSONString()
+	t.Cleanup(func() {
+		config.UpdateConfigFromMap(config.GlobalConfig.Get("billing_setting"), map[string]string{"billing_mode": before["billing_setting.billing_mode"], "billing_expr": before["billing_setting.billing_expr"]})
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(oldRatios))
+	})
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"sync-usd-native-test":1}`))
+	config.UpdateConfigFromMap(config.GlobalConfig.Get("billing_setting"), map[string]string{
+		"billing_mode": `{"sync-cny-native-test":"tiered_expr"}`,
+		"billing_expr": `{"sync-cny-native-test":"v2:CNY:p * 2"}`,
+	})
+	sources := map[string][]map[string]any{
+		"usd": {
+			{"model_name": "sync-cny-native-test", "currency": "USD", "billing_mode": "tiered_expr", "billing_expr": "v2:USD:p * 4"},
+			{"model_name": "sync-usd-native-test", "model_ratio": 2},
+		},
+		"cny": {
+			{"model_name": "sync-cny-native-test", "currency": "CNY", "billing_mode": "tiered_expr", "billing_expr": "v2:CNY:p * 4"},
+			{"model_name": "sync-usd-native-test", "currency": "CNY", "billing_mode": "tiered_expr", "billing_expr": "v2:CNY:p * 8"},
+			{"model_name": "sync-new-native-test", "billing_mode": "tiered_expr", "billing_expr": "v2:CNY:p * 3"},
+		},
+		"mismatched": {{"model_name": "sync-cny-native-test", "currency": "USD", "billing_mode": "tiered_expr", "billing_expr": "v2:CNY:p * 4"}},
+		"unknown":    {{"model_name": "sync-cny-native-test", "currency": "CNY", "billing_mode": "tiered_expr", "billing_expr": "v3:CNY:p * 4"}},
+		"legacy-cny": {{"model_name": "sync-cny-native-test", "currency": "CNY", "model_ratio": 2}},
+	}
+	encodedSources := make(map[string][]byte, len(sources))
+	for name, data := range sources {
+		encoded, err := common.Marshal(map[string]any{"success": true, "data": data})
+		require.NoError(t, err)
+		encodedSources["/"+name] = encoded
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(encodedSources[r.URL.Path])
+	}))
+	defer server.Close()
+	upstreams := make([]map[string]any, 0, len(sources))
+	for name := range sources {
+		upstreams = append(upstreams, map[string]any{"name": name, "base_url": server.URL, "endpoint": "/" + name})
+	}
+	var response struct {
+		Success bool
+		Data    struct {
+			Differences map[string]map[string]dto.DifferenceItem
+			Prices      map[string]struct {
+				Upstreams map[string]map[string]any
+			}
+			TestResults []dto.TestResult `json:"test_results"`
+		}
+	}
+	recorder := modelManagementRequest(t, FetchUpstreamRatios, http.MethodPost, "/api/ratio_sync/fetch", map[string]any{"upstreams": upstreams, "include_unchanged": true}, &response)
+	require.True(t, response.Success, recorder.Body.String())
+	require.Len(t, response.Data.TestResults, len(sources))
+	for _, result := range response.Data.TestResults {
+		if result.Name == "usd" || result.Name == "cny" {
+			assert.Equal(t, "success", result.Status, result.Name)
+			continue
+		}
+		assert.Equal(t, "error", result.Status, result.Name)
+		assert.Contains(t, result.Error, "currency", result.Name)
+	}
+	assert.Equal(t, map[string]map[string]any{"cny": {"billing_mode": "tiered_expr", "billing_expr": "v2:CNY:p * 4"}}, response.Data.Prices["sync-cny-native-test"].Upstreams)
+	assert.Equal(t, map[string]any{"cny": "v2:CNY:p * 4"}, response.Data.Differences["sync-cny-native-test"]["billing_expr"].Upstreams)
+	assert.Equal(t, map[string]map[string]any{"usd": {"billing_mode": "ratio", "model_ratio": float64(2)}}, response.Data.Prices["sync-usd-native-test"].Upstreams)
+	assert.Equal(t, map[string]any{"usd": float64(2)}, response.Data.Differences["sync-usd-native-test"]["model_ratio"].Upstreams)
+	assert.Equal(t, "v2:CNY:p * 3", response.Data.Prices["sync-new-native-test"].Upstreams["cny"]["billing_expr"])
 }
 
 func TestRatioConfigExportsEffectiveExpressions(t *testing.T) {

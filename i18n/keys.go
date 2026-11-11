@@ -246,3 +246,17 @@ const (
 	MsgAssetPortraitVerificationRequired   = "asset.portrait_verification_required"
 	MsgAssetPortraitChannelConflict        = "asset.portrait_channel_conflict"
 )
+
+// Native billing currency admission errors returned to API clients.
+const (
+	MsgBillingCurrencyRetryMismatch      = "billing.currency_retry_mismatch"
+	MsgBillingUSDTokenExhausted          = "billing.usd_token_exhausted"
+	MsgBillingCurrencyUnsupported        = "billing.currency_unsupported"
+	MsgBillingCNYWalletOnly              = "billing.cny_wallet_only"
+	MsgBillingCNYRequestUnsupported      = "billing.cny_request_unsupported"
+	MsgBillingCNYPaidToolsUnsupported    = "billing.cny_paid_tools_unsupported"
+	MsgBillingCNYViolationFeeUnsupported = "billing.cny_violation_fee_unsupported"
+	MsgBillingCNYUnavailable             = "billing.cny_unavailable"
+	MsgBillingCNYInsufficientWallet      = "billing.cny_insufficient_wallet"
+	MsgBillingCNYInsufficientToken       = "billing.cny_insufficient_token"
+)

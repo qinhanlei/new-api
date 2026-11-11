@@ -137,6 +137,11 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+	if service.IsCNYBilling(info) {
+		if apiErr := service.ValidateBillingCurrency(c, info); apiErr != nil {
+			return nil, apiErr
+		}
+	}
 	switch info.ChannelOtherSettings.AwsApiType {
 	case dto.AwsApiTypeMantle:
 		req, err := a.newMantleRequest(c, info, requestBody)

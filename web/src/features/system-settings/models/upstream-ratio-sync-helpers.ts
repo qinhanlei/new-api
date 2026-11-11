@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { createContext, useContext } from 'react'
 
 import {
+  CNY_PRICING_CURRENCY,
   formatPricingAmount,
   USD_PRICING_CURRENCY,
   type PricingCurrency,
@@ -28,6 +29,7 @@ import {
   splitBillingExprAndRequestRules,
 } from '@/features/pricing/lib/billing-expr'
 import { tryParseVisualConfig } from '@/features/pricing/lib/tier-expr'
+import { billingExpressionCurrency } from '@/lib/billing-currency'
 
 import type { PricingSyncValues } from '../types'
 import {
@@ -163,6 +165,9 @@ export function getSyncExpressionPricing(
   t: (key: string) => string,
   currency = USD_PRICING_CURRENCY
 ) {
+  if (billingExpressionCurrency(expression) === 'CNY') {
+    currency = CNY_PRICING_CURRENCY
+  }
   const { billingExpr, requestRuleExpr } =
     splitBillingExprAndRequestRules(expression)
   const config = tryParseVisualConfig(billingExpr)
@@ -215,6 +220,9 @@ export function describeSyncPrice(
 ): string {
   const kind = getSyncPriceKind(values)
   if (kind === 'expression') {
+    if (billingExpressionCurrency(String(values.billing_expr)) === 'CNY') {
+      currency = CNY_PRICING_CURRENCY
+    }
     const parsed = getSyncExpressionPricing(
       String(values.billing_expr),
       t,

@@ -49,7 +49,9 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { BillingCurrencySelector } from '@/features/model-pricing/billing-currency-selector'
 import {
+  CNY_PRICING_CURRENCY,
   formatPricingAmount,
   USD_PRICING_CURRENCY,
   type PricingCurrency,
@@ -95,6 +97,7 @@ import {
   exprUsesExtraVars,
   generateExprFromVisualConfig,
 } from '@/features/pricing/lib/tier-expr'
+import { billingExpressionCurrency } from '@/lib/billing-currency'
 import { cn } from '@/lib/utils'
 
 import {
@@ -1064,7 +1067,7 @@ function parseTierEditorDocument(source: string): VisualBillingDocument | null {
 }
 
 export const TieredPricingEditor = memo(function TieredPricingEditor({
-  currency = USD_PRICING_CURRENCY,
+  currency: displayCurrency = USD_PRICING_CURRENCY,
   modelName,
   billingExpr: currentExpr,
   requestRuleExpr: currentRequestRuleExpr,
@@ -1080,6 +1083,10 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
     visualDocument ? 'visual' : 'raw'
   )
   const [baseExpr, setBaseExpr] = useState(currentExpr)
+  const currency =
+    billingExpressionCurrency(baseExpr) === 'CNY'
+      ? CNY_PRICING_CURRENCY
+      : displayCurrency
   const [ruleExpr, setRuleExpr] = useState(currentRequestRuleExpr)
   const [rawExpr, setRawExpr] = useState(() =>
     combineBillingExpr(currentExpr, currentRequestRuleExpr)
@@ -1160,6 +1167,14 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
 
   const applyPreset = useCallback(
     (preset: Preset) => {
+      if (billingExpressionCurrency(baseExpr) === 'CNY') {
+        toast.error(
+          t(
+            'USD presets cannot replace CNY prices. Switch billing currency first.'
+          )
+        )
+        return
+      }
       const groups = preset.requestRules || []
       const rules = buildRequestRuleExpr(groups)
       const document = parseTierEditorDocument(preset.expr)
@@ -1172,7 +1187,7 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
       onBillingExprChange(preset.expr)
       onRequestRuleExprChange(rules)
     },
-    [onBillingExprChange, onRequestRuleExprChange]
+    [baseExpr, onBillingExprChange, onRequestRuleExprChange, t]
   )
 
   const handleRuleGroupsChange = useCallback(
@@ -1187,6 +1202,15 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
 
   return (
     <div className='space-y-5' data-billing-invalid={invalidDraft || undefined}>
+      <BillingCurrencySelector
+        expression={baseExpr}
+        defaultExpression='tier("base", p * 0 + c * 0)'
+        onChange={(expression) => {
+          handleRawChange(expression)
+          setVisualDocument(parseTierEditorDocument(expression))
+          setRequestRuleGroups([])
+        }}
+      />
       <div className='grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end'>
         <Field className='gap-2'>
           <FieldLabel>{t('Editor mode')}</FieldLabel>
@@ -1224,7 +1248,7 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
 
       <p className='text-muted-foreground text-xs'>
         {t(
-          'Raw expressions and presets use USD. Currency selection only converts visual price inputs and monetary previews.'
+          'Raw expressions use the billing currency. USD prices may use the display currency conversion; CNY prices are entered directly.'
         )}
       </p>
       <PresetSection applyPreset={applyPreset} />

@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { billingExpressionCurrency } from '@/lib/billing-currency'
 import { getCurrencyLabel } from '@/lib/currency'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
@@ -50,7 +51,7 @@ export function ModelPriceCell(props: {
 }) {
   const { t, i18n } = useTranslation()
   const currency = useSystemConfigStore((state) => state.config.currency)
-  const currencyLabel =
+  const displayCurrencyLabel =
     currency.quotaDisplayType === 'TOKENS' ? 'USD' : getCurrencyLabel()
   const options = props.options ?? {}
   const tokenUnit = options.tokenUnit ?? DEFAULT_TOKEN_UNIT
@@ -83,17 +84,28 @@ export function ModelPriceCell(props: {
       currency,
     ]
   )
-  let metrics: Array<{ label: string; value: string }>
+  const billingCurrencies = new Set(
+    dynamic?.entries.map((entry) => entry.billingCurrency ?? 'USD') ?? [
+      billingExpressionCurrency(props.model.billing_expr),
+    ]
+  )
+  const mixedCurrencies = billingCurrencies.size > 1
+  const currencyLabel = billingCurrencies.has('CNY')
+    ? 'CNY'
+    : displayCurrencyLabel
+  let metrics: Array<{ key?: string; label: string; value: string }>
   const providerCaption = dynamic?.providerCount
     ? t('{{count}} providers', { count: dynamic.providerCount })
     : ''
   const unconfiguredCaption = dynamic?.hasUnconfiguredProviders
     ? t('Not configured for some providers')
     : ''
-  let caption = t('{{currency}} / {{unit}} tokens', {
-    currency: currencyLabel,
-    unit: tokenUnitLabel,
-  })
+  let caption = mixedCurrencies
+    ? t('{{unit}} tokens', { unit: tokenUnitLabel })
+    : t('{{currency}} / {{unit}} tokens', {
+        currency: currencyLabel,
+        unit: tokenUnitLabel,
+      })
 
   if (dynamic) {
     if (dynamic.isSpecialExpression) {
@@ -133,12 +145,16 @@ export function ModelPriceCell(props: {
         if (hasRequestPrice && entry.unit === 'token') {
           suffix = `/${t('{{unit}} tokens', { unit: tokenUnitLabel })}`
         }
+        const entryCurrencyLabel =
+          entry.billingCurrency === 'CNY' ? 'CNY' : displayCurrencyLabel
+        const amount = `${entry.formattedRange ?? entry.formatted}${suffix}`
         return {
+          key: entry.key,
           label:
             entry.labelKind === 'schema'
               ? entry.shortLabel
               : t(entry.shortLabel),
-          value: `${entry.formattedRange ?? entry.formatted}${suffix}`,
+          value: mixedCurrencies ? `${entryCurrencyLabel} ${amount}` : amount,
         }
       })
     if (metrics.length === 0) {
@@ -157,16 +173,20 @@ export function ModelPriceCell(props: {
         </span>
       )
     }
-    if (dynamic.isTaskUsage || hasRequestPrice) caption = currencyLabel
-    if (dynamic.isTimePricing) caption += ` · ${t('Current period price')}`
-    if (dynamic.isMixedBilling) {
-      caption += ` · ${t('Token or per-call pricing')}`
+    if (dynamic.isTaskUsage || hasRequestPrice) {
+      caption = mixedCurrencies ? '' : currencyLabel
     }
-    if (providerCaption) caption += ` · ${providerCaption}`
-    if (unconfiguredCaption) caption += ` · ${unconfiguredCaption}`
-    if (dynamic.tierCount > 1) {
-      caption += ` · ${t('{{count}} tiers', { count: dynamic.tierCount })}`
-    }
+    caption = [
+      caption,
+      dynamic.isTimePricing && t('Current period price'),
+      dynamic.isMixedBilling && t('Token or per-call pricing'),
+      providerCaption,
+      unconfiguredCaption,
+      dynamic.tierCount > 1 &&
+        t('{{count}} tiers', { count: dynamic.tierCount }),
+    ]
+      .filter(Boolean)
+      .join(' · ')
   } else {
     if (isUnconfiguredTaskUsageModel(props.model)) {
       return (
@@ -240,7 +260,7 @@ export function ModelPriceCell(props: {
       >
         {metrics.map((metric) => (
           <span
-            key={metric.label}
+            key={metric.key ?? metric.label}
             className='flex min-w-0 flex-col items-start gap-y-0.5 sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-1.5'
           >
             <span

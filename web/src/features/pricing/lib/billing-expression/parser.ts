@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { splitBillingCurrency } from '@/lib/billing-currency'
+
 import {
   BILLING_FUNCTIONS,
   BILLING_VARIABLES,
@@ -68,13 +70,13 @@ class BillingParser {
       })
     }
     const version = source.match(/^\s*v(\d+):/)
-    if (version && version[1] !== '1') {
+    if (version && version[1] !== '1' && !/^\s*v2:(USD|CNY):/.test(source)) {
       throw new BillingExpressionError({
         code: 'unsupported',
         detail: version[0],
       })
     }
-    if (version) this.cursor = version[0].length
+    if (version) this.cursor = splitBillingCurrency(source).prefix.length
     this.current = this.next()
   }
 
@@ -523,7 +525,8 @@ export function compileBillingExpression(source: string): CompilationResult {
     }
     result = {
       status: 'ready',
-      version: 1,
+      version: splitBillingCurrency(source).version,
+      currency: splitBillingCurrency(source).currency,
       source,
       ast,
       ...dependencies,

@@ -12,11 +12,11 @@ The expression is the billing contract between the administrator and the system.
 
 2. **Variables are opt-in** — `p` (prompt) and `c` (completion) are the base. Cache (`cr`, `cc`, `cc1h`, `cc12h`), image (`img`), and audio (`ai`, `ao`) variables are optional. If omitted, those tokens are included in `p`/`c` and priced at their rate; an omitted long-lived cache write keeps its fixed multiple of the short write price. The system automatically detects which variables the expression uses (via AST introspection) and adjusts token normalization accordingly.
 
-3. **Prices are real prices** — Token coefficients are actual $/1M tokens prices as published by providers. `p * 2.5` means $2.50 per 1M prompt tokens; `fixed(0.01)` means $0.01 per request. No ratio conversion or `/2` convention is required.
+3. **Prices are real prices** — Token coefficients are actual prices per 1M tokens in the expression's currency. `p * 2.5` means USD 2.50 per 1M prompt tokens; `v2:CNY:p * 2.5` means CNY 2.50 per 1M prompt tokens. `fixed(0.01)` charges 0.01 of the same currency per request. No exchange-rate conversion or `/2` convention is required.
 
 4. **Upstream-agnostic** — The expression doesn't need to know whether the upstream API is OpenAI-format (prompt_tokens includes cache) or Claude-format (input_tokens excludes cache). The system normalizes token counts before evaluation based on the upstream response format.
 
-5. **Version-aware** — Expressions carry a version tag (`v1:`, default when omitted). The version controls the compile environment, token normalization, and quota conversion formula, enabling future evolution without breaking existing expressions.
+5. **Version-aware** — Unprefixed expressions and `v1:` are USD. `v2:USD:` and `v2:CNY:` explicitly declare currency, preserving the existing compile environment, numeric precision, token normalization, quota conversion, and time-function semantics.
 
 ---
 
@@ -168,7 +168,7 @@ OpenAI 已于 2026-05-12 下线 DALL·E 2/3；其校验、默认值和倍率保�
 | Function | Signature | Purpose |
 |----------|-----------|---------|
 | `tier` | `tier(name, value) → float64` | Records which pricing tier matched; must wrap the cost expression |
-| `fixed` | `fixed(amount) → float64` | A USD price per request, used only as the complete price in `tier(name, fixed(amount))` |
+| `fixed` | `fixed(amount) → float64` | A price per request in the expression's currency, used only as the complete price in `tier(name, fixed(amount))` |
 | `param` | `param(path) → any` | Reads a JSON path from the request body (uses ojson, gjson path syntax) |
 | `header` | `header(key) → string` | Reads a request header value |
 | `has` | `has(source, substr) → bool` | Substring check |
@@ -234,7 +234,7 @@ policy. Settlement evaluation errors retain the reservation and its estimated
 billing unit.
 
 Evaluation results expose `billing_unit` (`token` or `request`) and, for a
-request-priced leaf, `fixed_price` in USD before multipliers. Pre-consume snapshots
+request-priced leaf, `fixed_price` in the expression's currency before multipliers. Pre-consume snapshots
 carry `estimated_billing_unit` and `estimated_fixed_price`; consume logs append
 the actual values to `other`. An explicit zero price is present in these fields.
 Older snapshots and logs need no migration. The expression remains the sole
@@ -364,12 +364,13 @@ Task usage billing has a deliberately different conversion rule from token
 billing:
 
 ```
-task quota = expression output in USD * QuotaPerUnit * groupRatio
-token quota = expression output in $/1M tokens / 1,000,000 * QuotaPerUnit * groupRatio
+task quota = expression output in native currency * QuotaPerUnit * groupRatio
+token quota = expression output in native currency per 1M tokens / 1,000,000 * QuotaPerUnit * groupRatio
 ```
 
-In other words, a task expression already returns the request's dollar cost.
-For example, `u("seconds") * 0.4` means $0.40 per second. Engine semantics do
+In other words, a task expression already returns the request's native cost.
+For example, `u("seconds") * 0.4` means USD 0.40 per second, while
+`v2:CNY:u("seconds") * 0.4` means CNY 0.40 per second. Engine semantics do
 not divide task output by one million.
 
 The visual editor generates, and public pricing displays recognize, exactly
@@ -465,7 +466,7 @@ When a request arrives and the model uses `tiered_expr` billing:
 2. Builds `RequestInput` (headers + body) for `param()` / `header()` functions
 3. Runs the expression with locally estimated input tokens (`P` and `Len`) and zero output tokens (`C=0`). Client output limits do not affect the reservation. If request token estimation is disabled, the estimated input is zero.
 4. Converts output to quota: `rawCost / 1,000,000 * QuotaPerUnit`. For token-priced leaves, multiplies this reservation by `quota_setting.pre_consume_multiplier` (default 1; any finite positive decimal). The multiplier does not change context-length tier selection, actual settlement, or request-priced leaves. The snapshot freezes the multiplier for image quantity retries; group retries reuse the multiplied reservation. Older snapshots with no multiplier retain a factor of 1.
-5. Creates `BillingSnapshot` and stores it on `RelayInfo`. Expression and request state stay frozen for settlement. An auto-group retry refreshes group-dependent fields from the selected group before the next upstream attempt. If a free initial group skipped pre-consume and the retry selects a paid group, the billing session is created before that attempt. If an existing session moves to a more expensive group, its reservation is raised to that group's estimate before sending; cheaper groups are refunded only after actual usage is settled.
+5. Creates `BillingSnapshot` and stores it on `RelayInfo`. Expression, currency, and request state stay frozen for settlement. An auto-group retry refreshes group-dependent fields from the selected group before the next upstream attempt. If a free initial group skipped pre-consume and the retry selects a paid group, the billing session is created before that attempt. If an existing session moves to a more expensive group, its reservation is raised to that group's estimate before sending; cheaper groups are refunded only after actual usage is settled.
 
 Wallet trust bypass uses `quota_setting.trust_quota_usd` (default 10 USD; 0 disables bypass). Both the wallet and any limited API token must exceed the threshold. The wallet must still cover the estimated reservation before bypass is considered. Subscriptions and asynchronous tasks do not use this bypass. Legacy token-ratio pricing also reserves estimated input cost times the multiplier, without the former `PreConsumedQuota` floor or output-token estimate. Task usage pricing is unchanged.
 
@@ -493,6 +494,23 @@ After the upstream response returns with actual token usage:
 Backend: `InjectTieredBillingInfo()` adds `billing_mode`, `expr_b64` (base64 expression), `matched_tier`, and the structured `request_rules` trace list to the log's `other` JSON.
 
 Frontend: Detects `billing_mode === "tiered_expr"`, decodes `expr_b64`, parses tiers via shared `parseTiersFromExpr()`, and renders request multipliers from `request_rules` when present. Without log traces, it falls back to parsing the stored expression.
+
+Usage-log list, statistics, and export APIs accept `currency=CNY` to read the
+native CNY billing records from the main database. Omitted currency or `USD`
+retains the existing log path; unsupported currencies return HTTP 400. CNY
+history remains available when consume logging is disabled or the separate log
+database is unavailable. Existing user ownership, role visibility, time limits,
+and export locks still apply.
+
+CNY records use the request's `created_at` for list, export, and statistics
+filters. Reserved and submitted requests expose `billing_status: "reserved"`
+and their `reserved_quota`; settled requests expose final quota; refunded
+requests expose zero final quota. Statistics exclude administrator adjustments,
+report final spending separately from `pending_quota`, and include free and
+pending requests in `count`. `rpm` and `tpm` apply the same filters plus the last
+60 seconds. Amounts use the frozen CNY quota scale and never a display exchange
+rate. Administrator adjustments appear as management entries with signed
+`delta_quota`, `before_quota`, `after_quota`, and `reason` metadata.
 
 ---
 
@@ -522,7 +540,7 @@ This ensures that heavy cache usage doesn't cause the tier condition to incorrec
 
 ### Quota Conversion
 
-Expression coefficients are $/1M tokens. Conversion to internal quota:
+Expression coefficients are native currency per 1M tokens. Conversion to internal quota:
 
 ```
 quota = exprOutput / 1,000,000 * QuotaPerUnit * groupRatio
@@ -532,14 +550,69 @@ This matches the per-call billing pattern: `quota = modelPrice * QuotaPerUnit * 
 
 ### Expression Versioning
 
-Expressions can carry a version prefix: `v1:tier(...)`. No prefix = v1.
+| Prefix | Currency | Numeric semantics |
+| --- | --- | --- |
+| No prefix or `v1:` | USD | Existing token, fixed-price and task rules |
+| `v2:USD:` | USD | Identical to v1 |
+| `v2:CNY:` | CNY | Identical to v1, denominated in CNY |
 
-Version controls:
-- Compile environment (available variables and functions)
-- Token normalization logic
-- Quota conversion formula
+Unknown versions and currencies are rejected. Version 2 does not raise precision,
+change rounding, or perform currency conversion. `QuotaPerUnit` retains its
+existing scale (500,000 by default) for one unit of either currency.
+For example, token billing `v2:CNY:p * 2 + c * 8` uses CNY per million tokens;
+task billing `v2:CNY:u("tokens") * 10.43 / 1000000` already returns CNY.
 
-This enables future evolution without breaking existing expressions.
+The full prefix is part of the stored expression, hash, compile-cache key, exports,
+and provider overrides. Public pricing and previews expose derived `currency`
+metadata. USD built-in prices and saved unprefixed expressions remain unchanged.
+An administrator must deliberately set a CNY expression; changing a display
+exchange rate never changes its arithmetic or currency.
+
+Price synchronization only offers sources in the existing price's currency.
+An upstream `/api/pricing` response whose declared currency conflicts with its
+expression is rejected. New models can import a complete native expression;
+changing an existing model's currency requires editing its price explicitly.
+
+Snapshots freeze `currency` with the full expression. Historical snapshots without
+that field retain USD semantics; settlement rejects a snapshot whose currency or
+declared version differs from its expression. CNY snapshots must explicitly store
+`"currency":"CNY"`.
+
+### Operating Native CNY Billing
+
+1. In model pricing, select **Chinese yuan (CNY)** as the billing currency and
+   enter prices directly in CNY. Changing currency clears the editor's previous
+   prices; review and save the resulting `v2:CNY:` expression.
+2. In user management, open the user's quota adjustment, select **CNY**, and
+   credit the CNY wallet with an amount and reason.
+3. Create the API key, then open **Edit**, enable **CNY billing**, set its separate
+   CNY budget (or unlimited budget), and select **Save CNY budget**. CNY access is
+   disabled by default; enabling it does not fund the user's wallet.
+4. Select **CNY** in the usage-log currency filter. Lists, statistics, and exports
+   use that currency; API callers pass `currency=CNY` to the existing log APIs.
+
+The CNY wallet is separate from the existing USD wallet and subscriptions.
+USD balances and subscription allowances cannot pay CNY charges, and
+`subscription_only` accounts cannot submit CNY requests. CNY funding currently
+uses administrator adjustments; payment integrations and currency exchange are
+not connected to this wallet.
+
+CNY supports ordinary text HTTP requests (including SSE) and task-usage billing.
+Paid built-in tools, native WebSocket requests, AWS SDK InvokeModel routes, and
+Xunfei are rejected before submission. AWS Mantle HTTP remains supported.
+
+Unknown upstream outcomes retain their CNY reservation. Tasks with unresolved
+outcomes can enter `AWAITING_REVIEW`, which stops automatic polling without
+refunding. Check the upstream request/task status and billed usage before manual
+settlement, refund, or resubmission. There is currently no automatic
+reconciliation tool; an administrator wallet adjustment does not finalize the
+original billing record.
+
+Before enabling CNY in production, take a consistent backup of the main database
+and pricing configuration. An older binary cannot interpret CNY task quotas or
+snapshots safely: do not downgrade it against a database containing active CNY
+work. Stop CNY admission and resolve outstanding work first; restore a verified
+pre-CNY backup only when the subsequent transactions have been accounted for.
 
 ---
 
@@ -552,7 +625,7 @@ This enables future evolution without breaking existing expressions.
 | Pre-consume | `relay/helper/price.go`, `relay/helper/billing_expr_request.go` |
 | Settlement | `service/tiered_settle.go`, `service/quota.go` |
 | Log injection | `service/log_info_generate.go` |
-| Frontend editor | `web/src/pages/Setting/Ratio/components/TieredPricingEditor.jsx` |
-| Frontend display | `web/src/helpers/render.jsx`, `web/src/helpers/utils.jsx` |
-| Model detail | `web/src/components/table/model-pricing/modal/components/DynamicPricingBreakdown.jsx` |
-| Log display | `web/src/hooks/usage-logs/useUsageLogsData.jsx`, `web/src/components/table/usage-logs/UsageLogsColumnDefs.jsx` |
+| Frontend editor | `web/src/features/system-settings/models/tiered-pricing-editor.tsx`, `web/src/features/system-settings/models/task-usage-pricing-editor.tsx` |
+| Frontend display | `web/src/features/pricing/lib/billing-expr.ts`, `web/src/features/pricing/lib/dynamic-price.ts` |
+| Model detail | `web/src/features/pricing/components/dynamic-pricing-breakdown.tsx` |
+| Log display | `web/src/features/usage-logs/api.ts`, `web/src/features/usage-logs/components/columns/common-logs-columns.tsx`, `web/src/features/usage-logs/components/log-cost-display.tsx` |

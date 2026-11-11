@@ -56,6 +56,7 @@ import {
   getSuccessRateTextClass,
 } from '@/features/performance-metrics/lib/format'
 import { PluginIcon } from '@/features/task-plugins/components/plugin-icon'
+import { billingExpressionCurrency } from '@/lib/billing-currency'
 import { getLobeIcon } from '@/lib/lobe-icon'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
@@ -1158,6 +1159,7 @@ function ProviderGroupPricingSection(
       props.model.billing_usage_examples
     )
     const priceFields = getDynamicPriceFields(dynamicTiers, {
+      billingCurrency: billingExpressionCurrency(props.model.billing_expr),
       tokenUnit: props.tokenUnit,
       showRechargePrice,
       priceRate: props.priceRate,
@@ -1171,6 +1173,9 @@ function ProviderGroupPricingSection(
         return [
           group,
           getDynamicFormattedPricesByTier(dynamicTiers, {
+            billingCurrency: billingExpressionCurrency(
+              props.model.billing_expr
+            ),
             tokenUnit: props.tokenUnit,
             showRechargePrice,
             priceRate: props.priceRate,
@@ -1311,6 +1316,9 @@ function ProviderGroupPricingSection(
                           cellClassName: 'py-2.5 text-right font-mono',
                           cell: (row) =>
                             `≈ ${formatTaskUsageUnitPrice(row.total, {
+                              billingCurrency: billingExpressionCurrency(
+                                props.model.billing_expr
+                              ),
                               tokenUnit: props.tokenUnit,
                               showRechargePrice,
                               priceRate: props.priceRate,

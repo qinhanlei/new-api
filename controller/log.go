@@ -7,11 +7,24 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
 )
+
+func logCurrencyFromQuery(c *gin.Context) (string, bool) {
+	switch currency := c.Query("currency"); currency {
+	case "", billingexpr.CurrencyUSD:
+		return billingexpr.CurrencyUSD, true
+	case billingexpr.CurrencyCNY:
+		return currency, true
+	default:
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Unsupported billing currency"))
+		return "", false
+	}
+}
 
 // logFilterFromQuery reads the log search shared by the log list and the log
 // export. Username and channel are read only for administrators.
@@ -55,8 +68,19 @@ func limitLogTimeRange(startTimestamp int64, endTimestamp int64) (int64, error) 
 }
 
 func GetAllLogs(c *gin.Context) {
+	currency, ok := logCurrencyFromQuery(c)
+	if !ok {
+		return
+	}
 	pageInfo := common.GetPageQuery(c)
-	logs, total, err := model.GetAllLogs(logFilterFromQuery(c, true), pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	var logs []*model.Log
+	var total int64
+	var err error
+	if currency == billingexpr.CurrencyCNY {
+		logs, total, err = model.GetAllCNYLogs(logFilterFromQuery(c, true), pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	} else {
+		logs, total, err = model.GetAllLogs(logFilterFromQuery(c, true), pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	}
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -73,6 +97,10 @@ func GetAllLogs(c *gin.Context) {
 }
 
 func GetUserLogs(c *gin.Context) {
+	currency, ok := logCurrencyFromQuery(c)
+	if !ok {
+		return
+	}
 	pageInfo := common.GetPageQuery(c)
 	filter := logFilterFromQuery(c, false)
 	if c.GetInt("role") < common.RoleAdminUser {
@@ -83,7 +111,14 @@ func GetUserLogs(c *gin.Context) {
 		}
 		filter.StartTimestamp = startTimestamp
 	}
-	logs, total, err := model.GetUserLogs(c.GetInt("id"), filter, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	var logs []*model.Log
+	var total int64
+	var err error
+	if currency == billingexpr.CurrencyCNY {
+		logs, total, err = model.GetUserCNYLogs(c.GetInt("id"), filter, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	} else {
+		logs, total, err = model.GetUserLogs(c.GetInt("id"), filter, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	}
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -113,6 +148,10 @@ func ExportUserLogs(c *gin.Context) {
 // one export at a time, and every export stays within the longest log time
 // range.
 func exportLogs(c *gin.Context, all bool) {
+	currency, valid := logCurrencyFromQuery(c)
+	if !valid {
+		return
+	}
 	filter := logFilterFromQuery(c, all)
 	startTimestamp, err := limitLogTimeRange(filter.StartTimestamp, filter.EndTimestamp)
 	if err != nil {
@@ -152,7 +191,11 @@ func exportLogs(c *gin.Context, all bool) {
 		return nil
 	}
 	ctx := c.Request.Context()
-	if all {
+	if currency == billingexpr.CurrencyCNY && all {
+		err = model.StreamAllCNYLogs(ctx, filter, c.GetInt("role"), writeLog)
+	} else if currency == billingexpr.CurrencyCNY {
+		err = model.StreamUserCNYLogs(ctx, userId, filter, writeLog)
+	} else if all {
 		err = model.StreamAllLogs(ctx, filter, c.GetInt("role"), writeLog)
 	} else {
 		err = model.StreamUserLogs(ctx, userId, filter, writeLog)
@@ -201,6 +244,19 @@ func GetLogByKey(c *gin.Context) {
 }
 
 func GetLogsStat(c *gin.Context) {
+	currency, ok := logCurrencyFromQuery(c)
+	if !ok {
+		return
+	}
+	if currency == billingexpr.CurrencyCNY {
+		stat, err := model.SumCNYUsedQuota(logFilterFromQuery(c, true), nil)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		common.ApiSuccess(c, stat)
+		return
+	}
 	logType, _ := strconv.Atoi(c.Query("type"))
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
@@ -228,6 +284,29 @@ func GetLogsStat(c *gin.Context) {
 }
 
 func GetLogsSelfStat(c *gin.Context) {
+	currency, ok := logCurrencyFromQuery(c)
+	if !ok {
+		return
+	}
+	if currency == billingexpr.CurrencyCNY {
+		filter := logFilterFromQuery(c, false)
+		if c.GetInt("role") < common.RoleAdminUser {
+			start, err := limitLogTimeRange(filter.StartTimestamp, filter.EndTimestamp)
+			if err != nil {
+				common.ApiError(c, err)
+				return
+			}
+			filter.StartTimestamp = start
+		}
+		userID := c.GetInt("id")
+		stat, err := model.SumCNYUsedQuota(filter, &userID)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		common.ApiSuccess(c, stat)
+		return
+	}
 	username := c.GetString("username")
 	logType, _ := strconv.Atoi(c.Query("type"))
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)

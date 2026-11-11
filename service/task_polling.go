@@ -84,6 +84,12 @@ func sweepTimedOutTasks(ctx context.Context) {
 	timedOutCount := 0
 
 	for _, task := range tasks {
+		if IsCNYTask(task) {
+			if err := HoldCNYTaskForReview(task, task.Status, "Upstream task status is unknown; the CNY reservation is pending review"); err != nil {
+				logger.LogError(ctx, err.Error())
+			}
+			continue
+		}
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
 
 		oldStatus := task.Status
@@ -376,6 +382,12 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
+		if terminalTransition && IsCNYTask(task) {
+			if err := finalizeCNYTask(ctx, task, snap.Status, &responseItem.TaskInfo); err != nil {
+				logger.LogError(ctx, err.Error())
+			}
+			continue
+		}
 		won, updateErr := task.UpdateWithStatus(snap.Status)
 		if updateErr != nil {
 			common.SysLog(common.LogText("UpdateSunoTask task error: %s", updateErr.Error()))
@@ -612,6 +624,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
+	if isDone && snap.Status != task.Status && IsCNYTask(task) {
+		return finalizeCNYTask(ctx, task, snap.Status, taskResult)
+	}
 	if isDone && snap.Status != task.Status {
 		won, err := task.UpdateWithStatus(snap.Status)
 		if err != nil {
@@ -819,6 +834,11 @@ func recordPollFailureForTasks(ctx context.Context, adaptor TaskPollingAdaptor, 
 }
 
 func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, reason string) error {
+	if IsCNYTask(task) {
+		// Missing channels, polling errors, and local timeouts cannot prove failure.
+		logger.LogWarn(ctx, fmt.Sprintf("CNY task %s remains pending: %s", task.TaskID, reason))
+		return HoldCNYTaskForReview(task, fromStatus, "Upstream task status is unknown; the CNY reservation is pending review")
+	}
 	now := time.Now().Unix()
 	task.Status = model.TaskStatusFailure
 	task.Progress = taskcommon.ProgressComplete

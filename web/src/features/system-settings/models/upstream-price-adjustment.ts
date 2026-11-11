@@ -25,6 +25,7 @@ import {
   parseVisualBillingDocument,
   serializeVisualBillingDocument,
 } from '@/features/pricing/lib/billing-expression/visual'
+import { billingExpressionCurrency } from '@/lib/billing-currency'
 
 import type { PricingSyncValues } from '../types'
 
@@ -40,6 +41,13 @@ export function adjustSyncPrice(
   rate: number | null
 ): AdjustedSyncPrice {
   if (mode === 'keep') return { values }
+  if (
+    billingExpressionCurrency(
+      typeof values.billing_expr === 'string' ? values.billing_expr : ''
+    ) === 'CNY'
+  ) {
+    return { error: 'CNY prices cannot use USD exchange rate adjustments.' }
+  }
   if (rate === null || !Number.isFinite(rate) || rate <= 0) {
     return { error: 'A valid site exchange rate is required.' }
   }

@@ -49,6 +49,7 @@ export interface CommonFilters {
  * Common logs specific filters
  */
 export interface CommonLogFilters extends CommonFilters {
+  currency?: 'USD' | 'CNY'
   model?: string
   token?: string
   group?: string
@@ -115,6 +116,12 @@ export interface ToolSurchargeItem {
 }
 
 export interface LogOtherData {
+  billing_status?: 'reserved' | 'settled' | 'refunded'
+  reserved_quota?: number
+  quota_per_unit?: number
+  delta_quota?: number
+  before_quota?: number
+  after_quota?: number
   admin_info?: {
     request_policy?: PolicyEvent[]
     is_multi_key?: boolean
@@ -284,6 +291,8 @@ export interface LogOtherData {
  * Log statistics data
  */
 export interface LogStatistics {
+  currency?: 'USD' | 'CNY'
+  pending_quota?: number
   quota: number
   rpm: number
   tpm: number
@@ -322,6 +331,7 @@ export interface MidjourneyLog {
 // ============================================================================
 
 export interface TaskLog {
+  currency?: 'USD' | 'CNY'
   id: number
   user_id: number
   username?: string
@@ -427,6 +437,7 @@ export interface TaskArtifactsResponse {
 // ============================================================================
 
 export interface GetLogsParams {
+  currency?: 'CNY'
   p?: number
   page_size?: number
   type?: number
@@ -453,6 +464,7 @@ export interface GetLogsResponse {
 }
 
 export interface GetLogStatsParams {
+  currency?: 'CNY'
   type?: number
   username?: string
   token_name?: string

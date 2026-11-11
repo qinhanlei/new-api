@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { splitBillingCurrency } from '@/lib/billing-currency'
+
 import type {
   BillingUsageExample,
   BillingUsageFieldSchema,
@@ -42,6 +44,7 @@ export type TaskVisualTier = {
 }
 
 export type TaskVisualConfig = {
+  currencyPrefix?: string
   tiers: TaskVisualTier[]
 }
 
@@ -320,6 +323,7 @@ export function normalizeTaskVisualConfig(
   )
 
   return {
+    ...(config.currencyPrefix ? { currencyPrefix: config.currencyPrefix } : {}),
     tiers: config.tiers.map((tier, index) => {
       const unitPrices = Object.fromEntries(
         [...numberFields].map((field) => {
@@ -382,8 +386,9 @@ export function generateTaskExprFromConfig(
   const numberFields = getTaskNumberFields(schema)
   if (numberFields.length === 0) return ''
   const normalized = normalizeTaskVisualConfig(config, schema)
+  const prefix = normalized.currencyPrefix ?? ''
   if (normalized.tiers.length === 1) {
-    return generateTaskTierCall(normalized.tiers[0], numberFields)
+    return prefix + generateTaskTierCall(normalized.tiers[0], numberFields)
   }
 
   const parts: string[] = []
@@ -398,7 +403,7 @@ export function generateTaskExprFromConfig(
     if (!condition) return ''
     parts.push(`${condition} ? ${call}`)
   }
-  return parts.join(' : ')
+  return prefix + parts.join(' : ')
 }
 
 export function tryParseTaskVisualConfig(
@@ -410,6 +415,9 @@ export function tryParseTaskVisualConfig(
   if (tiers.length === 0) return null
   return normalizeTaskVisualConfig(
     {
+      ...(splitBillingCurrency(expression).prefix
+        ? { currencyPrefix: splitBillingCurrency(expression).prefix }
+        : {}),
       tiers: tiers.map((tier) => ({
         label: tier.label,
         conditions: tier.conditions,

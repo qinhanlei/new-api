@@ -22,6 +22,7 @@ type GroupRatioInfo struct {
 }
 
 type PriceData struct {
+	Currency              string // Empty historical values mean USD.
 	FreeModel             bool
 	ModelPrice            float64
 	ModelRatio            float64

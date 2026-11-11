@@ -94,6 +94,7 @@ import {
 } from './api-key-group-combobox'
 import { useApiKeys } from './api-keys-provider'
 import { AutoGroupOrderEditor } from './auto-group-order-editor'
+import { TokenCurrencyBudget } from './token-currency-budget'
 
 type ApiKeyMutateDrawerProps = {
   open: boolean
@@ -642,6 +643,20 @@ export function ApiKeysMutateDrawer({
                     </FormItem>
                   )}
                 />
+              )}
+
+              {currentRowId !== undefined ? (
+                <TokenCurrencyBudget
+                  key={currentRowId}
+                  tokenId={currentRowId}
+                  open={open}
+                />
+              ) : (
+                <p className='text-muted-foreground text-xs'>
+                  {t(
+                    'Create the API key first, then enable its CNY budget from Edit.'
+                  )}
+                </p>
               )}
 
               <FormField

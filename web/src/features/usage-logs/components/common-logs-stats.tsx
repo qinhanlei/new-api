@@ -54,7 +54,11 @@ export function CommonLogsStats() {
   const searchParams = route.useSearch()
   const { sensitiveVisible } = useUsageLogsContext()
 
-  const { data: stats, isLoading } = useQuery({
+  const {
+    data: stats,
+    isLoading,
+    isError,
+  } = useQuery({
     queryKey: ['usage-logs-stats', isAdmin, searchParams],
     queryFn: async () => {
       const params = buildApiParams({
@@ -73,7 +77,6 @@ export function CommonLogsStats() {
         ? result.data || DEFAULT_LOG_STATS
         : DEFAULT_LOG_STATS
     },
-    placeholderData: (previousData) => previousData,
   })
 
   if (isLoading) {
@@ -86,13 +89,39 @@ export function CommonLogsStats() {
     )
   }
 
+  if (isError) {
+    return (
+      <p role='alert' className='text-destructive text-xs'>
+        {t('Failed to query statistics')}
+      </p>
+    )
+  }
+
   return (
     <div className='flex flex-wrap items-center gap-2'>
       <StatBadge
         label={t('Usage')}
-        value={sensitiveVisible ? formatLogQuota(stats?.quota || 0) : '••••'}
+        value={
+          sensitiveVisible
+            ? formatLogQuota(
+                stats?.quota || 0,
+                stats?.currency ?? searchParams.currency
+              )
+            : '••••'
+        }
         accent='bg-sky-500/70'
       />
+      {searchParams.currency === 'CNY' && (
+        <StatBadge
+          label={t('Reserved')}
+          value={
+            sensitiveVisible
+              ? formatLogQuota(stats?.pending_quota ?? 0, 'CNY')
+              : '••••'
+          }
+          accent='bg-amber-500/70'
+        />
+      )}
       <StatBadge
         label={t('RPM')}
         value={stats?.rpm || 0}

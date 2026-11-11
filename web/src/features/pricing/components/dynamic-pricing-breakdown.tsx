@@ -22,6 +22,7 @@ import { useTranslation } from 'react-i18next'
 
 import { StaticDataTable } from '@/components/data-table'
 import { Badge } from '@/components/ui/badge'
+import { billingExpressionCurrency } from '@/lib/billing-currency'
 import { cn } from '@/lib/utils'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
@@ -288,14 +289,20 @@ export function DynamicPricingBreakdown({
   hideCacheColumns = false,
   compact = false,
   usageSchema,
-  taskPriceOptions,
+  taskPriceOptions: suppliedTaskPriceOptions,
   usageFacts,
 }: DynamicPricingBreakdownProps) {
   const { t, i18n } = useTranslation()
   const expr = billingExpr || ''
+  const nativeCurrency = billingExpressionCurrency(expr)
+  const taskPriceOptions = {
+    ...suppliedTaskPriceOptions,
+    billingCurrency: nativeCurrency,
+  }
   const currency = useSystemConfigStore((s) => s.config.currency)
 
   const { symbol, rate } = useMemo(() => {
+    if (nativeCurrency === 'CNY') return { symbol: '¥', rate: 1 }
     if (currency.quotaDisplayType === 'CNY') {
       return { symbol: '¥', rate: currency.usdExchangeRate || 7 }
     }
@@ -306,7 +313,7 @@ export function DynamicPricingBreakdown({
       }
     }
     return { symbol: '$', rate: 1 }
-  }, [currency])
+  }, [currency, nativeCurrency])
 
   const { tiers, ruleGroups } = useMemo(() => {
     const split = splitBillingExprAndRequestRules(expr)

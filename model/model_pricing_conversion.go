@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -29,9 +30,21 @@ type ModelPricingConversion struct {
 // ModelPricingDescription is shared by previews, conversions and snapshot
 // entries. It describes effective prices without adding persisted settings.
 type ModelPricingDescription struct {
+	Currency       string               `json:"currency"`
 	Effective      PricingValues        `json:"effective,omitempty"`
 	CacheWriteMode CacheWriteMode       `json:"cache_write_mode,omitempty"`
 	BillingDetails LegacyBillingDetails `json:"billing_details"`
+}
+
+// ModelPricingCurrency derives display metadata from the effective expression;
+// it is not a separate pricing setting. Invalid headers have no known currency.
+func ModelPricingCurrency(effective PricingValues) string {
+	if effective["billing_setting.billing_mode"] != billing_setting.BillingModeTieredExpr {
+		return billingexpr.CurrencyUSD
+	}
+	expression, _ := effective["billing_setting.billing_expr"].(string)
+	currency, _ := billingexpr.ExprCurrency(expression)
+	return currency
 }
 
 func legacyInputPricePerMillion(ratio float64) (decimal.Decimal, error) {
@@ -200,7 +213,7 @@ func PreviewModelPricingConversion(name string, draft PricingValues) (*ModelPric
 		return nil, err
 	}
 	if draft["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr {
-		return &ModelPricingConversion{UnsupportedReason: "This model already uses an expression."}, nil
+		return &ModelPricingConversion{ModelPricingDescription: ModelPricingDescription{Currency: ModelPricingCurrency(draft)}, UnsupportedReason: "This model already uses an expression."}, nil
 	}
 	// The draft is the complete editable configuration: omitted fields inherit
 	// relay defaults rather than silently retaining discarded saved values.
@@ -215,7 +228,7 @@ func PreviewModelPricingConversion(name string, draft PricingValues) (*ModelPric
 		return nil, err
 	}
 	_, fixedPrice := effective["ModelPrice"]
-	preview := &ModelPricingConversion{ModelPricingDescription: ModelPricingDescription{Effective: effective, BillingDetails: ResolveLegacyBillingDetails(name, effective, draft)}}
+	preview := &ModelPricingConversion{ModelPricingDescription: ModelPricingDescription{Currency: ModelPricingCurrency(effective), Effective: effective, BillingDetails: ResolveLegacyBillingDetails(name, effective, draft)}}
 	if preview.BillingDetails.InvalidAudioPrice {
 		return nil, errors.New("audio prices must be finite")
 	}

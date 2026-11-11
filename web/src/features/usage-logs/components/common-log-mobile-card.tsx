@@ -32,7 +32,12 @@ import dayjs from '@/lib/dayjs'
 import { formatLogQuota, formatTimestampToDate } from '@/lib/format'
 
 import type { UsageLog } from '../data/schema'
-import { formatModelName, logTokenName, parseLogOther } from '../lib/format'
+import {
+  formatModelName,
+  getNativeQuotaAdjustment,
+  logTokenName,
+  parseLogOther,
+} from '../lib/format'
 import {
   getLogTypeConfig,
   isDisplayableLogType,
@@ -67,6 +72,7 @@ export function CommonLogMobileCard<TData>(props: {
   const [selectedField, setSelectedField] = useState<FieldName | null>(null)
   const log = props.log
   const other = parseLogOther(log.other)
+  const adjustment = getNativeQuotaAdjustment(log, other)
   const displayable = isDisplayableLogType(log.type)
   const timing = isTimingLogType(log.type)
   const model = formatModelName(log)
@@ -83,9 +89,13 @@ export function CommonLogMobileCard<TData>(props: {
       visible: displayable && props.cells.has('model_name') && !!model.name,
     },
     cost: {
-      label: t('Cost'),
-      value: formatLogQuota(log.quota),
-      visible: displayable && props.cells.has('quota'),
+      label: adjustment ? t('Amount') : t('Cost'),
+      value:
+        adjustment?.amount ??
+        (other?.billing_status === 'reserved'
+          ? `${formatLogQuota(other.reserved_quota ?? 0, log.currency)} ${t('Reserved')}`
+          : formatLogQuota(log.quota, log.currency)),
+      visible: (displayable || !!adjustment) && props.cells.has('quota'),
     },
     time: {
       label: t('Time'),

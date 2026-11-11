@@ -156,6 +156,7 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	}
 
 	priceData := hosttypes.PriceData{
+		Currency:              billingexpr.CurrencyUSD,
 		FreeModel:             freeModel,
 		ModelPrice:            modelPrice,
 		ModelRatio:            modelRatio,
@@ -268,6 +269,7 @@ func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (hostt
 	}
 
 	priceData := hosttypes.PriceData{
+		Currency:       billingexpr.CurrencyUSD,
 		FreeModel:      freeModel,
 		ModelPrice:     modelPrice,
 		ModelRatio:     modelRatio,
@@ -346,6 +348,10 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 	if !ok {
 		return hosttypes.PriceData{}, fmt.Errorf("model %s is configured as tiered_expr but has no billing expression", billingModelName)
 	}
+	currency, err := billingexpr.ExprCurrency(exprStr)
+	if err != nil {
+		return hosttypes.PriceData{}, err
+	}
 	exprHash := billingexpr.ExprHashString(exprStr)
 	usedVars := billingexpr.UsedVarsByHash(exprStr, exprHash)
 	if usedVars["u"] {
@@ -366,7 +372,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 			if billing_setting.GetBillingMode(taskBillingModel) != billing_setting.BillingModeTieredExpr {
 				taskBillingModel = endpoint.MappedModel
 			}
-			// Task expressions return USD; ordinary expressions return USD *
+			// Task expressions return native currency; ordinary expressions return that amount *
 			// 1M. Even a constant without u() cannot safely serve both contracts.
 			if taskBillingModel == billingModelName {
 				return hosttypes.PriceData{}, errors.New(i18n.T(c, i18n.MsgRelaySharedTaskPriceNeedsOverride, map[string]any{"Model": billingModelName, "Plugin": pluginKey}))
@@ -402,7 +408,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 		return hosttypes.PriceData{}, fmt.Errorf("model %s tiered expr run failed: %w", billingModelName, err)
 	}
 
-	// Expression coefficients are $/1M tokens prices; convert to quota the same way per-call billing does.
+	// Expression coefficients are native currency per 1M tokens prices.
 	quotaBeforeGroup := rawCost / 1_000_000 * common.QuotaPerUnit
 	// Scale the reservation, preserving the expression's context-length tier
 	// and leaving actual settlement and fixed request prices unchanged.
@@ -425,6 +431,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 	snapshot := &billingexpr.BillingSnapshot{
 		EstimatedImageCount:       trace.ImageCount,
 		BillingMode:               billing_setting.BillingModeTieredExpr,
+		Currency:                  currency,
 		ModelName:                 billingModelName,
 		ExprString:                exprStr,
 		ExprHash:                  exprHash,
@@ -444,6 +451,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 	info.BillingRequestInput = &requestInput
 
 	priceData := hosttypes.PriceData{
+		Currency:          currency,
 		FreeModel:         freeModel,
 		GroupRatioInfo:    groupRatioInfo,
 		QuotaToPreConsume: preConsumedQuota,

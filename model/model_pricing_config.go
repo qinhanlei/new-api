@@ -42,6 +42,7 @@ type ModelPricingEntry struct {
 }
 
 type ModelPricingPluginVariant struct {
+	Currency      string                               `json:"currency"`
 	PluginKey     string                               `json:"plugin_key"`
 	PluginName    string                               `json:"plugin_name"`
 	Icon          string                               `json:"icon,omitempty"`
@@ -275,6 +276,7 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 		configured := modelPricingValues(values, name)
 		entry := ModelPricingEntry{ModelName: name, Version: ModelPricingVersion(configured), Configured: configured,
 			ModelPricingDescription: ModelPricingDescription{Effective: effectiveModelPricing(values, name)}}
+		entry.Currency = ModelPricingCurrency(entry.Effective)
 		entry.CacheWriteMode = ResolveCacheWriteMode(name, configured)
 		entry.BillingDetails = ResolveLegacyBillingDetails(name, entry.Effective, configured)
 		if plugin, ok := generation.GetByModel(name); ok {
@@ -299,8 +301,9 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 				configuredExpr, _ := configuredValue.(string)
 				plugin, exists := generation.Get(key)
 				if !exists || !slices.Contains(plugin.Meta.Models, name) {
+					currency, _ := billingexpr.ExprCurrency(configuredExpr)
 					variant := ModelPricingPluginVariant{
-						PluginKey: key, PluginName: key, Configured: configuredExpr,
+						PluginKey: key, PluginName: key, Configured: configuredExpr, Currency: currency,
 						UsageSchema: map[string]jsplugin.UsageFieldSchema{}, Stale: true,
 					}
 					if exists {
@@ -317,8 +320,9 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 				if !overridden && entry.Effective["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr {
 					expression, _ = entry.Effective["billing_setting.billing_expr"].(string)
 				}
+				currency, _ := billingexpr.ExprCurrency(expression)
 				entry.PluginVariants = append(entry.PluginVariants, ModelPricingPluginVariant{
-					PluginKey: plugin.Meta.Key, PluginName: plugin.Meta.Name, Icon: plugin.Meta.Icon,
+					PluginKey: plugin.Meta.Key, PluginName: plugin.Meta.Name, Icon: plugin.Meta.Icon, Currency: currency,
 					UsageSchema: schema, UsageExamples: examples, Configured: configuredExpr, Effective: expression,
 					Compatible: billing_setting.TaskExprCompatible(expression, schema),
 				})
@@ -508,6 +512,9 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 			expression, ok := value.(string)
 			if !ok || strings.TrimSpace(expression) == "" {
 				return fmt.Errorf("model %s: plugin %s: billing expression is required", name, key)
+			}
+			if _, err := billingexpr.ExprCurrency(expression); err != nil {
+				return fmt.Errorf("model %s: plugin %s: %w", name, key, err)
 			}
 			plugin, exists := generation.Get(key)
 			declared := exists && slices.Contains(plugin.Meta.Models, name)

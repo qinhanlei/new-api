@@ -36,7 +36,9 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { BillingCurrencySelector } from '@/features/model-pricing/billing-currency-selector'
 import {
+  CNY_PRICING_CURRENCY,
   formatPricingAmount,
   USD_PRICING_CURRENCY,
   type PricingCurrency,
@@ -73,6 +75,10 @@ import type {
   BillingUsageExample,
   BillingUsageSchema,
 } from '@/features/pricing/types'
+import {
+  billingExpressionCurrency,
+  preserveBillingCurrency,
+} from '@/lib/billing-currency'
 
 import { formatPricingNumber } from './pricing-format'
 import { RequestSimulation } from './request-simulation'
@@ -297,6 +303,12 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
   const [rawExpr, setRawExpr] = useState(() =>
     combineBillingExpr(props.billingExpr, props.requestRuleExpr)
   )
+  const currency =
+    billingExpressionCurrency(
+      editorMode === 'raw' ? rawExpr : props.billingExpr
+    ) === 'CNY'
+      ? CNY_PRICING_CURRENCY
+      : props.currency
   const [previewSample, setPreviewSample] = useState<
     Record<string, number | string>
   >(() => {
@@ -346,11 +358,14 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
   const publishRows = (nextRows: TaskMatrixRow[]) => {
     setMatrixRows(nextRows)
     props.onBillingExprChange(
-      generateTaskExprFromConfig(
-        {
-          tiers: taskMatrixToTiers({ rows: nextRows }, props.usageSchema),
-        },
-        props.usageSchema
+      preserveBillingCurrency(
+        props.billingExpr,
+        generateTaskExprFromConfig(
+          {
+            tiers: taskMatrixToTiers({ rows: nextRows }, props.usageSchema),
+          },
+          props.usageSchema
+        )
       )
     )
   }
@@ -401,9 +416,12 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
     ).rows
     setMatrixRows(nextRows)
     props.onBillingExprChange(
-      generateTaskExprFromConfig(
-        { tiers: taskMatrixToTiers({ rows: nextRows }, props.usageSchema) },
-        props.usageSchema
+      preserveBillingCurrency(
+        rawSplit.billingExpr,
+        generateTaskExprFromConfig(
+          { tiers: taskMatrixToTiers({ rows: nextRows }, props.usageSchema) },
+          props.usageSchema
+        )
       )
     )
     props.onRequestRuleExprChange(rawMatrix ? rawSplit.requestRuleExpr : '')
@@ -423,6 +441,24 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
 
   return (
     <div className='space-y-5'>
+      <BillingCurrencySelector
+        expression={props.billingExpr}
+        defaultExpression={generateTaskExprFromConfig(
+          {
+            tiers: taskMatrixToTiers(
+              createDefaultTaskMatrixConfig(props.usageSchema),
+              props.usageSchema
+            ),
+          },
+          props.usageSchema
+        )}
+        onChange={(expression) => {
+          setMatrixRows(createDefaultTaskMatrixConfig(props.usageSchema).rows)
+          setRawExpr(expression)
+          props.onBillingExprChange(expression)
+          props.onRequestRuleExprChange('')
+        }}
+      />
       <ConfirmDialog
         open={confirmVisualSwitch}
         onOpenChange={setConfirmVisualSwitch}
@@ -473,8 +509,8 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
       <Alert>
         <AlertDescription className='text-xs'>
           {t(
-            'Prices are in {{currency}}, with units shown below. Use USD when editing expressions directly.',
-            { currency: (props.currency ?? USD_PRICING_CURRENCY).label }
+            'Prices are in {{currency}}, with units shown below. Raw expressions use the billing currency.',
+            { currency: (currency ?? USD_PRICING_CURRENCY).label }
           )}
         </AlertDescription>
       </Alert>
@@ -490,7 +526,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                   )}
                 </p>
                 <TaskPricingMatrix
-                  currency={props.currency}
+                  currency={currency}
                   rows={matrixRows}
                   usageSchema={props.usageSchema}
                   matchedRowIndex={matchedRowIndex}
@@ -527,7 +563,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                             <FieldLabel>{description}</FieldLabel>
                             <div className='flex items-center gap-2'>
                               <PricingAmountInput
-                                currency={props.currency}
+                                currency={currency}
                                 aria-label={field}
                                 min={0}
                                 step={0.000001}
@@ -553,11 +589,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                                 className='font-mono'
                               />
                               <span className='text-muted-foreground shrink-0 text-xs'>
-                                {
-                                  (props.currency ?? USD_PRICING_CURRENCY)
-                                    .symbol
-                                }
-                                /
+                                {(currency ?? USD_PRICING_CURRENCY).symbol}/
                                 {taskUsageUnitLabel(
                                   definition,
                                   i18n.language,
@@ -576,7 +608,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                         <FieldLabel>{t('Additional charge')}</FieldLabel>
                         <div className='flex items-center gap-2'>
                           <PricingAmountInput
-                            currency={props.currency}
+                            currency={currency}
                             aria-label={t('Additional charge')}
                             min={0}
                             step={0.000001}
@@ -599,7 +631,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                             className='font-mono'
                           />
                           <span className='text-muted-foreground shrink-0 text-xs'>
-                            {(props.currency ?? USD_PRICING_CURRENCY).symbol}/
+                            {(currency ?? USD_PRICING_CURRENCY).symbol}/
                             {t('request')}
                           </span>
                         </div>
@@ -611,7 +643,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
             )}
 
             <TaskBillingPreview
-              currency={props.currency}
+              currency={currency}
               config={previewConfig}
               requestRuleExpr={previewRequestRuleExpr}
               sample={previewSample}
@@ -674,7 +706,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
               spellCheck={false}
             />
             <TaskBillingPreview
-              currency={props.currency}
+              currency={currency}
               config={previewConfig}
               requestRuleExpr={previewRequestRuleExpr}
               sample={previewSample}
@@ -691,16 +723,19 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
           editorMode === 'raw'
             ? rawExpr
             : combineBillingExpr(
-                generateTaskExprFromConfig(
-                  { tiers: visualTiers },
-                  props.usageSchema
+                preserveBillingCurrency(
+                  props.billingExpr,
+                  generateTaskExprFromConfig(
+                    { tiers: visualTiers },
+                    props.usageSchema
+                  )
                 ),
                 props.requestRuleExpr
               )
         }
         usage={previewSample}
         usageSchema={props.usageSchema}
-        currency={props.currency}
+        currency={currency}
         mode='task'
       />
     </div>
