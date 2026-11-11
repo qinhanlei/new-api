@@ -580,6 +580,21 @@ declared version differs from its expression. CNY snapshots must explicitly stor
 
 ### Operating Native CNY Billing
 
+Wallet and API-key balances are authoritative in the main database. Redis is a
+read cache; enabling batch updates only batches usage statistics, never wallet
+or key balances. Cache loss or an unavailable cache cannot create additional
+spendable quota. Database failures fail financial admission closed.
+
+Before upgrading a running version that used Redis or in-memory quota batches,
+stop new admissions and let its synchronous requests finish. Drain its pending
+financial writes, verify committed wallet and key balances against the old
+process's outstanding deltas, and take a consistent database backup before
+replacing it. If the old process cannot prove that its queue was durably drained,
+reconcile the discrepancy before starting the new version. Do not mix old
+cache-authoritative writers with the new database-authoritative writers. This
+cutover is a separate deployment operation; it does not require already
+persisted asynchronous tasks to finish.
+
 1. In model pricing, select **Chinese yuan (CNY)** as the billing currency and
    enter prices directly in CNY. Changing currency clears the editor's previous
    prices; review and save the resulting `v2:CNY:` expression.

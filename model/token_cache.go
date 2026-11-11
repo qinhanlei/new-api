@@ -65,10 +65,20 @@ func invalidateTokenCacheForMutation(key string) error {
 	return common.RDB.Del(ctx, getTokenCacheKey(key)).Err()
 }
 
+// InvalidateTokenQuotaCache clears the read cache after a committed quota
+// mutation. Financial reads always query the database even if invalidation fails.
+func InvalidateTokenQuotaCache(key string) {
+	if !common.RedisEnabled || key == "" {
+		return
+	}
+	if err := common.RedisDelKey(getTokenCacheKey(key)); err != nil {
+		common.SysLog(common.LogText("failed to invalidate token quota cache: %s", err.Error()))
+	}
+}
+
 // cacheInitToken publishes database metadata when the hash is cold or fails
-// verification. Existing quota counters survive repairs because pre-consume
-// can update Redis before the database catches up; counters that are no
-// longer integers are replaced from the snapshot.
+// verification. Quota fields are only snapshots; GetTokenByKey obtains their
+// current values from the database before returning a cached token.
 // Returns 0 when fenced, 1 after initialization, or 2 for an existing hash.
 func cacheInitToken(token Token) (int, error) {
 	if !common.RedisEnabled {
@@ -110,11 +120,7 @@ redis.call('HSET', KEYS[1],
   'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
   'AutoGroups', ARGV[14], 'AllowUserQuotaQuery', ARGV[17],
   'CacheExpiresAt', ARGV[19], 'CacheMAC', ARGV[20])
-for _, counter in ipairs({{'AccessedTime', ARGV[6]}, {'RemainQuota', ARGV[15]}, {'UsedQuota', ARGV[16]}}) do
-  if not string.match(redis.call('HGET', KEYS[1], counter[1]) or '', '^-?%d+$') then
-    redis.call('HSET', KEYS[1], counter[1], counter[2])
-  end
-end
+redis.call('HSET', KEYS[1], 'AccessedTime', ARGV[6], 'RemainQuota', ARGV[15], 'UsedQuota', ARGV[16])
 redis.call('EXPIRE', KEYS[1], ARGV[18])
 if exists == 1 then
   return 2

@@ -835,9 +835,7 @@ func PurchaseSubscriptionWithBalance(userId int, planId int) error {
 	}
 
 	if chargedQuota > 0 {
-		if err := cacheDecrUserQuota(userId, int64(chargedQuota)); err != nil {
-			common.SysLog(common.LogText("failed to decrease user quota cache after subscription balance purchase: %s", err.Error()))
-		}
+		InvalidateUserQuotaCache(userId)
 	}
 	if upgradeGroup != "" {
 		refreshSubscriptionUserGroupCache(userId, common.LogText("subscription balance purchase"))

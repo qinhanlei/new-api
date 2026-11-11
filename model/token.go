@@ -7,7 +7,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
-	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
 )
 
@@ -231,16 +230,9 @@ func ValidateUserToken(key string) (token *Token, err error) {
 			return token, ErrTokenInvalid
 		}
 		if token.ExpiredTime != -1 && token.ExpiredTime < common.GetTimestamp() {
-			if !common.RedisEnabled {
-				token.Status = common.TokenStatusExpired
-				err := token.SelectUpdate()
-				if err != nil {
-					common.SysLog(common.LogText("failed to update token status%s", err.Error()))
-				}
-			}
 			return token, ErrTokenInvalid
 		}
-		if token.Status == common.TokenStatusExhausted || (!token.UnlimitedQuota && token.RemainQuota <= 0) {
+		if !token.UnlimitedQuota && token.RemainQuota <= 0 {
 			// Currency is selected after authentication. CNY-enabled tokens may
 			// authenticate here; each billing path must enforce its own budget.
 			hasCNY, cnyErr := HasCNYTokenQuota(token.Id)
@@ -249,13 +241,6 @@ func ValidateUserToken(key string) (token *Token, err error) {
 			}
 			if hasCNY {
 				return token, nil
-			}
-			if !common.RedisEnabled {
-				token.Status = common.TokenStatusExhausted
-				err := token.SelectUpdate()
-				if err != nil {
-					common.SysLog(common.LogText("failed to update token status%s", err.Error()))
-				}
 			}
 			return token, ErrTokenInvalid
 		}
@@ -293,6 +278,16 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		// Try Redis first
 		token, err := cacheGetTokenByKey(key)
 		if err == nil {
+			// Financial state and disabling must not depend on cache eviction.
+			var current Token
+			if err := DB.Select("status", "expired_time", "unlimited_quota", "remain_quota", "used_quota", "accessed_time").
+				Where("id = ? AND "+commonKeyCol+" = ?", token.Id, key).First(&current).Error; err != nil {
+				return nil, err
+			}
+			token.Status, token.ExpiredTime = current.Status, current.ExpiredTime
+			token.UnlimitedQuota = current.UnlimitedQuota
+			token.RemainQuota, token.UsedQuota = current.RemainQuota, current.UsedQuota
+			token.AccessedTime = current.AccessedTime
 			return token, nil
 		}
 		// Don't return error - fall through to DB
@@ -302,7 +297,7 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		return nil, err
 	}
 	if common.RedisEnabled {
-		// 用数据库快照初始化或修复元数据，Lua 保留正在使用的额度计数。
+		// Publish a read-only snapshot; quota is re-read from the database on cache hits.
 		// 初始化失败不影响本次读取。
 		if _, cacheErr := cacheInitToken(*token); cacheErr != nil {
 			common.SysLog(common.LogText("failed to init token cache: %s", cacheErr.Error()))
@@ -323,9 +318,13 @@ func (token *Token) Update() (err error) {
 	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
 		common.SysLog(common.LogText("failed to invalidate token cache before update: %s", cacheErr.Error()))
 	}
-	return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
+	if err = DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
 		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "auto_groups",
-		"allow_user_quota_query").Updates(token).Error
+		"allow_user_quota_query").Updates(token).Error; err != nil {
+		return err
+	}
+	InvalidateTokenQuotaCache(token.Key)
+	return nil
 }
 
 func (token *Token) SelectUpdate() (err error) {
@@ -386,64 +385,47 @@ func DeleteTokenById(id int, userId int) (err error) {
 	return token.Delete()
 }
 
-func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
+func IncreaseTokenQuota(tokenID int, key string, quota int) error {
 	if quota < 0 {
 		return errors.New("quota cannot be negative")
 	}
-	if common.RedisEnabled {
-		gopool.Go(func() {
-			// 守卫式增量：哈希不存在时跳过，由下次读取从数据库水合，
-			// 绝不创建只有配额字段的残缺哈希。
-			if _, err := cacheApplyTokenQuotaDelta(tokenId, key, int64(quota)); err != nil {
-				common.SysLog(common.LogText("failed to increase token quota: %s", err.Error()))
-			}
-		})
-	}
-	if common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeTokenQuota, tokenId, quota)
-		return nil
-	}
-	return increaseTokenQuota(tokenId, quota)
+	return changeTokenQuota(tokenID, key, quota)
 }
 
-func increaseTokenQuota(id int, quota int) (err error) {
-	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
-		map[string]any{
-			"remain_quota":  gorm.Expr("remain_quota + ?", quota),
-			"used_quota":    gorm.Expr("used_quota - ?", quota),
-			"accessed_time": common.GetTimestamp(),
-		},
-	).Error
-	return err
-}
-
-func DecreaseTokenQuota(id int, key string, quota int) (err error) {
+func DecreaseTokenQuota(id int, key string, quota int) error {
 	if quota < 0 {
 		return errors.New("quota cannot be negative")
 	}
-	if common.RedisEnabled {
-		gopool.Go(func() {
-			if _, err := cacheApplyTokenQuotaDelta(id, key, int64(-quota)); err != nil {
-				common.SysLog(common.LogText("failed to decrease token quota: %s", err.Error()))
-			}
-		})
-	}
-	if common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeTokenQuota, id, -quota)
-		return nil
-	}
-	return decreaseTokenQuota(id, quota)
+	return changeTokenQuota(id, key, -quota)
 }
 
-func decreaseTokenQuota(id int, quota int) (err error) {
-	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
-		map[string]any{
-			"remain_quota":  gorm.Expr("remain_quota - ?", quota),
-			"used_quota":    gorm.Expr("used_quota + ?", quota),
+func changeTokenQuota(id int, key string, delta int) error {
+	if delta > common.MaxWalletQuota || delta < -common.MaxWalletQuota {
+		return ErrWalletQuotaLimitExceeded
+	}
+	if delta == 0 {
+		return nil
+	}
+	result := DB.Model(&Token{}).
+		Where("id = ? AND remain_quota >= ? AND remain_quota <= ?", id, -common.MaxWalletQuota-delta, common.MaxWalletQuota-delta).
+		Where("used_quota >= ? AND used_quota <= ?", -common.MaxWalletQuota+delta, common.MaxWalletQuota+delta).
+		Updates(map[string]any{
+			"remain_quota":  gorm.Expr("remain_quota + ?", delta),
+			"used_quota":    gorm.Expr("used_quota - ?", delta),
 			"accessed_time": common.GetTimestamp(),
-		},
-	).Error
-	return err
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		var token Token
+		if err := DB.Select("id").First(&token, id).Error; err != nil {
+			return err
+		}
+		return ErrWalletQuotaLimitExceeded
+	}
+	InvalidateTokenQuotaCache(key)
+	return nil
 }
 
 // CountUserTokens returns total number of tokens for the given user, used for pagination

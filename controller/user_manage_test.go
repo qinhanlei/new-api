@@ -573,15 +573,15 @@ func TestManageUserQuotaConcurrentSnapshots(t *testing.T) {
 	assert.Equal(t, balance, user.Quota)
 }
 
-func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
+func TestManageUserQuotaCacheReflectsCommittedDatabaseBalance(t *testing.T) {
 	for _, tc := range []struct {
 		name, mode                               string
 		before, cached, value, after, wantCached int
 		failUpdate, failCache, missingCache      bool
 	}{
-		{name: "add_preserves_reservations", mode: "add", before: 1000, cached: 900, value: 500, after: 1500, wantCached: 1400},
-		{name: "subtract_preserves_reservations", mode: "subtract", before: 1000, cached: 900, value: 500, after: 500, wantCached: 400},
-		{name: "override_preserves_reservations", mode: "override", before: 1000, cached: 900, value: 2000, after: 2000, wantCached: 1900},
+		{name: "add_invalidates_stale_snapshot", mode: "add", before: 1000, cached: 900, value: 500, after: 1500, wantCached: 1500},
+		{name: "subtract_invalidates_stale_snapshot", mode: "subtract", before: 1000, cached: 900, value: 500, after: 500, wantCached: 500},
+		{name: "override_invalidates_stale_snapshot", mode: "override", before: 1000, cached: 900, value: 2000, after: 2000, wantCached: 2000},
 		{name: "large_odd_difference", mode: "override", before: common.MaxWalletQuota - 1, cached: common.MaxWalletQuota - 1, value: -common.MaxWalletQuota, after: -common.MaxWalletQuota, wantCached: -common.MaxWalletQuota},
 		{name: "rollback_does_not_change_cache", mode: "subtract", before: 1000, cached: 900, value: 500, after: 1000, wantCached: 900, failUpdate: true},
 		{name: "cache_error_keeps_committed_change", mode: "add", before: 1000, value: 500, after: 1500, failCache: true},
@@ -637,6 +637,11 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 					assert.Equal(t, strconv.Itoa(tc.after), server.HGet(quotaKey, "Quota"))
 				}
 			} else if !tc.failCache {
+				current, err := model.GetUserCache(user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, tc.after, current.Quota)
+				// A rollback leaves the old cache alone; committed changes
+				// invalidate it and any later fill must use the database.
 				assert.Equal(t, strconv.Itoa(tc.wantCached), server.HGet(quotaKey, "Quota"))
 			}
 		})

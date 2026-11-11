@@ -14,7 +14,7 @@ var (
 )
 
 // UserQuotaAdjustment is the immutable database snapshot of a committed manual
-// adjustment. Pending relay deductions in the quota cache are not part of it.
+// adjustment, including every previously committed relay reservation.
 type UserQuotaAdjustment struct {
 	UserID   int
 	Username string
@@ -74,13 +74,6 @@ func AdjustUserQuota(userID, operatorRole int, mode string, value int) (*UserQuo
 		return nil, err
 	}
 
-	// Apply only the committed difference, preserving outstanding reservations.
-	// Both balances are bounded above, so their difference fits in int64.
-	delta := int64(adjustment.After) - int64(adjustment.Before)
-	if delta != 0 {
-		if err := cacheIncrUserQuota(userID, delta); err != nil {
-			common.SysError(common.LogText("failed to sync manual quota adjustment for user %d: %s", userID, err))
-		}
-	}
+	InvalidateUserQuotaCache(userID)
 	return &adjustment, nil
 }
