@@ -18,12 +18,200 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBillingRateManagementAndPersonalPricing(t *testing.T) {
+	database := modelManagementDB(t, "sqlite", "")
+	require.NoError(t, database.AutoMigrate(&model.BillingRateRule{}, &model.Log{}))
+	root := model.User{Username: "rate-root", AffCode: "rate-root", Password: "fixture", Role: common.RoleRootUser, Status: common.UserStatusEnabled, Group: "default"}
+	user := model.User{Username: "rate-user", AffCode: "rate-user", Password: "fixture", Status: common.UserStatusEnabled, Group: "default"}
+	require.NoError(t, database.Create(&root).Error)
+	require.NoError(t, database.Create(&user).Error)
+	patch := func(path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		context.Request = httptest.NewRequest(http.MethodPatch, path, strings.NewReader(body))
+		context.Set("id", root.Id)
+		context.Set("role", common.RoleRootUser)
+		if strings.HasPrefix(path, "/api/user/") {
+			context.Params = gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}
+		}
+		UpdateBillingRates(context)
+		return recorder
+	}
+	const modelName = "billing-rate-public-model"
+	globalResponse := patch("/api/option/billing_rates", `{"changes":[{"model_name":"billing-rate-public-model","rate":"0.8","expected_version":0}]}`)
+	require.Equal(t, http.StatusOK, globalResponse.Code, globalResponse.Body.String())
+	userPath := fmt.Sprintf("/api/user/%d/billing_rates", user.Id)
+	userResponse := patch(userPath, `{"changes":[{"model_name":"billing-rate-public-model","rate":"0.6","expected_version":0}]}`)
+	require.Equal(t, http.StatusOK, userResponse.Code, userResponse.Body.String())
+	var saved struct {
+		Success bool
+		Data    model.BillingRateRuleList
+	}
+	require.NoError(t, common.Unmarshal(userResponse.Body.Bytes(), &saved))
+	require.True(t, saved.Success)
+	require.Len(t, saved.Data.Rules, 1)
+	require.Len(t, saved.Data.GlobalRules, 1)
+	assert.Equal(t, "0.600000", *saved.Data.Rules[0].Rate)
+	assert.Equal(t, "0.800000", *saved.Data.GlobalRules[0].Rate)
+	for _, body := range []string{
+		`{"changes":[{"model_name":"billing-rate-public-model","expected_version":1}]}`,
+		`{"changes":[{"model_name":"billing-rate-public-model","rate":null}]}`,
+		`{"changes":[{"model_name":"billing-rate-public-model","rate":0.1,"expected_version":1}]}`,
+		`{"changes":[{"model_name":"billing-rate-public-model","rate":"-0.1","expected_version":1}]}`,
+	} {
+		response := patch(userPath, body)
+		assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	}
+	conflict := patch(userPath, `{"changes":[{"model_name":"billing-rate-public-model","rate":null,"expected_version":0}]}`)
+	assert.Equal(t, http.StatusConflict, conflict.Code, conflict.Body.String())
+
+	previousGroup := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":0.9}`))
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousGroup)) })
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"billing-rate-public-model":2}`))
+	channel := model.Channel{Name: "billing-rate-pricing", Type: 1, Key: "fixture", Models: modelName, Group: "default", Status: common.ChannelStatusEnabled}
+	require.NoError(t, database.Create(&channel).Error)
+	require.NoError(t, database.Create(&model.Ability{Group: "default", Model: modelName, ChannelId: channel.Id, Enabled: true}).Error)
+	model.InvalidatePricingCache()
+	t.Cleanup(model.InvalidatePricingCache)
+	for _, tc := range []struct {
+		userID int
+		rate   float64
+		source string
+	}{{user.Id, 0.6, "user"}, {root.Id, 0.8, "model"}, {0, 0.8, "model"}, {user.Id, 0.6, "user"}} {
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		context.Request = httptest.NewRequest(http.MethodGet, "/api/pricing?user_id="+strconv.Itoa(user.Id), nil)
+		if tc.userID != 0 {
+			context.Set("id", tc.userID)
+		}
+		GetPricing(context)
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		assert.Equal(t, "private, no-store", recorder.Header().Get("Cache-Control"))
+		var response struct {
+			Data []struct {
+				ModelName        string                                   `json:"model_name"`
+				BillingModelName string                                   `json:"billing_model_name"`
+				ModelRatio       float64                                  `json:"model_ratio"`
+				EffectiveRates   map[string]hosttypes.BillingRateSnapshot `json:"effective_rates"`
+			}
+		}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+		require.Len(t, response.Data, 1)
+		assert.Equal(t, modelName, response.Data[0].BillingModelName)
+		assert.Equal(t, 2.0, response.Data[0].ModelRatio, "the shared base-price cache remains unchanged")
+		assert.Equal(t, tc.rate, response.Data[0].EffectiveRates["default"].Rate)
+		assert.Equal(t, tc.source, response.Data[0].EffectiveRates["default"].Source)
+	}
+	cleared := patch(userPath, `{"changes":[{"model_name":"billing-rate-public-model","rate":null,"expected_version":1}]}`)
+	require.Equal(t, http.StatusOK, cleared.Code, cleared.Body.String())
+	require.NoError(t, common.Unmarshal(cleared.Body.Bytes(), &saved))
+	assert.Nil(t, saved.Data.Rules[0].Rate)
+	assert.EqualValues(t, 2, saved.Data.Rules[0].Version)
+}
+
+func TestBillingRateModelSelectionDoesNotDependOnPublicPricing(t *testing.T) {
+	database := modelManagementDB(t, "sqlite", "")
+	require.NoError(t, database.AutoMigrate(&model.Log{}))
+	root := model.User{Username: "rate-model-root", AffCode: "rate-model-root", Password: "fixture", Role: common.RoleRootUser, Status: common.UserStatusEnabled, Group: "default"}
+	user := model.User{Username: "rate-model-user", AffCode: "rate-model-user", Password: "fixture", Status: common.UserStatusEnabled, Group: "default"}
+	require.NoError(t, database.Create(&root).Error)
+	require.NoError(t, database.Create(&user).Error)
+	previousUsable := setting.UserUsableGroups2JSONString()
+	previousBlacklist := model_setting.GetGlobalSettings().ThinkingModelBlacklist
+	specialGroups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
+	previousSpecialGroups := specialGroups.ReadAll()
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default"}`))
+	model_setting.GetGlobalSettings().ThinkingModelBlacklist = nil
+	specialGroups.Clear()
+	t.Cleanup(func() {
+		require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(previousUsable))
+		model_setting.GetGlobalSettings().ThinkingModelBlacklist = previousBlacklist
+		specialGroups.Clear()
+		specialGroups.AddAll(previousSpecialGroups)
+		model.InvalidatePricingCache()
+	})
+	const alias, billingModel = "deepseek-v4-pro-max", "deepseek-v4-pro"
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"deepseek-v4-pro":1}`))
+	channel := model.Channel{Name: "hidden-rate-model", Type: 1, Key: "fixture", Models: alias, Group: "billing-rates-hidden", Status: common.ChannelStatusEnabled}
+	require.NoError(t, database.Create(&channel).Error)
+	require.NoError(t, database.Create(&model.Ability{Group: channel.Group, Model: alias, ChannelId: channel.Id, Enabled: true}).Error)
+	model.InvalidatePricingCache()
+	publicRecorder := httptest.NewRecorder()
+	publicContext, _ := gin.CreateTestContext(publicRecorder)
+	publicContext.Request = httptest.NewRequest(http.MethodGet, "/api/pricing", nil)
+	publicContext.Set("id", root.Id)
+	GetPricing(publicContext)
+	require.Equal(t, http.StatusOK, publicRecorder.Code, publicRecorder.Body.String())
+	var publicPrices struct{ Data []model.Pricing }
+	require.NoError(t, common.Unmarshal(publicRecorder.Body.Bytes(), &publicPrices))
+	assert.Empty(t, publicPrices.Data, "the configured model is hidden from this administrator's usable groups")
+
+	request := func(method, path, query, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		context.Request = httptest.NewRequest(method, path, strings.NewReader(body))
+		context.Request.URL.RawQuery = query
+		context.Set("id", root.Id)
+		context.Set("role", common.RoleRootUser)
+		if strings.HasPrefix(path, "/api/user/") {
+			context.Params = gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}
+		}
+		if method == http.MethodGet {
+			GetBillingRates(context)
+		} else {
+			UpdateBillingRates(context)
+		}
+		return recorder
+	}
+	for _, path := range []string{"/api/option/billing_rates", fmt.Sprintf("/api/user/%d/billing_rates", user.Id)} {
+		for _, method := range []string{http.MethodGet, http.MethodPatch} {
+			response := request(method, path, "model_name="+alias, `{"changes":[{"model_name":"deepseek-v4-pro","rate":"0.6","expected_version":0}]}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			var resolved struct{ Data model.BillingRateRuleList }
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &resolved))
+			assert.Equal(t, billingModel, resolved.Data.BillingModelName, method)
+		}
+		for _, method := range []string{http.MethodGet, http.MethodPatch} {
+			response := request(method, path, "", `{"changes":[{"model_name":"deepseek-v4-pro-max","rate":"0.7","expected_version":0}]}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), `"billing_model_name"`, "no query preserves the original response contract")
+			if method == http.MethodPatch {
+				var exact struct{ Data model.BillingRateRuleList }
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &exact))
+				assert.Contains(t, exact.Data.Rules, model.BillingRateEntry{ModelName: alias, Rate: new("0.700000"), Version: 1}, "batch rule names remain exact and are not canonicalized")
+			}
+		}
+		for _, malformed := range []string{
+			"model_name=", "model_name=" + strings.Repeat("a", 513), "model_name=%FF", "model_name=%00",
+			"model_name=model%0Aname", "model_name=%20model", "model_name=a&model_name=b", "model_name=%GG",
+		} {
+			for _, method := range []string{http.MethodGet, http.MethodPatch} {
+				response := request(method, path, malformed, `{"changes":[{"model_name":"deepseek-v4-pro","rate":"0","expected_version":1}]}`)
+				assert.Equal(t, http.StatusBadRequest, response.Code, "%s %s: %s", method, malformed, response.Body.String())
+				assert.Contains(t, response.Body.String(), `"message_key":"Invalid billing rate model name"`)
+			}
+		}
+	}
+	for _, owner := range []int{0, user.Id} {
+		rules, err := model.GetBillingRateRules(owner)
+		require.NoError(t, err)
+		assert.Contains(t, rules.Rules, model.BillingRateEntry{ModelName: billingModel, Rate: new("0.600000"), Version: 1}, "malformed PATCH queries cannot mutate an existing rule")
+	}
+}
 
 func TestUpdateOptionRejectsInvalidTaskBillingExpressions(t *testing.T) {
 	const pluginKey = "billing-save-probe"

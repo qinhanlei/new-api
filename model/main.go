@@ -351,6 +351,7 @@ func migrateDB() error {
 		&ExternalIdentityClaim{},
 		&PasskeyCredential{},
 		&Option{},
+		&BillingRateRule{},
 		&LoginEncryptionKey{},
 		&Redemption{},
 		&Ability{},

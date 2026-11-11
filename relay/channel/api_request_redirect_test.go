@@ -67,7 +67,7 @@ func TestDoRequestReturnsUpstreamRedirectWithoutFollowing(t *testing.T) {
 			require.NoError(t, err)
 			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
 
-			resp, err := doRequest(ctx, req, info)
+			resp, err := doRequest(ctx, req, info, nil)
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			body, err := io.ReadAll(resp.Body)

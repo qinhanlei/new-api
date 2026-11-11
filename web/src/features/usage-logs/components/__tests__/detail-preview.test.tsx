@@ -22,7 +22,14 @@ import {
   getCoreRowModel,
   useReactTable,
 } from '@tanstack/react-table'
-import { act, fireEvent, render, screen, within } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from '@testing-library/react'
 import { createInstance } from 'i18next'
 import { I18nextProvider } from 'react-i18next'
 import { afterAll, afterEach, beforeEach, expect, test, vi } from 'vitest'
@@ -114,12 +121,13 @@ beforeEach(async () => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   client.setQueryData(['status'], {}, { updatedAt: Date.now() + 60_000 })
   client.setQueryData(
-    ['pricing'],
+    ['pricing', 0],
     { data: [], vendors: [] },
     { updatedAt: Date.now() + 60_000 }
   )
 })
 afterEach(() => {
+  cleanup()
   client.clear()
   useSystemConfigStore.getState().setConfig(previousConfig)
 })
@@ -391,7 +399,7 @@ test.each([
 ])(
   'task expression $tier shows its recorded unit price',
   ({ expression, tier, expected }) => {
-    client.setQueryData(['pricing'], {
+    client.setQueryData(['pricing', 0], {
       data: [
         {
           model_name: 'wan2.5-i2v-preview',
@@ -420,7 +428,7 @@ test.each([
 )
 
 test('task log prices use localized unit labels from pricing metadata', async () => {
-  client.setQueryData(['pricing'], {
+  client.setQueryData(['pricing', 0], {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -448,8 +456,8 @@ test('task log prices use localized unit labels from pricing metadata', async ()
   ).toHaveTextContent('images · images $0.25/张')
 })
 
-test('CNY task log prices stay in CNY when the site display exchange rate changes', async () => {
-  client.setQueryData(['pricing'], {
+test('CNY task log prices and the recorded user rate stay stable when the site display exchange rate changes', async () => {
+  client.setQueryData(['pricing', 0], {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -460,21 +468,26 @@ test('CNY task log prices stay in CNY when the site display exchange rate change
     ],
     vendors: [],
   })
-  useSystemConfigStore
-    .getState()
-    .setConfig({
-      currency: {
-        ...DEFAULT_CURRENCY_CONFIG,
-        quotaDisplayType: 'CNY',
-        usdExchangeRate: 7,
-      },
-    })
+  useSystemConfigStore.getState().setConfig({
+    currency: {
+      ...DEFAULT_CURRENCY_CONFIG,
+      quotaDisplayType: 'CNY',
+      usdExchangeRate: 7,
+    },
+  })
   const preview = renderPreview(
     {
       is_task: true,
       billing_mode: 'tiered_expr',
       expr_b64: btoa('v2:CNY:tier("images", u("images") * 0.25)'),
       matched_tier: 'images',
+      group_ratio: 0,
+      billing_rate: {
+        rate: 0.6,
+        source: 'user',
+        version: 4,
+        model_name: 'native-image-model',
+      },
     },
     true,
     2,
@@ -482,21 +495,26 @@ test('CNY task log prices stay in CNY when the site display exchange rate change
   )
   expect(preview).toHaveTextContent('images · images ¥0.25/image')
   await act(() =>
-    useSystemConfigStore
-      .getState()
-      .setConfig({
-        currency: {
-          ...DEFAULT_CURRENCY_CONFIG,
-          quotaDisplayType: 'CNY',
-          usdExchangeRate: 14,
-        },
-      })
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType: 'CNY',
+        usdExchangeRate: 14,
+      },
+    })
   )
-  expect(preview).toHaveTextContent('images · images ¥0.25/image')
+  const updatedPreview = screen.getByRole('button', { name: /images · images/ })
+  expect(updatedPreview).toHaveTextContent('images · images ¥0.25/image')
+  fireEvent.click(updatedPreview)
+  const dialog = await screen.findByRole('dialog')
+  expect(dialog).toHaveTextContent('User model rate0.6x')
+  expect(dialog).toHaveTextContent('Billing modelnative-image-model')
+  expect(dialog).toHaveTextContent('Rate rule version4')
+  expect(dialog).toHaveTextContent('¥0.01')
 })
 
 test('task log prices select the executing provider’s schema', () => {
-  client.setQueryData(['pricing'], {
+  client.setQueryData(['pricing', 0], {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -535,7 +553,7 @@ test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
   'task pricing with %s preserves the saved tier without guessing prices',
   (scenario) => {
     if (scenario !== 'missing schema') {
-      client.setQueryData(['pricing'], {
+      client.setQueryData(['pricing', 0], {
         data: [
           {
             model_name: 'wan2.5-i2v-preview',
@@ -558,5 +576,19 @@ test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
     expect(preview.textContent).toBe(
       `Dynamic Pricing · ${scenario === 'unknown tier' ? 'old' : 'music'}`
     )
+  }
+)
+
+test.each([0, 0.6, 1, 0.000001])(
+  'shows the final user rate %s instead of the superseded group rate',
+  (rate) => {
+    const preview = renderPreview({
+      model_price: 0,
+      group_ratio: 0.9,
+      user_group_ratio: 0.8,
+      billing_rate: { rate, source: 'user', version: 4, model_name: 'model-a' },
+    })
+    expect(preview).toHaveTextContent(`User model rate ${rate}x`)
+    expect(preview).not.toHaveTextContent('Group Ratio')
   }
 )

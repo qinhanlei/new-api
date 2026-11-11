@@ -40,7 +40,7 @@ func setupRelayChannelDB(t *testing.T) *gorm.DB {
 	sqlDB, err := database.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, database.AutoMigrate(&model.Channel{}))
+	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.BillingRateRule{}))
 	model.DB = database
 	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
 	common.MemoryCacheEnabled = false
@@ -234,6 +234,7 @@ func newTaskSubmitContext(t *testing.T, originalModel, mapping string) (*gin.Con
 }
 
 func TestRelayTaskSubmitMapsBeforeValidateWhenOriginSet(t *testing.T) {
+	setupRelayChannelDB(t)
 	const mapping = `{"alias-model":"mid-model","mid-model":"declared-model"}`
 
 	c, info := newTaskSubmitContext(t, "alias-model", mapping)
@@ -249,6 +250,7 @@ func TestRelayTaskSubmitMapsBeforeValidateWhenOriginSet(t *testing.T) {
 }
 
 func TestRelayTaskSubmitDeclaredNameWithoutMappingIsUnchanged(t *testing.T) {
+	setupRelayChannelDB(t)
 	c, info := newTaskSubmitContext(t, "declared-model", "")
 	pinMappingOrderPlugin(t, c, mappingOrderSubmitPlugin)
 	info.OriginModelName = "declared-model"
@@ -262,6 +264,7 @@ func TestRelayTaskSubmitDeclaredNameWithoutMappingIsUnchanged(t *testing.T) {
 }
 
 func TestRelayTaskSubmitDoesNotApplyMappingTwice(t *testing.T) {
+	setupRelayChannelDB(t)
 	c, info := newTaskSubmitContext(t, "alias-model", `{"alias-model":"declared-model"}`)
 	pinMappingOrderPlugin(t, c, mappingOrderRewritePlugin)
 	info.OriginModelName = "alias-model"
@@ -274,6 +277,7 @@ func TestRelayTaskSubmitDoesNotApplyMappingTwice(t *testing.T) {
 }
 
 func TestRelayTaskSubmitEmptyOriginKeepsLateMapping(t *testing.T) {
+	setupRelayChannelDB(t)
 	plugin, err := pluginruntime.NewRegistry().Register(mappingOrderSubmitPlugin, pluginruntime.Options{})
 	require.NoError(t, err)
 	synthesized := service.CoverTaskActionToModelName(constant.TaskPlatform(plugin.Meta.Key), "text_to_video")
@@ -313,6 +317,7 @@ func saveBillingConfig(t *testing.T) {
 }
 
 func TestRelayTaskSubmitAliasBillingIdentityAndExprFallback(t *testing.T) {
+	setupRelayChannelDB(t)
 	const mapping = `{"alias-model":"declared-model"}`
 	const aliasExpr = `tier("alias", 2)`
 	const tailExpr = `tier("tail", 3)`
@@ -414,6 +419,7 @@ export function extractUsage(){return {old_units:2};}
 }
 
 func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
+	setupRelayChannelDB(t)
 	const baseExpr = `tier("base", u("seconds") * 2)`
 	const alphaExpr = `tier("alpha", u("seconds") * 3)`
 	const betaExpr = `tier("beta", u("credits") * 5)`
@@ -496,6 +502,7 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 }
 
 func TestSharedEndpointBillingKeepsOrdinaryAndPluginPricesSeparate(t *testing.T) {
+	setupRelayChannelDB(t)
 	require.NoError(t, i18n.Init())
 	const taskExpr = `tier("images", u("image_count") * 0.05)`
 	const ordinaryExpr = `tier("images", fixed(0.04)) * image_count`
@@ -614,6 +621,7 @@ func TestSharedEndpointBillingKeepsOrdinaryAndPluginPricesSeparate(t *testing.T)
 // Every 2xx must reach parseSubmitResponse; only other statuses are upstream
 // failures that keep the upstream status and body.
 func TestRelayTaskSubmitAcceptsAnySuccessfulUpstreamStatus(t *testing.T) {
+	setupRelayChannelDB(t)
 	service.InitHttpClient()
 	const source = `
 export const meta = {apiVersion:1,key:"status-echo",name:"Status Echo",version:"1.0.0",author:{name:"Test"},models:["declared-model"],fetchMode:"per_task"};
@@ -676,6 +684,7 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 // attempt; the retry runs on plugin B, pinned the way
 // SetupContextForSelectedChannel pins another candidate plugin's channel.
 func TestRelayTaskSubmitRetryRepricesAndReservesBeforeUpstream(t *testing.T) {
+	setupRelayChannelDB(t)
 	service.InitHttpClient()
 	const source = `
 export const meta = {apiVersion:1,key:"KEY",name:"KEY",version:"1.0.0",author:{name:"Test"},models:["declared-model"],fetchMode:"per_task",usageSchema:{seconds:{type:"number",unit:"second",description:"Video generation unit price"}}};
@@ -688,6 +697,7 @@ export function extractUsage() { return {seconds:2}; }
 	pricier := map[string]string{"retry-a::declared-model": `tier("a", u("seconds") * 0.05)`, "retry-b::declared-model": `tier("b", u("seconds") * 0.4)`}
 	for _, tc := range []struct {
 		name, perCallPrice, wantCode string
+		rate, changeRate             string
 		expressions                  map[string]string
 		wallet, wantQuota            int
 		wantSubmitted                []string
@@ -695,19 +705,27 @@ export function extractUsage() { return {seconds:2}; }
 		{name: "per-call plugin drops the previous expression", expressions: map[string]string{"retry-a::declared-model": `tier("a", u("seconds") * 0.02)`}, perCallPrice: `{"declared-model":0.04}`, wallet: 1 << 30, wantQuota: 40000, wantSubmitted: []string{"a", "b"}},
 		{name: "pricier plugin is held before submission", expressions: pricier, perCallPrice: `{}`, wallet: 1 << 30, wantQuota: 400000, wantSubmitted: []string{"a", "b"}},
 		{name: "unaffordable plugin is never submitted", expressions: pricier, perCallPrice: `{}`, wallet: 100000, wantCode: "insufficient_user_quota", wantSubmitted: []string{"a"}},
+		{name: "model rate stays frozen across repricing and free group retry", expressions: pricier, perCallPrice: `{}`, rate: "0.6", changeRate: "0.2", wallet: 1 << 30, wantQuota: 240000, wantSubmitted: []string{"a", "b"}},
+		{name: "explicit free task needs no wallet session", expressions: pricier, perCallPrice: `{}`, rate: "0", wantQuota: 0, wantSubmitted: []string{"a", "b"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			saveBillingConfig(t)
+			require.NoError(t, model.DB.Where("id > ?", 0).Delete(&model.BillingRateRule{}).Error)
+			if tc.rate != "" {
+				_, _, err := model.UpdateBillingRateRules(0, 1, []model.BillingRateChange{{ModelName: "declared-model", Rate: &tc.rate}})
+				require.NoError(t, err)
+			}
 			savedPrices := ratio_setting.ModelPrice2JSONString()
 			t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedPrices)) })
 			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(tc.perCallPrice))
 			expressions, err := common.Marshal(tc.expressions)
 			require.NoError(t, err)
 			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-				billing_setting.PluginBillingExprOption: string(expressions),
-				"billing_setting.billing_mode":          `{}`,
-				"billing_setting.billing_expr":          `{}`,
-				"group_ratio_setting.group_ratio":       `{"default":1}`,
+				billing_setting.PluginBillingExprOption:       string(expressions),
+				"billing_setting.billing_mode":                `{}`,
+				"billing_setting.billing_expr":                `{}`,
+				"group_ratio_setting.group_ratio":             `{"default":1,"free":0}`,
+				"quota_setting.enable_free_model_pre_consume": "false",
 			}))
 			registry := pluginruntime.NewRegistry()
 			for _, key := range []string{"retry-a", "retry-b"} {
@@ -735,6 +753,9 @@ export function extractUsage() { return {seconds:2}; }
 			c.Set("group", "default")
 			info.UserGroup, info.UsingGroup, info.OriginModelName = "default", "default", "declared-model"
 			info.Billing = billing
+			if tc.rate == "0" {
+				info.Billing = nil
+			}
 			var result *TaskSubmitResult
 			var taskErr *dto.TaskError
 			for _, attempt := range []string{"a", "b"} {
@@ -747,6 +768,11 @@ export function extractUsage() { return {seconds:2}; }
 				if attempt == "a" {
 					require.NotNil(t, taskErr)
 					require.Equal(t, http.StatusInternalServerError, taskErr.StatusCode, "the first attempt fails upstream and is retried")
+					if tc.changeRate != "" {
+						_, _, err := model.UpdateBillingRateRules(0, 1, []model.BillingRateChange{{ModelName: "declared-model", Rate: &tc.changeRate, ExpectedVersion: 1}})
+						require.NoError(t, err)
+						c.Set("auto_group", "free")
+					}
 				}
 			}
 
@@ -760,6 +786,15 @@ export function extractUsage() { return {seconds:2}; }
 			require.Nil(t, taskErr, "submission error: %+v", taskErr)
 			assert.Equal(t, tc.wantQuota, result.Quota)
 			assert.Equal(t, tc.wantQuota, heldAtSubmit[1], "plugin B must not see the request before its price is held")
+			if tc.rate == "0" {
+				assert.Nil(t, info.Billing)
+				assert.True(t, info.PriceData.FreeModel)
+			}
+			if tc.changeRate != "" {
+				assert.Equal(t, 0.6, info.PriceData.EffectiveBillingRate())
+				assert.Equal(t, int64(1), info.PriceData.BillingRate.Version)
+				assert.Zero(t, info.PriceData.GroupRatioInfo.GroupRatio)
+			}
 			if tc.perCallPrice != `{}` {
 				assert.Nil(t, info.TieredBillingSnapshot, "a per-call plugin must not settle with the previous plugin's expression")
 				return

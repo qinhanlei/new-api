@@ -194,7 +194,7 @@ func (s *CNYBillingSession) ReserveBeforeSubmit(targetQuota int) error {
 	if err != nil {
 		return err
 	}
-	s.params.Free = s.info.TieredBillingSnapshot.GroupRatio == 0
+	s.params.Free = s.info.TieredBillingSnapshot.EffectiveBillingRate() == 0
 	if !s.params.Free && len(billingexpr.UsedVars(s.info.TieredBillingSnapshot.ExprString)) == 0 {
 		cost, _, err := billingexpr.RunExpr(s.info.TieredBillingSnapshot.ExprString, billingexpr.TokenParams{})
 		s.params.Free = err == nil && cost == 0

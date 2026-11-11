@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -214,6 +215,59 @@ it('labels single and mixed provider overrides with each displayed price currenc
   expect(screen.getByText('CNY 1.4/s')).toBeVisible()
 })
 
+it.each([0, 0.6, 1])(
+  'applies the user rate %s once to native prices, replacing the free group rate',
+  (rate) => {
+    const model: PricingModel = {
+      id: 1,
+      model_name: 'native-user-rate',
+      quota_type: 0,
+      model_ratio: 1,
+      completion_ratio: 1,
+      enable_groups: ['default'],
+      group_ratio: { default: 0 },
+      effective_rates: {
+        default: {
+          rate,
+          source: 'user',
+          version: 4,
+          model_name: 'native-user-rate',
+        },
+      },
+      billing_mode: 'tiered_expr',
+      billing_expr: 'v2:CNY:tier("base", p * 10 + c * 20)',
+    }
+    const { container, rerender } = render(<ModelPriceCell model={model} />)
+    for (const exchangeRate of [7, 14]) {
+      act(() => {
+        useSystemConfigStore.getState().setConfig({
+          currency: {
+            ...DEFAULT_CURRENCY_CONFIG,
+            quotaDisplayType: 'CNY',
+            usdExchangeRate: exchangeRate,
+          },
+        })
+      })
+      rerender(
+        <ModelPriceCell
+          model={model}
+          options={{
+            tokenUnit: 'M',
+            selectedGroup: 'default',
+            showRechargePrice: true,
+            priceRate: 3,
+            usdExchangeRate: exchangeRate,
+          }}
+        />
+      )
+      expect(container).toHaveTextContent(`Input${rate * 10}`)
+      expect(container).toHaveTextContent(`Output${rate * 20}`)
+      expect(screen.getByText('CNY / 1M tokens')).toBeVisible()
+      expect(screen.getByText(`User model rate ${rate}×`)).toBeVisible()
+    }
+  }
+)
+
 it('rejects cross-currency synchronization rather than relabeling existing prices', () => {
   const options = pricingOptions({
     'billing_setting.billing_mode': JSON.stringify({ native: 'tiered_expr' }),
@@ -256,6 +310,62 @@ it('sorts prices within each currency without comparing CNY amounts to USD amoun
       (model) => model.model_name
     )
   ).toEqual(['cny-low', 'cny-high', 'usd'])
+})
+
+it('sorts native prices by their effective rates within the billing currency', () => {
+  const base: PricingModel = {
+    id: 1,
+    model_name: 'native',
+    model_ratio: 1,
+    completion_ratio: 1,
+    quota_type: 0,
+    enable_groups: ['default'],
+    group_ratio: { default: 0 },
+    billing_mode: 'tiered_expr',
+  }
+  const models: PricingModel[] = [
+    {
+      ...base,
+      model_name: 'usd-free',
+      billing_expr: 'tier("base", p * 1)',
+    },
+    {
+      ...base,
+      model_name: 'cny-base-low',
+      billing_expr: 'v2:CNY:tier("base", p * 3)',
+      effective_rates: {
+        default: {
+          rate: 1,
+          source: 'model',
+          version: 1,
+          model_name: 'cny-base-low',
+        },
+      },
+    },
+    {
+      ...base,
+      model_name: 'cny-discounted',
+      billing_expr: 'v2:CNY:tier("base", p * 9)',
+      effective_rates: {
+        default: {
+          rate: 0.1,
+          source: 'user',
+          version: 2,
+          model_name: 'cny-discounted',
+        },
+      },
+    },
+  ]
+  expect(
+    sortModels(models, SORT_OPTIONS.INPUT_PRICE_LOW, 'default').map(
+      (model) => model.model_name
+    )
+  ).toEqual(['cny-discounted', 'cny-base-low', 'usd-free'])
+  expect(
+    sortModels(models, SORT_OPTIONS.INPUT_PRICE_HIGH, 'default').map(
+      (model) => model.model_name
+    )
+  ).toEqual(['cny-base-low', 'cny-discounted', 'usd-free'])
 })
 
 it('requires confirmation and clears prices when selecting another billing currency', async () => {

@@ -610,8 +610,8 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 	return resp, err
 }
 
-// SubmissionStarted is called after URL/header validation, immediately before
-// transport. An uncertain upstream outcome must keep its asset use holds.
+// SubmissionStarted runs after local billing and transport validation, just
+// before sending. An uncertain upstream outcome must keep its asset use holds.
 func (a *TaskAdaptor) SubmissionStarted(c *gin.Context) {
 	if len(a.assets) > 0 {
 		c.Set(pluginruntime.ContextKeyAssetSubmissionStarted, true)

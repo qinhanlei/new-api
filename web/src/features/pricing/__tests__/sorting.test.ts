@@ -18,8 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { describe, expect, test } from 'vitest'
 
-import { SORT_OPTIONS } from '../constants'
-import { sortModels } from '../lib/filters'
+import { SORT_OPTIONS, FILTER_ALL } from '../constants'
+import { filterAndSortModels, sortModels } from '../lib/filters'
 import type { PricingModel } from '../types'
 
 function pricingModel(
@@ -124,3 +124,131 @@ describe('price sorting', () => {
     }
   )
 })
+
+const priceModes = [
+  {
+    name: 'legacy input',
+    sort: SORT_OPTIONS.INPUT_PRICE_LOW,
+    pricing: (price: number): Partial<PricingModel> => ({
+      model_ratio: price / 2,
+    }),
+  },
+  {
+    name: 'legacy output',
+    sort: SORT_OPTIONS.OUTPUT_PRICE_LOW,
+    pricing: (price: number): Partial<PricingModel> => ({
+      model_ratio: price / 2,
+      completion_ratio: 1,
+    }),
+  },
+  {
+    name: 'legacy per-call',
+    sort: SORT_OPTIONS.REQUEST_PRICE_LOW,
+    pricing: (price: number): Partial<PricingModel> => ({
+      quota_type: 1,
+      model_price: price,
+    }),
+  },
+  {
+    name: 'expression input',
+    sort: SORT_OPTIONS.INPUT_PRICE_LOW,
+    pricing: (price: number): Partial<PricingModel> => ({
+      billing_mode: 'tiered_expr',
+      billing_expr: `tier("base", p * ${price} + c * ${price})`,
+    }),
+  },
+  {
+    name: 'expression output',
+    sort: SORT_OPTIONS.OUTPUT_PRICE_LOW,
+    pricing: (price: number): Partial<PricingModel> => ({
+      billing_mode: 'tiered_expr',
+      billing_expr: `tier("base", p * ${price} + c * ${price})`,
+    }),
+  },
+  {
+    name: 'expression fixed',
+    sort: SORT_OPTIONS.REQUEST_PRICE_LOW,
+    pricing: (price: number): Partial<PricingModel> => ({
+      billing_mode: 'tiered_expr',
+      billing_expr: `tier("base", fixed(${price}))`,
+    }),
+  },
+  {
+    name: 'task example',
+    sort: SORT_OPTIONS.REQUEST_PRICE_LOW,
+    pricing: (price: number): Partial<PricingModel> => ({
+      billing_mode: 'tiered_expr',
+      billing_expr: `tier("base", u("seconds") * ${price / 5})`,
+      billing_usage_schema: { seconds: { type: 'number', unit: 'second' } },
+      billing_usage_examples: [{ label: '5s', facts: { seconds: 5 } }],
+    }),
+  },
+]
+
+for (const rate of [0.1, 0]) {
+  test.each(priceModes)(
+    `sorts $name by the final rate ${rate}, reversing the base-price order`,
+    ({ sort, pricing }) => {
+      const discounted = pricingModel('expensive-base', {
+        ...pricing(10),
+        group_ratio: { default: 0.9 },
+        effective_rates: {
+          default: {
+            model_name: 'expensive-base',
+            source: 'user',
+            rate,
+            version: 1,
+          },
+        },
+      })
+      const regular = pricingModel('cheap-base', {
+        ...pricing(2),
+        group_ratio: { default: 0.9 },
+        effective_rates: {
+          default: {
+            model_name: 'cheap-base',
+            source: 'model',
+            rate: 1,
+            version: 1,
+          },
+        },
+      })
+      expect(
+        sortModels([regular, discounted], sort, 'default').map(
+          (model) => model.model_name
+        )
+      ).toEqual(['expensive-base', 'cheap-base'])
+    }
+  )
+}
+
+test.each([
+  { group: 'default', expected: ['expensive-base', 'cheap-base'] },
+  { group: 'vip', expected: ['cheap-base', 'expensive-base'] },
+  { group: FILTER_ALL, expected: ['cheap-base', 'expensive-base'] },
+])(
+  'sorts the $group filter using inherited group rates when model rates are absent',
+  ({ group, expected }) => {
+    const discounted = pricingModel('expensive-base', {
+      model_ratio: 5,
+      enable_groups: ['default', 'vip'],
+      group_ratio: { default: 0.1, vip: 1 },
+    })
+    const regular = pricingModel('cheap-base', {
+      model_ratio: 1,
+      enable_groups: ['default', 'vip'],
+      group_ratio: { default: 1, vip: 0 },
+    })
+    expect(
+      filterAndSortModels([regular, discounted], {
+        search: '',
+        vendor: FILTER_ALL,
+        group,
+        quotaType: FILTER_ALL,
+        endpointType: FILTER_ALL,
+        tag: FILTER_ALL,
+        sortBy: SORT_OPTIONS.INPUT_PRICE_LOW,
+      }).map((model) => model.model_name)
+    ).toEqual(expected)
+  }
+)

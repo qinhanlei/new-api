@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type { BillingRateSnapshot } from '@/features/billing-rates/types'
+
 // ----------------------------------------------------------------------------
 // Pricing Types
 // ----------------------------------------------------------------------------
@@ -56,6 +58,8 @@ export type BillingPluginVariant = {
 }
 
 export type PricingModel = {
+  billing_model_name?: string
+  effective_rates?: Record<string, BillingRateSnapshot>
   billing_plugin_variants?: BillingPluginVariant[]
   id: number
   model_name: string

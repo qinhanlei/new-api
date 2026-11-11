@@ -341,7 +341,7 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	if err = ApplyHeaderOverride(info, c, req); err != nil {
 		return nil, err
 	}
-	resp, err := doRequest(c, req, info)
+	resp, err := doRequest(c, req, info, nil)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
 	}
@@ -371,7 +371,7 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 	if err = ApplyHeaderOverride(info, c, req); err != nil {
 		return nil, err
 	}
-	resp, err := doRequest(c, req, info)
+	resp, err := doRequest(c, req, info, nil)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
 	}
@@ -445,7 +445,7 @@ func toWebSocketURL(raw string) string {
 }
 
 func DoRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
-	return doRequest(c, req, info)
+	return doRequest(c, req, info, nil)
 }
 
 // keepUpstreamRedirectResponse stops net/http from following redirects while
@@ -454,7 +454,7 @@ func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
-func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo, submissionStarted func(*gin.Context)) (*http.Response, error) {
 	if err := service.PrepareCNYHTTPRequest(c, info, req); err != nil {
 		return nil, err
 	}
@@ -491,6 +491,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
 	if err := req.Context().Err(); err != nil {
 		return nil, err
+	}
+	if submissionStarted != nil {
+		submissionStarted(c)
 	}
 	service.MarkCNYUpstreamPending(info, true)
 	resp, err := relayClient.Do(req)
@@ -547,10 +550,11 @@ func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, req
 	if err = ApplyHeaderOverride(info, c, req); err != nil {
 		return nil, err
 	}
+	var submissionStarted func(*gin.Context)
 	if observer, ok := a.(interface{ SubmissionStarted(*gin.Context) }); ok {
-		observer.SubmissionStarted(c)
+		submissionStarted = observer.SubmissionStarted
 	}
-	resp, err := doRequest(c, req, info)
+	resp, err := doRequest(c, req, info, submissionStarted)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
 	}

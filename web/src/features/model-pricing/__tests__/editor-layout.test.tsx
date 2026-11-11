@@ -75,26 +75,40 @@ it.each(['none', 'standard', 'claude_ttl', 'openai_ttl'] as const)(
       .getState()
       .auth.setUser({ id: 1, username: 'administrator', role: 100 })
     usePricingPreferencesStore.setState({ currency: 'USD' })
-    vi.spyOn(api, 'get').mockImplementation(async (url) => ({
-      data: {
-        success: true,
-        data:
-          url === '/api/option/model_pricing'
-            ? {
-                entries: [
-                  {
-                    model_name: 'gpt-4o-custom',
-                    version: 'v1',
-                    configured,
-                    effective,
-                    cache_write_mode: cacheWriteMode,
-                  },
-                ],
-              }
-            : [],
-        vendors: [],
-      },
-    }))
+    vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      if (url === '/api/option/billing_rates') {
+        return {
+          data: {
+            success: true,
+            data: {
+              rules: [],
+              global_rules: [],
+              billing_model_name: 'gpt-4o-custom',
+            },
+          },
+        }
+      }
+      return {
+        data: {
+          success: true,
+          data:
+            url === '/api/option/model_pricing'
+              ? {
+                  entries: [
+                    {
+                      model_name: 'gpt-4o-custom',
+                      version: 'v1',
+                      configured,
+                      effective,
+                      cache_write_mode: cacheWriteMode,
+                    },
+                  ],
+                }
+              : [],
+          vendors: [],
+        },
+      }
+    })
     vi.spyOn(api, 'post').mockResolvedValue({
       data: {
         success: true,

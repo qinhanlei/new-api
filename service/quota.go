@@ -3,7 +3,6 @@ package service
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -85,71 +84,61 @@ func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
 	return common.QuotaFromDecimalChecked(quota)
 }
 
+// PreWssConsumeQuota reserves the cost of cumulative session usage. The final
+// settlement reconciles this same session, so completed segments are not billed
+// again when the WebSocket closes.
 func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
-	if relayInfo.UsePrice {
+	if relayInfo.UsePrice || relayInfo.PriceData.UsePrice {
 		return nil
 	}
-	userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
-	if err != nil {
-		return err
+	modelName := relayInfo.GetBillingModelName()
+	modelRatio := relayInfo.PriceData.ModelRatio
+	effectiveRate := relayInfo.PriceData.EffectiveBillingRate()
+	if relayInfo.PriceData.BillingRate == nil {
+		// Preserve the settings fallback for callers created before rate snapshots.
+		modelRatio, _, _ = ratio_setting.GetModelRatio(modelName)
+		group := relayInfo.UsingGroup
+		if autoGroup, exists := common.GetContextKey(ctx, constant.ContextKeyAutoGroup); exists {
+			group = autoGroup.(string)
+			relayInfo.UsingGroup = group
+		}
+		effectiveRate = ratio_setting.GetGroupRatio(group)
+		if special, ok := ratio_setting.GetGroupGroupRatio(relayInfo.UserGroup, group); ok {
+			effectiveRate = special
+		}
 	}
-
-	token, err := model.GetTokenByKey(strings.TrimPrefix(relayInfo.TokenKey, "sk-"), false)
-	if err != nil {
-		return err
-	}
-
-	modelName := relayInfo.OriginModelName
-	textInputTokens := usage.InputTokenDetails.TextTokens
-	textOutTokens := usage.OutputTokenDetails.TextTokens
-	audioInputTokens := usage.InputTokenDetails.AudioTokens
-	audioOutTokens := usage.OutputTokenDetails.AudioTokens
-	groupRatio := ratio_setting.GetGroupRatio(relayInfo.UsingGroup)
-	modelRatio, _, _ := ratio_setting.GetModelRatio(modelName)
-
-	autoGroup, exists := common.GetContextKey(ctx, constant.ContextKeyAutoGroup)
-	if exists {
-		groupRatio = ratio_setting.GetGroupRatio(autoGroup.(string))
-		logger.LogDebug(ctx, "final group ratio: %f", groupRatio)
-		relayInfo.UsingGroup = autoGroup.(string)
-	}
-
-	actualGroupRatio := groupRatio
-	userGroupRatio, ok := ratio_setting.GetGroupGroupRatio(relayInfo.UserGroup, relayInfo.UsingGroup)
-	if ok {
-		actualGroupRatio = userGroupRatio
-	}
-
 	quotaInfo := QuotaInfo{
 		InputDetails: TokenDetails{
-			TextTokens:  textInputTokens,
-			AudioTokens: audioInputTokens,
+			TextTokens:  usage.InputTokenDetails.TextTokens,
+			AudioTokens: usage.InputTokenDetails.AudioTokens,
 		},
 		OutputDetails: TokenDetails{
-			TextTokens:  textOutTokens,
-			AudioTokens: audioOutTokens,
+			TextTokens:  usage.OutputTokenDetails.TextTokens,
+			AudioTokens: usage.OutputTokenDetails.AudioTokens,
 		},
 		ModelName:  modelName,
-		UsePrice:   relayInfo.UsePrice,
 		ModelRatio: modelRatio,
-		GroupRatio: actualGroupRatio,
+		GroupRatio: effectiveRate,
 	}
-
 	quota, clamp := calculateAudioQuota(quotaInfo)
 	noteQuotaClamp(relayInfo, clamp)
-
-	if userQuota < quota {
-		return fmt.Errorf("user quota is not enough, user quota: %s, need quota: %s", logger.FormatQuota(userQuota), logger.FormatQuota(quota))
+	if ok, tieredQuota, _ := TryTieredSettle(relayInfo, billingexpr.TokenParams{
+		P: float64(usage.InputTokens), C: float64(usage.OutputTokens), Len: float64(usage.InputTokens),
+	}); ok {
+		quota = tieredQuota
 	}
-
-	if !token.UnlimitedQuota && token.RemainQuota < quota {
-		return fmt.Errorf("token quota is not enough, token remain quota: %s, need quota: %s", logger.FormatQuota(token.RemainQuota), logger.FormatQuota(quota))
+	if relayInfo.Billing == nil {
+		if quota == 0 {
+			return nil
+		}
+		if apiErr := PreConsumeBilling(ctx, quota, relayInfo); apiErr != nil {
+			return apiErr
+		}
 	}
-
-	err = PostConsumeQuota(relayInfo, quota, 0, false)
-	if err != nil {
+	if err := relayInfo.Billing.ReserveBeforeSubmit(quota); err != nil {
 		return err
 	}
+	relayInfo.FinalPreConsumedQuota = relayInfo.Billing.GetPreConsumedQuota()
 	logger.LogInfo(ctx, common.LogText("realtime streaming consume quota success, quota: %d", quota))
 	return nil
 }
@@ -196,7 +185,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		ModelName:  modelName,
 		UsePrice:   usePrice,
 		ModelRatio: modelRatio,
-		GroupRatio: groupRatio,
+		GroupRatio: relayInfo.PriceData.EffectiveBillingRate(),
 	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
@@ -335,7 +324,7 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		ModelName:  billingModelName,
 		UsePrice:   usePrice,
 		ModelRatio: modelRatio,
-		GroupRatio: groupRatio,
+		GroupRatio: relayInfo.PriceData.EffectiveBillingRate(),
 	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)

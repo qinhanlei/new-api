@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/types"
 )
 
 type RequestInput struct {
@@ -63,25 +64,33 @@ type TraceResult struct {
 // auto-group retry and settlement. It is fully serializable and contains no
 // compiled program pointers.
 type BillingSnapshot struct {
-	EstimatedImageCount       *int           `json:"estimated_image_count,omitempty"`
-	BillingMode               string         `json:"billing_mode"`
-	Currency                  string         `json:"currency,omitempty"`
-	ModelName                 string         `json:"model_name"`
-	ExprString                string         `json:"expr_string"`
-	ExprHash                  string         `json:"expr_hash"`
-	GroupRatio                float64        `json:"group_ratio"`
-	EstimatedPromptTokens     int            `json:"estimated_prompt_tokens"`
-	EstimatedCompletionTokens int            `json:"estimated_completion_tokens"`
-	PreConsumeMultiplier      float64        `json:"pre_consume_multiplier,omitempty"` // Reservation only; zero in older snapshots means 1.
-	EstimatedQuotaBeforeGroup float64        `json:"estimated_quota_before_group"`
-	EstimatedQuotaAfterGroup  int            `json:"estimated_quota_after_group"`
-	EstimatedTier             string         `json:"estimated_tier"`
-	EstimatedBillingUnit      BillingUnit    `json:"estimated_billing_unit,omitempty"`
-	EstimatedFixedPrice       *float64       `json:"estimated_fixed_price,omitempty"`
-	QuotaPerUnit              float64        `json:"quota_per_unit"`
-	ExprVersion               int            `json:"expr_version"`
-	TaskUsageBilling          bool           `json:"task_usage_billing,omitempty"`
-	UsageFacts                map[string]any `json:"usage_facts,omitempty"`
+	Currency                  string                     `json:"currency,omitempty"`
+	EstimatedImageCount       *int                       `json:"estimated_image_count,omitempty"`
+	BillingMode               string                     `json:"billing_mode"`
+	ModelName                 string                     `json:"model_name"`
+	ExprString                string                     `json:"expr_string"`
+	ExprHash                  string                     `json:"expr_hash"`
+	GroupRatio                float64                    `json:"group_ratio"`
+	BillingRate               *types.BillingRateSnapshot `json:"billing_rate,omitempty"`
+	EstimatedPromptTokens     int                        `json:"estimated_prompt_tokens"`
+	EstimatedCompletionTokens int                        `json:"estimated_completion_tokens"`
+	PreConsumeMultiplier      float64                    `json:"pre_consume_multiplier,omitempty"` // Reservation only; zero in older snapshots means 1.
+	EstimatedQuotaBeforeGroup float64                    `json:"estimated_quota_before_group"`
+	EstimatedQuotaAfterGroup  int                        `json:"estimated_quota_after_group"`
+	EstimatedTier             string                     `json:"estimated_tier"`
+	EstimatedBillingUnit      BillingUnit                `json:"estimated_billing_unit,omitempty"`
+	EstimatedFixedPrice       *float64                   `json:"estimated_fixed_price,omitempty"`
+	QuotaPerUnit              float64                    `json:"quota_per_unit"`
+	ExprVersion               int                        `json:"expr_version"`
+	TaskUsageBilling          bool                       `json:"task_usage_billing,omitempty"`
+	UsageFacts                map[string]any             `json:"usage_facts,omitempty"`
+}
+
+func (s *BillingSnapshot) EffectiveBillingRate() float64 {
+	if s.BillingRate != nil {
+		return s.BillingRate.Rate
+	}
+	return s.GroupRatio
 }
 
 // BillingCurrency preserves the USD denomination of historical snapshots.

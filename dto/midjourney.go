@@ -27,6 +27,7 @@ type MidjourneyRequest struct {
 }
 
 type MidjourneyResponse struct {
+	HTTPStatus  int    `json:"-"` // Local transport errors; never supplied by an upstream response.
 	Code        int    `json:"code"`
 	Description string `json:"description"`
 	Properties  any    `json:"properties"`

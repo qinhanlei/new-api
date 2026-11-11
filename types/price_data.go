@@ -21,25 +21,61 @@ type GroupRatioInfo struct {
 	HasSpecialRatio   bool
 }
 
+// BillingRateSnapshot freezes the selected commercial rate, including a rule
+// miss. Only group fallbacks may change when routing selects another group.
+type BillingRateSnapshot struct {
+	Rate      float64 `json:"rate"`
+	Source    string  `json:"source"`
+	Version   int64   `json:"version"`
+	ModelName string  `json:"model_name"`
+}
+
+func (r *BillingRateSnapshot) IsOverride() bool {
+	return r != nil && (r.Source == "user" || r.Source == "model")
+}
+
 type PriceData struct {
-	Currency              string // Empty historical values mean USD.
-	FreeModel             bool
-	ModelPrice            float64
-	ModelRatio            float64
-	CompletionRatio       float64
-	CacheRatio            float64
-	CacheCreationRatio    float64
-	CacheCreation5mRatio  float64
-	CacheCreation1hRatio  float64
-	CacheCreation12hRatio float64
-	ImageRatio            float64
-	AudioRatio            float64
-	AudioCompletionRatio  float64
-	otherRatios           map[string]float64
-	UsePrice              bool
-	Quota                 int // 按次计费的最终额度（MJ / Task）
-	QuotaToPreConsume     int // 按量计费的预消耗额度
-	GroupRatioInfo        GroupRatioInfo
+	Currency               string // Empty historical values mean USD.
+	FreeModel              bool
+	ModelPrice             float64
+	ModelRatio             float64
+	CompletionRatio        float64
+	CacheRatio             float64
+	CacheCreationRatio     float64
+	CacheCreation5mRatio   float64
+	CacheCreation1hRatio   float64
+	CacheCreation12hRatio  float64
+	ImageRatio             float64
+	AudioRatio             float64
+	AudioCompletionRatio   float64
+	otherRatios            map[string]float64
+	UsePrice               bool
+	Quota                  int // 按次计费的最终额度（MJ / Task）
+	QuotaToPreConsume      int // 按量计费的预消耗额度
+	GroupRatioInfo         GroupRatioInfo
+	BillingRate            *BillingRateSnapshot
+	QuotaBeforeBillingRate float64 // Unrounded reservation, used when a retry changes groups.
+}
+
+func (p *PriceData) EffectiveBillingRate() float64 {
+	if p.BillingRate != nil {
+		return p.BillingRate.Rate
+	}
+	return p.GroupRatioInfo.GroupRatio
+}
+
+func (p *PriceData) SetGroupRatioInfo(group GroupRatioInfo) {
+	p.GroupRatioInfo = group
+	if p.BillingRate == nil || p.BillingRate.IsOverride() {
+		return
+	}
+	rate := *p.BillingRate
+	rate.Rate = group.GroupRatio
+	rate.Source = "group"
+	if group.HasSpecialRatio {
+		rate.Source = "group_special"
+	}
+	p.BillingRate = &rate
 }
 
 func (p *PriceData) AddOtherRatio(key string, ratio float64) {

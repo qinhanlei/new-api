@@ -21,9 +21,12 @@ import (
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -64,6 +67,23 @@ func (b *taskSubmissionTestBilling) Reserve(int) error {
 }
 
 func (b *taskSubmissionTestBilling) ReserveBeforeSubmit(quota int) error { return b.Reserve(quota) }
+
+type assetSubmissionTestAdaptor struct {
+	channel.TaskAdaptor
+	url string
+}
+
+func (a *assetSubmissionTestAdaptor) BuildRequestURL(*relaycommon.RelayInfo) (string, error) {
+	return a.url, nil
+}
+
+func (*assetSubmissionTestAdaptor) BuildRequestHeader(*gin.Context, *http.Request, *relaycommon.RelayInfo) error {
+	return nil
+}
+
+func (*assetSubmissionTestAdaptor) SubmissionStarted(c *gin.Context) {
+	c.Set(pluginruntime.ContextKeyAssetSubmissionStarted, true)
+}
 
 func TestPresentTaskSubmissionUsesNativePresenterAfterPersistence(t *testing.T) {
 	plugin, err := pluginruntime.CompilePlugin(`
@@ -575,6 +595,7 @@ func taskSubmissionRelayInfo(billing relaycommon.BillingSettler) *relaycommon.Re
 // runs leave a record.
 func openTaskDialectDatabase(t *testing.T, models ...any) (*gorm.DB, common.DatabaseType) {
 	t.Helper()
+	models = append(models, &model.BillingRateRule{})
 	dialect := common.DatabaseType(os.Getenv("TEST_TASK_DB_DIALECT"))
 	var driver gorm.Dialector
 	switch dialect {
@@ -897,9 +918,9 @@ func TestExecuteTaskSubmissionRefundsWhenFinalReserveFails(t *testing.T) {
 }
 
 func TestCNYTaskSubmissionKeepsReservationUntilTerminal(t *testing.T) {
-	for _, state := range []string{"async", "success", "failure", "unknown", "insert failure"} {
+	for _, state := range []string{"async", "success", "failure", "unknown", "insert failure", "local rejection"} {
 		t.Run(state, func(t *testing.T) {
-			db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}, &model.CNYWallet{}, &model.CNYTokenBudget{}, &model.CNYBillingRecord{})
+			db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}, &model.Asset{}, &model.AssetUse{}, &model.CNYWallet{}, &model.CNYTokenBudget{}, &model.CNYBillingRecord{})
 			previousDB, previousLogDB := model.DB, model.LOG_DB
 			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 			previousRetry := common.RetryTimes
@@ -923,14 +944,34 @@ func TestCNYTaskSubmissionKeepsReservationUntilTerminal(t *testing.T) {
 			info.PriceData = types.PriceData{Currency: "CNY", Quota: 10000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}
 			expr := `v2:CNY:u("tokens") * 10 / 1000000`
 			info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{Currency: "CNY", BillingMode: "tiered_expr", ExprString: expr, ExprHash: billingexpr.ExprHashString(expr), GroupRatio: 1, QuotaPerUnit: 500000, TaskUsageBilling: true, UsageFacts: map[string]any{"tokens": float64(2000)}}
+			asset := model.Asset{PublicID: "asset-na-cny", UserID: 1, Status: model.AssetActive}
+			require.NoError(t, db.Create(&asset).Error)
+			require.NoError(t, db.Create(&model.AssetUse{AssetID: asset.ID, TaskID: info.PublicTaskID, ChannelID: 1, CreatedAt: time.Now().Unix()}).Error)
+			c.Set(pluginruntime.ContextKeyAssetReferences, []string{asset.PublicID})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if state == "unknown" {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if assert.NoError(t, err) {
+						_ = conn.Close()
+					}
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(upstream.Close)
+			adaptor := &assetSubmissionTestAdaptor{url: upstream.URL}
 			attempts := 0
 			outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
 				attempts++
 				require.Nil(t, service.PreConsumeBilling(c, 10000, info))
-				service.MarkCNYUpstreamPending(info, true)
-				if state == "unknown" {
-					return nil, service.TaskErrorWrapper(errors.New("transport lost after submit"), "do_request_failed", http.StatusBadGateway)
+				if state == "local rejection" {
+					info.ChannelSetting.Proxy = "://invalid"
 				}
+				response, err := channel.DoTaskApiRequest(adaptor, c, info, strings.NewReader(`{}`))
+				if err != nil {
+					return nil, service.TaskErrorWrapperLocal(err, "do_request_failed", http.StatusBadGateway)
+				}
+				require.NoError(t, response.Body.Close())
 				result := &relay.TaskSubmitResult{UpstreamTaskID: "upstream-id", Platform: constant.TaskPlatform("doubao"), Quota: 10000}
 				if state == "success" {
 					result.Immediate = &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}
@@ -945,7 +986,11 @@ func TestCNYTaskSubmissionKeepsReservationUntilTerminal(t *testing.T) {
 				}
 				return result, nil
 			})
-			assert.Equal(t, 1, attempts)
+			wantAttempts := 1
+			if state == "local rejection" {
+				wantAttempts += common.RetryTimes
+			}
+			assert.Equal(t, wantAttempts, attempts)
 			record, err := model.GetCNYBillingRecord("request-native")
 			require.NoError(t, err)
 			wallet, err := model.GetCNYWallet(1)
@@ -966,11 +1011,24 @@ func TestCNYTaskSubmissionKeepsReservationUntilTerminal(t *testing.T) {
 				require.Nil(t, taskErr)
 				assert.Equal(t, model.CNYBillingRefunded, record.Status)
 				assert.Equal(t, 100000, wallet.Quota)
+			case "local rejection":
+				require.NotNil(t, taskErr)
+				assert.Equal(t, model.CNYBillingRefunded, record.Status)
+				assert.Equal(t, 100000, wallet.Quota)
+				assert.False(t, c.GetBool(pluginruntime.ContextKeyAssetSubmissionStarted))
 			default:
 				require.NotNil(t, taskErr)
 				assert.Equal(t, model.CNYBillingReserved, record.Status)
 				assert.Equal(t, 90000, wallet.Quota)
 				assert.Zero(t, wallet.UsedQuota)
+			}
+			var uses []model.AssetUse
+			require.NoError(t, db.Find(&uses).Error)
+			if state == "local rejection" {
+				assert.Empty(t, uses)
+			} else {
+				require.Len(t, uses, 1)
+				assert.Equal(t, taskErr == nil, uses[0].Committed)
 			}
 			var user model.User
 			require.NoError(t, db.First(&user, 1).Error)
@@ -1012,7 +1070,7 @@ func TestCNYTextAdmissionBeforeChannelMetadata(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 7, record.ChannelID)
 	c.Set("channel_id", 8)
-	require.Nil(t, service.PrepareTieredBillingForSelectedGroup(c, info))
+	require.Nil(t, service.PrepareBillingForSelectedGroup(c, info))
 	record, err = model.GetCNYBillingRecord(info.RequestId)
 	require.NoError(t, err)
 	assert.Equal(t, 8, record.ChannelID)
@@ -1033,5 +1091,116 @@ func TestCNYTextAdmissionBeforeChannelMetadata(t *testing.T) {
 		response := handler(c, &relaycommon.RelayInfo{})
 		require.NotNil(t, response)
 		assert.Equal(t, i18n.T(c, i18n.MsgBillingUSDTokenExhausted), response.Description)
+	}
+}
+
+func TestCNYBillingRatesAdmissionAndSettlement(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		group      float64
+		userRate   *string
+		wantRate   float64
+		wantSource string
+	}{
+		{"model replaces group", 2, nil, 0.8, "model"},
+		{"user replaces model", 2, common.GetPointer("0.5"), 0.5, "user"},
+		{"paid override of free group", 0, common.GetPointer("0.5"), 0.5, "user"},
+		{"free override of paid group", 2, common.GetPointer("0"), 0, "user"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Token{}, &model.Channel{}, &model.CNYWallet{}, &model.CNYTokenBudget{}, &model.CNYBillingRecord{})
+			previousDB, previousLogs, previousEnabled := model.DB, model.LOG_DB, common.LogConsumeEnabled
+			mainType, logType := common.MainDatabaseType(), common.LogDatabaseType()
+			previousConfig := config.GlobalConfig.ExportAllConfigs()
+			previousFX, previousCount := operation_setting.USDExchangeRate, constant.CountToken
+			model.DB, model.LOG_DB, common.LogConsumeEnabled = db, nil, false
+			common.SetDatabaseTypes(dialect, dialect)
+			constant.CountToken = false
+			t.Cleanup(func() {
+				model.DB, model.LOG_DB, common.LogConsumeEnabled = previousDB, previousLogs, previousEnabled
+				common.SetDatabaseTypes(mainType, logType)
+				require.NoError(t, config.GlobalConfig.LoadFromDB(previousConfig))
+				operation_setting.USDExchangeRate, constant.CountToken = previousFX, previousCount
+			})
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+				"billing_setting.billing_mode":                `{"native-rate":"tiered_expr"}`,
+				"billing_setting.billing_expr":                `{"native-rate":"v2:CNY:2000 + p * 2 + c * 8"}`,
+				"group_ratio_setting.group_ratio":             fmt.Sprintf(`{"default":%g}`, tc.group),
+				"quota_setting.pre_consume_multiplier":        "1",
+				"quota_setting.enable_free_model_pre_consume": "false",
+			}))
+			require.NoError(t, db.Create(&model.User{Id: 1, Username: "native-rates", Status: common.UserStatusEnabled, Quota: 123456}).Error)
+			require.NoError(t, db.Create(&model.Token{Id: 1, UserId: 1, Key: strings.Repeat("d", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1}).Error)
+			require.NoError(t, db.Create(&model.Channel{Id: 1, Name: "native-rates", Key: "test"}).Error)
+			_, err := model.AdjustCNYWallet(1, 99, common.RoleRootUser, 100000, "initial", "test")
+			require.NoError(t, err)
+			_, err = model.UpdateCNYTokenBudget(1, 1, model.CNYTokenBudgetChange{Enabled: true, RemainQuota: 100000})
+			require.NoError(t, err)
+			_, _, err = model.UpdateBillingRateRules(0, 99, []model.BillingRateChange{{ModelName: "native-rate", Rate: common.GetPointer("0.8")}})
+			require.NoError(t, err)
+			version := int64(0)
+			if tc.userRate != nil {
+				_, _, err = model.UpdateBillingRateRules(1, 99, []model.BillingRateChange{{ModelName: "native-rate", Rate: tc.userRate}})
+				require.NoError(t, err)
+				version = 1
+			}
+			c := taskSubmissionTestContext()
+			c.Set("token_usd_exhausted", true)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+			info := &relaycommon.RelayInfo{
+				UserId: 1, TokenId: 1, RequestId: "native-rates", OriginModelName: "native-rate", UserGroup: "default", UsingGroup: "default",
+				StartTime: time.Now(), RelayMode: relayconstant.RelayModeChatCompletions,
+				ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 1}, BillingRequestInput: &billingexpr.RequestInput{},
+			}
+			// This entry point resolves DB rules through ModelPriceHelper before
+			// reserving the native wallet, including explicitly free overrides.
+			require.Nil(t, relay.PrepareRequestBilling(c, info))
+			require.NotNil(t, info.Billing)
+			rate := info.PriceData.BillingRate
+			require.NotNil(t, rate)
+			assert.Equal(t, tc.wantSource, rate.Source)
+			assert.Equal(t, tc.wantRate, rate.Rate)
+			assert.Equal(t, billingexpr.CurrencyCNY, info.PriceData.Currency)
+			record, err := model.GetCNYBillingRecord(info.RequestId)
+			require.NoError(t, err)
+			assert.Equal(t, common.QuotaRound(1000*tc.wantRate), record.ReservedQuota)
+			_, _, err = model.UpdateBillingRateRules(1, 99, []model.BillingRateChange{{ModelName: "native-rate", Rate: common.GetPointer("0.9"), ExpectedVersion: version}})
+			require.NoError(t, err)
+			operation_setting.USDExchangeRate = 100
+			info.PriceData.SetGroupRatioInfo(types.GroupRatioInfo{GroupRatio: 3})
+			require.Nil(t, service.PrepareBillingForSelectedGroup(c, info))
+			assert.Equal(t, rate, info.TieredBillingSnapshot.BillingRate)
+			service.PostTextConsumeQuota(c, info, &relaydto.Usage{PromptTokens: 2000, CompletionTokens: 100, TotalTokens: 2100}, nil)
+			record, err = model.GetCNYBillingRecord(info.RequestId)
+			require.NoError(t, err)
+			wantQuota := common.QuotaRound(3400 * tc.wantRate)
+			assert.Equal(t, model.CNYBillingSettled, record.Status)
+			assert.Equal(t, billingexpr.CurrencyCNY, record.Currency)
+			assert.Equal(t, wantQuota, record.Quota)
+			var storedSnapshot billingexpr.BillingSnapshot
+			require.NoError(t, common.UnmarshalJsonStr(record.Snapshot, &storedSnapshot))
+			assert.Equal(t, rate, storedSnapshot.BillingRate)
+			assert.Equal(t, billingexpr.CurrencyCNY, storedSnapshot.BillingCurrency())
+			var other struct {
+				BillingRate *types.BillingRateSnapshot `json:"billing_rate"`
+			}
+			require.NoError(t, common.UnmarshalJsonStr(record.Other, &other))
+			assert.Equal(t, rate, other.BillingRate)
+			wallet, err := model.GetCNYWallet(1)
+			require.NoError(t, err)
+			assert.Equal(t, 100000-wantQuota, wallet.Quota)
+			assert.Equal(t, wantQuota, wallet.UsedQuota)
+			assert.Zero(t, wallet.ReservedQuota)
+			budget, err := model.GetCNYTokenBudget(1, 1)
+			require.NoError(t, err)
+			assert.Equal(t, 100000-wantQuota, budget.RemainQuota)
+			var user model.User
+			var token model.Token
+			require.NoError(t, db.First(&user, 1).Error)
+			require.NoError(t, db.First(&token, 1).Error)
+			assert.Equal(t, 123456, user.Quota)
+			assert.Zero(t, user.UsedQuota)
+			assert.Zero(t, token.UsedQuota)
+		})
 	}
 }

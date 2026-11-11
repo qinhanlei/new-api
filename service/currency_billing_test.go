@@ -60,7 +60,7 @@ func TestCNYServiceDatabaseMatrix(t *testing.T) {
 			previousFX := operation_setting.USDExchangeRate
 			model.DB, model.LOG_DB, common.LogConsumeEnabled = db, nil, false
 			common.SetDatabaseTypes(database.kind, database.kind)
-			tables := []any{&model.CNYBillingRecord{}, &model.CNYTokenBudget{}, &model.CNYWallet{}, &model.Task{}, &model.Channel{}, &model.Token{}, &model.User{}}
+			tables := []any{&model.BillingRateRule{}, &model.CNYBillingRecord{}, &model.CNYTokenBudget{}, &model.CNYWallet{}, &model.Task{}, &model.Channel{}, &model.Token{}, &model.User{}}
 			require.NoError(t, db.Migrator().DropTable(tables...))
 			require.NoError(t, db.AutoMigrate(tables...))
 			t.Cleanup(func() {
@@ -127,16 +127,30 @@ func TestCNYServiceDatabaseMatrix(t *testing.T) {
 				if failed {
 					id = "task-failure"
 				}
-				c, info = cnyServiceRequest(id, `v2:CNY:u("tokens") * 10 / 1000000`, 10000)
+				_, _, err = model.UpdateBillingRateRules(1, 99, []model.BillingRateChange{{ModelName: id, Rate: common.GetPointer("0.5")}})
+				require.NoError(t, err)
+				rate, err := model.ResolveBillingRate(1, id, hosttypes.GroupRatioInfo{GroupRatio: 0})
+				require.NoError(t, err)
+				c, info = cnyServiceRequest(id, `v2:CNY:u("tokens") * 10 / 1000000`, 5000)
+				info.OriginModelName = id
+				info.PriceData.GroupRatioInfo.GroupRatio = 0
+				info.PriceData.BillingRate = rate
+				info.TieredBillingSnapshot.GroupRatio = 0
+				info.TieredBillingSnapshot.BillingRate = rate
 				info.TieredBillingSnapshot.TaskUsageBilling = true
 				info.TieredBillingSnapshot.UsageFacts = map[string]any{"tokens": float64(2000)}
-				require.Nil(t, PreConsumeBilling(c, 10000, info))
+				require.Nil(t, PreConsumeBilling(c, 5000, info))
 				task := &model.Task{TaskID: id, UserId: 1, ChannelId: 1, Status: model.TaskStatusSubmitted, SubmitTime: time.Now().Unix() - 3600,
-					PrivateData: model.TaskPrivateData{TokenId: 1, Execution: &model.TaskExecutionSnapshot{RequestID: id}, BillingContext: &model.TaskBillingContext{TieredSnapshot: info.TieredBillingSnapshot}}}
+					PrivateData: model.TaskPrivateData{TokenId: 1, Execution: &model.TaskExecutionSnapshot{RequestID: id}, BillingContext: &model.TaskBillingContext{BillingRate: rate, TieredSnapshot: info.TieredBillingSnapshot}}}
 				require.NoError(t, model.InsertCNYTask(context.Background(), task, nil))
 				record, err = model.GetCNYBillingRecord(id)
 				require.NoError(t, err)
 				assert.Equal(t, model.CNYBillingSubmitted, record.Status)
+				assert.Equal(t, 5000, record.ReservedQuota)
+				// Completion after a rule edit must use the persisted submission rate.
+				_, _, err = model.UpdateBillingRateRules(1, 99, []model.BillingRateChange{{ModelName: id, Rate: common.GetPointer("1.5"), ExpectedVersion: 1}})
+				require.NoError(t, err)
+				require.NoError(t, db.First(task, task.ID).Error)
 				// Local expiry and failed polls must not infer a vendor failure.
 				oldTimeout := constant.TaskTimeoutMinutes
 				constant.TaskTimeoutMinutes = 1
@@ -164,16 +178,33 @@ func TestCNYServiceDatabaseMatrix(t *testing.T) {
 					assert.Equal(t, model.CNYBillingRefunded, record.Status)
 				} else {
 					assert.Equal(t, model.CNYBillingSettled, record.Status)
-					assert.Equal(t, 5000, record.Quota)
+					assert.Equal(t, 2500, record.Quota)
 				}
+				assert.Equal(t, billingexpr.CurrencyCNY, record.Currency)
+				var storedSnapshot billingexpr.BillingSnapshot
+				require.NoError(t, common.UnmarshalJsonStr(record.Snapshot, &storedSnapshot))
+				assert.Equal(t, rate, storedSnapshot.BillingRate)
+				var other struct {
+					BillingRate *hosttypes.BillingRateSnapshot `json:"billing_rate"`
+				}
+				logs, total, err := model.GetUserCNYLogs(1, model.LogFilter{RequestId: id}, 0, 10)
+				require.NoError(t, err)
+				require.Equal(t, int64(1), total)
+				require.Len(t, logs, 1)
+				require.NoError(t, common.UnmarshalJsonStr(logs[0].Other, &other))
+				assert.Equal(t, rate, other.BillingRate)
 			}
 			// An output-only expression estimates zero, but still needs available CNY funds.
 			require.NoError(t, db.Model(&model.CNYWallet{}).Where("user_id = ?", 1).Update("quota", 0).Error)
 			c, info = cnyServiceRequest("empty-wallet", "v2:CNY:c * 8", 0)
+			info.TieredBillingSnapshot.GroupRatio = 0
+			info.TieredBillingSnapshot.BillingRate = &hosttypes.BillingRateSnapshot{Rate: 0.5, Source: "user"}
 			require.NotNil(t, PreConsumeBilling(c, 0, info))
 			require.NoError(t, db.Model(&model.CNYWallet{}).Where("user_id = ?", 1).Update("quota", 100).Error)
 			require.NoError(t, db.Model(&model.CNYTokenBudget{}).Where("token_id = ?", 1).Update("remain_quota", 0).Error)
 			c, info = cnyServiceRequest("empty-budget", "v2:CNY:c * 8", 0)
+			info.TieredBillingSnapshot.GroupRatio = 0
+			info.TieredBillingSnapshot.BillingRate = &hosttypes.BillingRateSnapshot{Rate: 0.5, Source: "user"}
 			require.NotNil(t, PreConsumeBilling(c, 0, info))
 			require.NoError(t, db.Model(&model.CNYWallet{}).Where("user_id = ?", 1).Update("quota", 0).Error)
 			c, info = cnyServiceRequest("known-free", "v2:CNY:0", 0)
@@ -183,6 +214,22 @@ func TestCNYServiceDatabaseMatrix(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, model.CNYBillingSettled, record.Status)
 			assert.Zero(t, record.Quota)
+			c, info = cnyServiceRequest("free-override", "v2:CNY:p * 10", 0)
+			info.PriceData.BillingRate = &hosttypes.BillingRateSnapshot{Rate: 0, Source: "user"}
+			info.TieredBillingSnapshot.BillingRate = info.PriceData.BillingRate
+			require.Nil(t, PrepareBillingForSelectedGroup(c, info))
+			require.NotNil(t, info.Billing)
+			PostTextConsumeQuota(c, info, &dto.Usage{PromptTokens: 1000, TotalTokens: 1000}, nil)
+			record, err = model.GetCNYBillingRecord("free-override")
+			require.NoError(t, err)
+			assert.Equal(t, model.CNYBillingSettled, record.Status)
+			assert.Zero(t, record.Quota)
+			// A free override still requires an enabled CNY token budget.
+			require.NoError(t, db.Model(&model.CNYTokenBudget{}).Where("token_id = ?", 1).Update("enabled", false).Error)
+			c, info = cnyServiceRequest("free-disabled-budget", "v2:CNY:p * 10", 0)
+			info.PriceData.BillingRate = &hosttypes.BillingRateSnapshot{Rate: 0, Source: "user"}
+			info.TieredBillingSnapshot.BillingRate = info.PriceData.BillingRate
+			require.NotNil(t, PrepareBillingForSelectedGroup(c, info))
 			var user model.User
 			var token model.Token
 			var channel model.Channel

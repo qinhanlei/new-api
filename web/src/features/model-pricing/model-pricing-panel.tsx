@@ -24,6 +24,8 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
 import { Button } from '@/components/ui/button'
+import { BillingRatesDrawer } from '@/features/billing-rates/billing-rates-drawer'
+import { BillingRatesEditor } from '@/features/billing-rates/billing-rates-editor'
 import { DynamicPricingBreakdown } from '@/features/pricing/components/dynamic-pricing-breakdown'
 import { ModelPriceCell } from '@/features/pricing/components/model-price-cell'
 import { isDynamicPricingModel } from '@/features/pricing/lib/dynamic-price'
@@ -66,6 +68,14 @@ export function ModelPricingPanel(props: {
   const save = useSaveModelPricing()
   const [entry, setEntry] = useState<ModelPricingEntry | null>(null)
   const [resetOpen, setResetOpen] = useState(false)
+  const [ratesOpen, setRatesOpen] = useState(false)
+  const [priceDirty, setPriceDirty] = useState(false)
+  const [ratesDirty, setRatesDirty] = useState(false)
+  const notifyDirty = props.onDirtyChange
+  useEffect(
+    () => notifyDirty?.(priceDirty || ratesDirty),
+    [notifyDirty, priceDirty, ratesDirty]
+  )
   const editor = useRef<ModelPricingEditorPanelHandle>(null)
   const editData = useMemo(() => {
     if (!entry) return null
@@ -165,7 +175,7 @@ export function ModelPricingPanel(props: {
         editData={editData}
         usageSchema={entry.usage_schema}
         pluginVariants={entry.plugin_variants}
-        onDirtyChange={props.onDirtyChange}
+        onDirtyChange={setPriceDirty}
         onSave={() => persist()}
         isSaving={save.isPending}
         className='rounded-none border-0'
@@ -229,6 +239,26 @@ export function ModelPricingPanel(props: {
                 )
               )}
             </section>
+            <section className='space-y-3 border-b pb-3'>
+              <div className='flex flex-wrap items-center justify-between gap-2'>
+                <h3 className='text-sm font-medium'>
+                  {t('Global model rate')}
+                </h3>
+                <Button
+                  type='button'
+                  variant='outline'
+                  size='sm'
+                  onClick={() => setRatesOpen(true)}
+                >
+                  {t('Manage all model rates')}
+                </Button>
+              </div>
+              <BillingRatesEditor
+                key={props.modelName}
+                modelName={props.modelName}
+                onDirtyChange={setRatesDirty}
+              />
+            </section>
             {save.isError && (
               <div>
                 <p role='alert' className='text-destructive mb-2 text-sm'>
@@ -255,6 +285,7 @@ export function ModelPricingPanel(props: {
           </>
         }
       />
+      <BillingRatesDrawer open={ratesOpen} onOpenChange={setRatesOpen} />
       <ConfirmDialog
         open={resetOpen}
         onOpenChange={setResetOpen}

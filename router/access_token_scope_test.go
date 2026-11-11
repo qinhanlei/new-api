@@ -4,18 +4,24 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // accessTokenExemptRoutes are /api routes that never reach dashboard
@@ -161,6 +167,85 @@ func TestAccessTokenCatalogCoversEveryPermission(t *testing.T) {
 	}
 	for resource, count := range resources {
 		assert.Equal(t, 1, count, "resource %s appears in more than one catalog entry", resource)
+	}
+}
+
+func TestBillingRateRoutesRequireRoot(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.BillingRateRule{}, &model.Log{}, &model.AuditLog{}))
+	connection, err := db.DB()
+	require.NoError(t, err)
+	connection.SetMaxOpenConns(1)
+	previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	previousSecret := common.SessionSecret
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	common.SessionSecret = "billing-rate-route-test"
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		common.SessionSecret = previousSecret
+		common.SetDatabaseTypes(previousMain, previousLog)
+		require.NoError(t, connection.Close())
+	})
+	require.NoError(t, i18n.Init())
+	engine := newAccessTokenScopeTestEngine(t)
+	credentials := map[int]string{0: ""}
+	rootID := 0
+	for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+		user := model.User{Username: "rate-role-" + strconv.Itoa(role), AffCode: "rate-role-" + strconv.Itoa(role), Password: "fixture", Role: role, Status: common.UserStatusEnabled, AuthVersion: 1}
+		require.NoError(t, db.Create(&user).Error)
+		bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "billing-rate-test")
+		require.NoError(t, err)
+		credentials[role] = bundle.AccessToken
+		if role == common.RoleRootUser {
+			rootID = user.Id
+		}
+	}
+	for role, credential := range credentials {
+		for _, path := range []string{"/api/option/billing_rates", "/api/user/1/billing_rates"} {
+			for _, method := range []string{http.MethodGet, http.MethodPatch} {
+				request := httptest.NewRequest(method, path, strings.NewReader(`{"changes":[]}`))
+				if credential != "" {
+					request.Header.Set("Authorization", "Bearer "+credential)
+				}
+				request.Header.Set("Content-Type", "application/json")
+				response := httptest.NewRecorder()
+				engine.ServeHTTP(response, request)
+				switch role {
+				case 0:
+					assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+				case common.RoleRootUser:
+					if method == http.MethodGet {
+						assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+					} else {
+						assert.Equal(t, http.StatusBadRequest, response.Code, "root reaches validation: %s", response.Body.String())
+					}
+				default:
+					assert.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+				}
+			}
+		}
+	}
+	// Root identity does not bypass a personal access token's explicit grant.
+	rawToken := model.AccessTokenPrefix + strings.Repeat("b", 43)
+	pat := &model.UserAccessToken{TokenHash: model.AccessTokenFingerprint(rawToken), Name: "billing read fixture"}
+	require.NoError(t, pat.SetScopes([]string{"option:read", "user:read"}))
+	require.NoError(t, model.CreateUserAccessToken(rootID, pat, 20))
+	for _, path := range []string{"/api/option/billing_rates", "/api/user/1/billing_rates"} {
+		for _, method := range []string{http.MethodGet, http.MethodPatch} {
+			request := httptest.NewRequest(method, path, strings.NewReader(`{"changes":[]}`))
+			request.Header.Set("Authorization", "Bearer "+rawToken)
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			if method == http.MethodGet {
+				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			} else {
+				assert.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), "ACCESS_TOKEN_SCOPE_DENIED")
+			}
+		}
 	}
 }
 

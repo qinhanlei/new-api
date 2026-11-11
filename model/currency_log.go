@@ -95,6 +95,9 @@ func (record *CNYBillingRecord) usageLog() (*Log, error) {
 	var snapshot billingexpr.BillingSnapshot
 	if record.Snapshot != "" && common.UnmarshalJsonStr(record.Snapshot, &snapshot) == nil {
 		fallback := map[string]any{"matched_tier": snapshot.EstimatedTier, "group_ratio": snapshot.GroupRatio}
+		if snapshot.BillingRate != nil {
+			fallback["billing_rate"] = *snapshot.BillingRate
+		}
 		if snapshot.ExprString != "" {
 			fallback["billing_mode"] = snapshot.BillingMode
 			fallback["expr_b64"] = base64.StdEncoding.EncodeToString([]byte(snapshot.ExprString))

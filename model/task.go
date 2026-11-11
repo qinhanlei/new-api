@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/types"
 	"gorm.io/gorm"
 )
 
@@ -180,6 +181,14 @@ type TaskBillingContext struct {
 	OriginModelName string                       `json:"origin_model_name,omitempty"` // 模型名称，必须为OriginModelName
 	PerCallBilling  bool                         `json:"per_call_billing,omitempty"`  // 按次计费：跳过轮询阶段的差额结算
 	TieredSnapshot  *billingexpr.BillingSnapshot `json:"tiered_snapshot,omitempty"`
+	BillingRate     *types.BillingRateSnapshot   `json:"billing_rate,omitempty"`
+}
+
+func (c *TaskBillingContext) EffectiveBillingRate() float64 {
+	if c.BillingRate != nil {
+		return c.BillingRate.Rate
+	}
+	return c.GroupRatio
 }
 
 // ResultRetrievable reports whether retrieval surfaces (native query routes,

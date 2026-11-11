@@ -36,7 +36,7 @@ import {
   hasTaskUsageSchema,
   isUnconfiguredTaskUsageModel,
 } from './dynamic-price'
-import { isTokenBasedModel } from './model-helpers'
+import { getDisplayGroupRatio, isTokenBasedModel } from './model-helpers'
 import { calculateTokenPrice } from './price'
 
 // ----------------------------------------------------------------------------
@@ -154,11 +154,6 @@ const PRICE_SORTS: Partial<
   [SORT_OPTIONS.REQUEST_PRICE_HIGH]: { kind: 'request', dir: -1 },
 }
 
-/**
- * Base USD price shown on the model card: input/output per 1M tokens, request
- * per call (task models use their first usage example). Undefined when the
- * model has no price of that kind.
- */
 function getModelPricingCurrencies(model: PricingModel): string {
   const expressions = model.billing_plugin_variants?.length
     ? model.billing_plugin_variants.map((variant) => variant.billing_expr)
@@ -168,7 +163,12 @@ function getModelPricingCurrencies(model: PricingModel): string {
     .join(',')
 }
 
-function getSortPrice(
+/**
+ * Base price in the billing currency: input/output per 1M tokens, request
+ * per call (task models use their first usage example). Undefined when the
+ * model has no price of that kind or mixes billing currencies.
+ */
+function getBaseSortPrice(
   model: PricingModel,
   kind: SortPriceKind
 ): number | undefined {
@@ -203,15 +203,25 @@ function getSortPrice(
  */
 export function sortModels(
   models: PricingModel[],
-  sortBy: string
+  sortBy: string,
+  selectedGroup?: string
 ): PricingModel[] {
   const sorted = [...models]
 
   const priceSort = PRICE_SORTS[sortBy as SortOption]
   if (priceSort) {
-    // Extracting the price parses the billing expression, so compute once
+    // Expression entries and task example totals retain their base numeric
+    // values. Apply the effective rate once to sort every pricing mode by
+    // the displayed price without parsing formatted currency.
     const price = new Map(
-      sorted.map((m) => [m, getSortPrice(m, priceSort.kind)])
+      sorted.map((model) => {
+        const basePrice = getBaseSortPrice(model, priceSort.kind)
+        const effectivePrice =
+          basePrice === undefined
+            ? undefined
+            : basePrice * getDisplayGroupRatio(model, selectedGroup)
+        return [model, effectivePrice]
+      })
     )
     const currencies = new Map(
       sorted.map((model) => [model, getModelPricingCurrencies(model)])
@@ -264,7 +274,7 @@ export function filterAndSortModels(
   result = filterByQuotaType(result, filters.quotaType)
   result = filterByEndpointType(result, filters.endpointType)
   result = filterByTag(result, filters.tag)
-  result = sortModels(result, filters.sortBy)
+  result = sortModels(result, filters.sortBy, filters.group)
 
   return result
 }

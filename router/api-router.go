@@ -151,6 +151,9 @@ func SetApiRouter(router *gin.Engine) {
 				selfRoute.DELETE("/oauth/bindings/:provider_id", controller.UnbindCustomOAuth)
 			}
 
+			userRoute.GET("/:id/billing_rates", middleware.RootAuth(), middleware.DisableCache(), controller.GetBillingRates)
+			userRoute.PATCH("/:id/billing_rates", middleware.RootAuth(), middleware.DisableCache(), controller.UpdateBillingRates)
+
 			adminRoute := userRoute.Group("/")
 			adminRoute.Use(middleware.AdminAuth())
 			{
@@ -225,6 +228,8 @@ func SetApiRouter(router *gin.Engine) {
 			optionRoute.PUT("/", controller.UpdateOption)
 			optionRoute.PUT("/passkey/domains", controller.UpdatePasskeyDomains)
 			optionRoute.GET("/model_pricing", controller.GetModelPricingConfig)
+			optionRoute.GET("/billing_rates", middleware.DisableCache(), controller.GetBillingRates)
+			optionRoute.PATCH("/billing_rates", middleware.DisableCache(), controller.UpdateBillingRates)
 			optionRoute.GET("/model_pricing/issues", controller.GetModelPricingIssues)
 			optionRoute.PATCH("/model_pricing", controller.UpdateModelPricingConfig)
 			optionRoute.POST("/model_pricing/convert", controller.PreviewModelPricingConversion)

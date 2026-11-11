@@ -35,6 +35,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { billingRateSourceKey } from '@/features/billing-rates/rates'
 import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
 import {
   normalizeTierLabel,
@@ -68,6 +69,7 @@ import {
   renderLogContent,
 } from '../../lib/format'
 import {
+  getLogBillingRate,
   isDisplayableLogType,
   isTimingLogType,
   getLogTypeConfig,
@@ -90,22 +92,17 @@ function formatRatioCompact(ratio: number | undefined): string {
   if (ratio == null || !Number.isFinite(ratio)) return '-'
   return ratio % 1 === 0
     ? String(ratio)
-    : ratio.toFixed(4).replace(/\.?0+$/, '')
+    : ratio.toFixed(6).replace(/\.?0+$/, '')
 }
 
 function getGroupRatio(other: LogOtherData | null): number | null {
-  const userGroupRatio = other?.user_group_ratio
+  const rate = getLogBillingRate(other).rate
   if (
-    userGroupRatio != null &&
-    userGroupRatio !== -1 &&
-    Number.isFinite(userGroupRatio)
+    rate != null &&
+    Number.isFinite(rate) &&
+    (rate !== 1 || other?.billing_rate)
   ) {
-    return userGroupRatio
-  }
-
-  const groupRatio = other?.group_ratio
-  if (groupRatio != null && groupRatio !== 1 && Number.isFinite(groupRatio)) {
-    return groupRatio
+    return rate
   }
 
   return null
@@ -321,22 +318,25 @@ function buildTypeDetailSegments(
         }
       }
     } else {
-      const userGroupRatio = other.user_group_ratio
-      const groupRatio = other.group_ratio
-      const isUserGroup =
-        userGroupRatio != null &&
-        Number.isFinite(userGroupRatio) &&
-        userGroupRatio !== -1
-      const effectiveRatio = isUserGroup ? userGroupRatio : groupRatio
-      const ratioLabel = isUserGroup
-        ? t('User Exclusive Ratio')
-        : t('Group Ratio')
+      const billing = getLogBillingRate(other)
+      const effectiveRatio = billing.rate
+      const ratioLabel = t(billing.label)
 
       if (effectiveRatio != null && Number.isFinite(effectiveRatio)) {
         segments.push({
           text: `${ratioLabel} ${formatRatioCompact(effectiveRatio)}x`,
         })
       }
+    }
+  }
+
+  if (other.billing_rate) {
+    const label = t(billingRateSourceKey(other.billing_rate.source))
+    if (!segments.some((segment) => segment.text.startsWith(label))) {
+      segments.push({
+        text: `${label} ${formatRatioCompact(other.billing_rate.rate)}x`,
+        muted: true,
+      })
     }
   }
 
@@ -668,6 +668,9 @@ export function useCommonLogsColumns(
                 {group && groupRatio != null ? ' ' : null}
                 {groupRatio != null ? (
                   <span className='text-muted-foreground/60 relative top-px align-baseline tabular-nums'>
+                    {other?.billing_rate
+                      ? `${t(billingRateSourceKey(other.billing_rate.source))} `
+                      : ''}
                     {formatRatioCompact(groupRatio)}x
                   </span>
                 ) : null}

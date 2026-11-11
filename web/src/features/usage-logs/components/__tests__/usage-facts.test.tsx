@@ -71,7 +71,7 @@ function renderDetails(other: LogOtherData, promptTokens = 0): QueryClient {
   const freshAt = Date.now() + 60_000
   queryClient.setQueryData(['status'], {}, { updatedAt: freshAt })
   queryClient.setQueryData(
-    ['pricing'],
+    ['pricing', 0],
     { data: [], vendors: [] },
     { updatedAt: freshAt }
   )
