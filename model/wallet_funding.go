@@ -23,6 +23,7 @@ type WalletFundingRecord struct {
 	UserID                  int                    `json:"user_id" gorm:"index;not null"`
 	TokenID                 int                    `json:"-" gorm:"index"`
 	Currency                string                 `json:"currency" gorm:"type:varchar(3);not null"`
+	TokenCurrency           string                 `json:"-" gorm:"type:varchar(3)"`
 	USDQuotaPerUnit         float64                `json:"usd_quota_per_unit"`
 	CNYQuotaPerUnit         int                    `json:"cny_quota_per_unit"`
 	Exchange                WalletExchangeSnapshot `json:"exchange" gorm:"embedded;embeddedPrefix:fx_"`
@@ -47,6 +48,8 @@ type WalletFundingParams struct {
 	RequestID          string
 	UserID, TokenID    int
 	Currency           string
+	TokenCurrency      string // Selected only when creating the funding record.
+	exchangeSnapshot   *WalletExchangeSnapshot
 	Free               bool
 	SkipInitialReserve bool
 	AllowDebt          bool // Only an already admitted request's non-submit adjustment.
@@ -63,7 +66,20 @@ type WalletFundingLog struct {
 	USDQuotaPerUnit float64                `json:"usd_quota_per_unit"`
 	CNYQuotaPerUnit int                    `json:"cny_quota_per_unit"`
 	DebtQuota       int                    `json:"debt_quota"`
+	DebtCurrency    string                 `json:"debt_currency,omitempty"`
 	Exchange        WalletExchangeSnapshot `json:"exchange"`
+}
+
+// Historical records charged the key in the model's pricing currency.
+func (record *WalletFundingRecord) tokenBudgetCurrency() string {
+	if record.TokenCurrency == "" {
+		return record.Currency
+	}
+	return record.TokenCurrency
+}
+
+func (record *WalletFundingRecord) usesUSDTokenFallback() bool {
+	return record.Currency == "CNY" && record.tokenBudgetCurrency() == "USD"
 }
 
 func (record *WalletFundingRecord) LogSummary() WalletFundingLog {
@@ -80,8 +96,12 @@ func (record *WalletFundingRecord) LogSummary() WalletFundingLog {
 	if record.Currency == "CNY" {
 		usd, cny = alternate, native
 	}
+	debtCurrency := ""
+	if record.usesUSDTokenFallback() {
+		debtCurrency = record.tokenBudgetCurrency()
+	}
 	return WalletFundingLog{Currency: record.Currency, Status: record.Status, USDQuota: usd, CNYQuota: cny,
-		USDQuotaPerUnit: record.USDQuotaPerUnit, CNYQuotaPerUnit: record.CNYQuotaPerUnit, DebtQuota: debt, Exchange: record.Exchange}
+		USDQuotaPerUnit: record.USDQuotaPerUnit, CNYQuotaPerUnit: record.CNYQuotaPerUnit, DebtQuota: debt, DebtCurrency: debtCurrency, Exchange: record.Exchange}
 }
 
 func AppendWalletFundingLog(other *LogOther, requestID string, userID int) {
@@ -121,7 +141,7 @@ func ReserveWalletFunding(params WalletFundingParams, target int) (*WalletFundin
 	})
 	if err == nil {
 		InvalidateUserQuotaCache(params.UserID)
-		if params.Currency == "USD" && params.TokenID > 0 {
+		if record.tokenBudgetCurrency() == "USD" && params.TokenID > 0 {
 			var token Token
 			if DB.Select("key").Unscoped().First(&token, params.TokenID).Error == nil {
 				InvalidateTokenQuotaCache(token.Key)
@@ -141,8 +161,22 @@ func reserveWalletFunding(tx *gorm.DB, wallet *CNYWallet, user *User, params Wal
 	if !params.AllowDebt && user.Status != common.UserStatusEnabled {
 		return nil, ErrUserQuotaPermission
 	}
+	var record WalletFundingRecord
+	err := tx.Where("request_id = ?", params.RequestID).First(&record).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	tokenCurrency := params.TokenCurrency
+	if record.ID > 0 {
+		tokenCurrency = record.tokenBudgetCurrency()
+	} else if tokenCurrency == "" {
+		tokenCurrency = params.Currency
+	}
+	if tokenCurrency != params.Currency && (params.Currency != "CNY" || tokenCurrency != "USD" || params.TokenID == 0) {
+		return nil, ErrCNYInvalid
+	}
 	var token Token
-	if params.Currency == "USD" && params.TokenID > 0 {
+	if tokenCurrency == "USD" && params.TokenID > 0 {
 		tokenQuery := tx
 		if params.AllowDebt {
 			tokenQuery = tx.Unscoped()
@@ -154,8 +188,6 @@ func reserveWalletFunding(tx *gorm.DB, wallet *CNYWallet, user *User, params Wal
 			return nil, ErrTokenInvalid
 		}
 	}
-	var record WalletFundingRecord
-	err := tx.Where("request_id = ?", params.RequestID).First(&record).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		if params.AllowDebt {
 			return nil, ErrCNYState
@@ -163,24 +195,30 @@ func reserveWalletFunding(tx *gorm.DB, wallet *CNYWallet, user *User, params Wal
 		if common.QuotaPerUnit <= 0 || math.IsNaN(common.QuotaPerUnit) || math.IsInf(common.QuotaPerUnit, 0) {
 			return nil, ErrCNYInvalid
 		}
-		snapshot, snapshotErr := GetWalletExchangeSnapshot(tx, common.GetTimestamp())
-		if snapshotErr != nil && !errors.Is(snapshotErr, ErrExchangeRateUnavailable) {
-			return nil, snapshotErr
-		}
-		// An unavailable quote must not reject a request fully funded natively.
-		// The empty frozen rate also prevents later retries from adopting a new rate.
-		if snapshotErr != nil {
-			snapshot.Rate = ""
+		var snapshot WalletExchangeSnapshot
+		if params.exchangeSnapshot != nil {
+			snapshot = *params.exchangeSnapshot
+		} else {
+			var snapshotErr error
+			snapshot, snapshotErr = GetWalletExchangeSnapshot(tx, common.GetTimestamp())
+			if snapshotErr != nil && !errors.Is(snapshotErr, ErrExchangeRateUnavailable) {
+				return nil, snapshotErr
+			}
+			// An unavailable quote must not reject a request fully funded natively.
+			// The empty frozen rate also prevents retries from adopting a new rate.
+			if snapshotErr != nil {
+				snapshot.Rate = ""
+			}
 		}
 		record = WalletFundingRecord{RequestID: params.RequestID, UserID: params.UserID, TokenID: params.TokenID,
-			Currency: params.Currency, USDQuotaPerUnit: common.QuotaPerUnit, CNYQuotaPerUnit: wallet.QuotaPerUnit,
-			Exchange: snapshot, Status: CNYBillingReserved, TokenLimited: params.Currency == "USD" && params.TokenID > 0 && !token.UnlimitedQuota, CreatedAt: common.GetTimestamp()}
+			Currency: params.Currency, TokenCurrency: tokenCurrency, USDQuotaPerUnit: common.QuotaPerUnit, CNYQuotaPerUnit: wallet.QuotaPerUnit,
+			Exchange: snapshot, Status: CNYBillingReserved, TokenLimited: tokenCurrency == "USD" && params.TokenID > 0 && !token.UnlimitedQuota, CreatedAt: common.GetTimestamp()}
 		if params.SkipInitialReserve && !snapshot.Enabled && params.Currency == "USD" && user.Quota >= target {
 			target = 0
 		}
 	} else if err != nil {
 		return nil, err
-	} else if record.UserID != params.UserID || record.TokenID != params.TokenID || record.Currency != params.Currency {
+	} else if record.UserID != params.UserID || record.TokenID != params.TokenID || record.Currency != params.Currency || (params.TokenCurrency != "" && tokenCurrency != params.TokenCurrency) {
 		return nil, ErrCNYConflict
 	} else if record.Status != CNYBillingReserved || (record.UpstreamPending && !params.AllowDebt && !params.ContinueStream) {
 		return nil, ErrCNYState
@@ -188,6 +226,20 @@ func reserveWalletFunding(tx *gorm.DB, wallet *CNYWallet, user *User, params Wal
 	primary, alternate := user.Quota, wallet.Quota
 	if record.Currency == "CNY" {
 		primary, alternate = wallet.Quota, user.Quota
+	}
+	usdFallback := record.usesUSDTokenFallback()
+	if usdFallback {
+		if !record.Exchange.Enabled {
+			return nil, ErrCNYTokenQuota
+		}
+		// A disabled CNY budget never authorizes spending the CNY wallet, even
+		// when the final charge exceeds the estimate or its USD reservation.
+		primary = 0
+		if !params.Free || target > 0 {
+			if _, err = record.convertAlternateQuota(1); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if params.ContinueStream && (primary < 0 || record.ReservedDebtQuota > 0) {
 		return nil, ErrWalletFundingInsufficient
@@ -204,14 +256,14 @@ func reserveWalletFunding(tx *gorm.DB, wallet *CNYWallet, user *User, params Wal
 		}
 	}
 	delta := max(0, target-record.ReservedQuota)
-	if !params.AllowDebt && record.TokenLimited && token.RemainQuota < delta {
+	if !usdFallback && !params.AllowDebt && record.TokenLimited && token.RemainQuota < delta {
 		return nil, ErrWalletTokenInsufficient
 	}
 	nativeDelta := min(max(0, primary), delta)
 	alternateNative := record.AlternateNativeReserved + delta - nativeDelta
 	alternateTotal, err := record.convertAlternateQuota(alternateNative)
 	debt := 0
-	if params.AllowDebt && record.ID > 0 && (errors.Is(err, ErrWalletFundingInsufficient) || errors.Is(err, ErrExchangeRateUnavailable) || alternateTotal-record.AlternateReserved > max(0, alternate)) {
+	if params.AllowDebt && record.ID > 0 && !usdFallback && (errors.Is(err, ErrWalletFundingInsufficient) || errors.Is(err, ErrExchangeRateUnavailable) || alternateTotal-record.AlternateReserved > max(0, alternate)) {
 		fundable := record.affordableAlternateNative(alternateNative, max(0, alternate)+record.AlternateReserved)
 		debt = alternateNative - fundable
 		alternateNative = fundable
@@ -223,13 +275,23 @@ func reserveWalletFunding(tx *gorm.DB, wallet *CNYWallet, user *User, params Wal
 	}
 	alternateDelta := alternateTotal - record.AlternateReserved
 	if alternateDelta > max(0, alternate) {
-		return nil, ErrWalletFundingInsufficient
+		if !params.AllowDebt || !usdFallback {
+			return nil, ErrWalletFundingInsufficient
+		}
+		debt = alternateDelta - max(0, alternate)
+	}
+	tokenDelta := delta
+	if usdFallback {
+		tokenDelta = alternateDelta
+	}
+	if usdFallback && !params.AllowDebt && record.TokenLimited && token.RemainQuota < tokenDelta {
+		return nil, ErrWalletTokenInsufficient
 	}
 	if err = moveWalletFunds(tx, wallet, user, record.Currency, -nativeDelta, -alternateDelta, true); err != nil {
 		return nil, err
 	}
-	if record.Currency == "USD" && record.TokenID > 0 && delta != 0 {
-		if err = updateWalletTokenQuota(tx, record.TokenID, delta); err != nil {
+	if record.tokenBudgetCurrency() == "USD" && record.TokenID > 0 && tokenDelta != 0 {
+		if err = updateWalletTokenQuota(tx, record.TokenID, tokenDelta); err != nil {
 			return nil, err
 		}
 	}
@@ -340,9 +402,22 @@ func moveWalletFunds(tx *gorm.DB, wallet *CNYWallet, user *User, currency string
 // A deleted or subsequently disabled key cannot block returning money. This
 // changes only financial fields and never restores a credential's authority.
 func updateWalletTokenQuota(tx *gorm.DB, tokenID, delta int) error {
-	return tx.Unscoped().Model(&Token{}).Where("id = ?", tokenID).Updates(map[string]any{
-		"remain_quota": gorm.Expr("remain_quota - ?", delta), "used_quota": gorm.Expr("used_quota + ?", delta), "accessed_time": common.GetTimestamp(),
-	}).Error
+	if delta > common.MaxWalletQuota || delta < -common.MaxWalletQuota {
+		return ErrWalletQuotaLimitExceeded
+	}
+	result := tx.Unscoped().Model(&Token{}).Where("id = ?", tokenID).
+		Where("remain_quota >= ? AND remain_quota <= ?", -common.MaxWalletQuota+delta, common.MaxWalletQuota+delta).
+		Where("used_quota >= ? AND used_quota <= ?", -common.MaxWalletQuota-delta, common.MaxWalletQuota-delta).
+		Updates(map[string]any{
+			"remain_quota": gorm.Expr("remain_quota - ?", delta), "used_quota": gorm.Expr("used_quota + ?", delta), "accessed_time": common.GetTimestamp(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrWalletQuotaLimitExceeded
+	}
+	return nil
 }
 
 func SettleWalletFunding(requestID string, actual int, refund bool) (*WalletFundingRecord, error) {
@@ -369,7 +444,7 @@ func SettleWalletFunding(requestID string, actual int, refund bool) (*WalletFund
 	})
 	if err == nil {
 		InvalidateUserQuotaCache(record.UserID)
-		if record.Currency == "USD" && record.TokenID > 0 {
+		if record.tokenBudgetCurrency() == "USD" && record.TokenID > 0 {
 			var token Token
 			if DB.Select("key").Unscoped().First(&token, record.TokenID).Error == nil {
 				InvalidateTokenQuotaCache(token.Key)
@@ -403,7 +478,16 @@ func finalizeWalletFunding(tx *gorm.DB, wallet *CNYWallet, user *User, record *W
 		previousNative, previousAlternate, previousQuota = record.NativeCharged, record.AlternateCharged, record.Quota
 	}
 	nativeCharge, alternateCharge, debt := 0, 0, 0
-	if !refund {
+	if !refund && record.usesUSDTokenFallback() {
+		var err error
+		alternateCharge, err = record.convertAlternateQuota(actual)
+		if err != nil {
+			return err
+		}
+		fundedReservation := record.AlternateReserved - record.ReservedDebtQuota
+		available := max(0, user.Quota+record.ReservedDebtQuota)
+		debt = max(0, alternateCharge-fundedReservation-available)
+	} else if !refund {
 		nativeCharge = min(actual, record.NativeReserved-record.ReservedDebtQuota)
 		alternateNative := min(max(0, actual-nativeCharge), record.AlternateNativeReserved)
 		remaining := actual - nativeCharge - alternateNative
@@ -454,9 +538,17 @@ func finalizeWalletFunding(tx *gorm.DB, wallet *CNYWallet, user *User, record *W
 	if refund {
 		finalQuota = 0
 	}
-	if record.Currency == "USD" && record.TokenID > 0 && finalQuota != previousQuota {
-		if err := updateWalletTokenQuota(tx, record.TokenID, finalQuota-previousQuota); err != nil {
-			return err
+	if record.tokenBudgetCurrency() == "USD" && record.TokenID > 0 && finalQuota != previousQuota {
+		tokenDelta := finalQuota - previousQuota
+		if record.usesUSDTokenFallback() {
+			// All fallback payments and key accounting use the same cumulative
+			// conversion. Refund the original allocation, never today's policy.
+			tokenDelta = alternateCharge - previousAlternate
+		}
+		if tokenDelta != 0 {
+			if err := updateWalletTokenQuota(tx, record.TokenID, tokenDelta); err != nil {
+				return err
+			}
 		}
 	}
 	if refund {

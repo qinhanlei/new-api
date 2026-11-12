@@ -436,6 +436,8 @@ func cnyReservationError(c *gin.Context, err error) *types.NewAPIError {
 		key, code, status = i18n.MsgBillingExchangeUnavailable, types.ErrorCodeInsufficientUserQuota, http.StatusServiceUnavailable
 	case errors.Is(err, model.ErrCNYTokenQuota):
 		key, code, status = i18n.MsgBillingCNYInsufficientToken, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden
+	case errors.Is(err, model.ErrWalletTokenInsufficient):
+		key, code, status = i18n.MsgBillingUSDTokenExhausted, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden
 	case errors.Is(err, model.ErrTokenInvalid), errors.Is(err, model.ErrUserQuotaPermission):
 		key, code, status = i18n.MsgTokenInvalid, types.ErrorCodeAccessDenied, http.StatusForbidden
 	}

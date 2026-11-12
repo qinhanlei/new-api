@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDown, KeyRound, Settings2, WalletCards } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm, type SubmitErrorHandler } from 'react-hook-form'
@@ -77,6 +77,7 @@ import {
   updateApiKey,
   getApiKey,
   getTokenAutoGroups,
+  getApiKeyCNYBudget,
 } from '../api'
 import { ERROR_MESSAGES, SUCCESS_MESSAGES } from '../constants'
 import {
@@ -107,12 +108,14 @@ export function ApiKeysMutateDrawer({
   currentRow,
 }: ApiKeyMutateDrawerProps) {
   const { t } = useTranslation()
+  const queryClient = useQueryClient()
   const isUpdate = !!currentRow
   const currentRowId = currentRow?.id
   const { triggerRefresh } = useApiKeys()
   const { status, loading: statusLoading } = useStatus()
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [cnySaveFailed, setCnySaveFailed] = useState(false)
   const [initializedTarget, setInitializedTarget] = useState<string | null>(
     null
   )
@@ -148,6 +151,15 @@ export function ApiKeysMutateDrawer({
       requireServerSuccess(await getApiKey(currentRowId ?? 0)),
     enabled: open && isUpdate && currentRowId !== undefined,
     staleTime: 0,
+  })
+
+  const cnyBudget = useQuery({
+    queryKey: ['token-currency-budget', currentRowId, 'CNY'],
+    queryFn: async () =>
+      requireServerSuccess(await getApiKeyCNYBudget(currentRowId ?? 0)),
+    enabled: open && isUpdate && currentRowId !== undefined,
+    staleTime: 0,
+    refetchOnWindowFocus: false,
   })
 
   const {
@@ -212,6 +224,7 @@ export function ApiKeysMutateDrawer({
         getApiKeyFormDefaultValues(defaultUseAutoGroup && backendHasAuto)
       )
       setInitializedTarget(null)
+      setCnySaveFailed(false)
       return
     }
     if (
@@ -222,21 +235,35 @@ export function ApiKeysMutateDrawer({
     ) {
       return
     }
-    if (isUpdate && (!apiKeyFetched || apiKeyFetching)) return
+    if (
+      isUpdate &&
+      (!apiKeyFetched ||
+        apiKeyFetching ||
+        !cnyBudget.isFetched ||
+        cnyBudget.isFetching)
+    ) {
+      return
+    }
     if (!isUpdate && statusLoading) return
 
     const target = isUpdate && currentRow ? `update:${currentRow.id}` : 'create'
     if (initializedTarget === target) return
     if (isUpdate && currentRow) {
-      if (apiKeyData?.success && apiKeyData.data) {
+      if (
+        apiKeyData?.success &&
+        apiKeyData.data &&
+        (cnyBudget.data?.data || cnyBudget.isError)
+      ) {
         form.reset(
           transformApiKeyToFormDefaults(
             apiKeyData.data,
             availableAutoGroupNames,
-            maxAutoGroups
+            maxAutoGroups,
+            cnyBudget.data?.data
           )
         )
         setInitializedTarget(target)
+        setCnySaveFailed(false)
       }
     } else {
       form.reset(
@@ -262,11 +289,16 @@ export function ApiKeysMutateDrawer({
     availableAutoGroupNames,
     maxAutoGroups,
     initializedTarget,
+    cnyBudget.data,
+    cnyBudget.isFetched,
+    cnyBudget.isFetching,
+    cnyBudget.isError,
   ])
 
   const formTarget =
     isUpdate && currentRow ? `update:${currentRow.id}` : 'create'
   const isFormInitialized = initializedTarget === formTarget
+  const initialCnyBudget = form.formState.defaultValues?.cny_budget
   const selectedGroup = form.watch('group')
 
   // Correct group after groups load: if the form value is not in available groups, fall back
@@ -288,39 +320,70 @@ export function ApiKeysMutateDrawer({
   }, [groups, form, selectedGroup])
 
   const onSubmit = async (data: ApiKeyFormValues) => {
+    if (
+      !isFormInitialized ||
+      cnySaveFailed ||
+      (isUpdate && (cnyBudget.isError || !cnyBudget.data?.data))
+    ) {
+      return
+    }
     setIsSubmitting(true)
+    let savingCny = false
     try {
       const basePayload = transformFormDataToPayload(data)
 
-      if (isUpdate && currentRow) {
-        const result = await updateApiKey({
-          ...basePayload,
-          id: currentRow.id,
+      if (isUpdate) {
+        savingCny =
+          data.cny_budget.enabled !== initialCnyBudget?.enabled ||
+          data.cny_budget.unlimited_quota !==
+            initialCnyBudget?.unlimited_quota ||
+          data.cny_budget.remain_quota !== initialCnyBudget?.remain_quota
+        if (!savingCny) delete basePayload.cny_budget
+      }
+      // Settlement can leave a negative balance; unchanged budgets are omitted.
+      if (basePayload.cny_budget && basePayload.cny_budget.remain_quota < 0) {
+        form.setError('cny_budget.remain_quota', {
+          type: 'validate',
+          message: t('Quota must be zero or greater'),
         })
-        if (result.success) {
-          toast.success(t(SUCCESS_MESSAGES.API_KEY_UPDATED))
-          onOpenChange(false)
-          triggerRefresh()
-        } else {
-          handleServerError(result, t(ERROR_MESSAGES.UPDATE_FAILED))
+        toast.error(t('Please fix the highlighted fields before saving'))
+        return
+      }
+      if (isUpdate && currentRow) {
+        const result = requireServerSuccess(
+          await updateApiKey({
+            ...basePayload,
+            id: currentRow.id,
+          })
+        )
+        if (result.data?.cny_budget) {
+          queryClient.setQueryData(
+            ['token-currency-budget', currentRow.id, 'CNY'],
+            { success: true, data: result.data.cny_budget }
+          )
         }
+        toast.success(t(SUCCESS_MESSAGES.API_KEY_UPDATED))
+        onOpenChange(false)
+        triggerRefresh()
       } else {
         // Create mode - handle batch creation
         const count = data.tokenCount || 1
         let successCount = 0
 
         for (let i = 0; i < count; i++) {
-          const result = await createApiKey({
-            ...basePayload,
-            name:
-              i === 0 && data.name
-                ? data.name
-                : `${data.name || 'default'}-${Math.random().toString(36).slice(2, 8)}`,
-          })
-          if (result.success) {
+          try {
+            requireServerSuccess(
+              await createApiKey({
+                ...basePayload,
+                name:
+                  i === 0 && data.name
+                    ? data.name
+                    : `${data.name || 'default'}-${Math.random().toString(36).slice(2, 8)}`,
+              })
+            )
             successCount++
-          } else {
-            handleServerError(result, t(ERROR_MESSAGES.CREATE_FAILED))
+          } catch (error) {
+            handleServerError(error, t(ERROR_MESSAGES.CREATE_FAILED))
             break
           }
         }
@@ -336,10 +399,26 @@ export function ApiKeysMutateDrawer({
         }
       }
     } catch (error) {
+      if (savingCny) setCnySaveFailed(true)
       handleServerError(error, t(ERROR_MESSAGES.UNEXPECTED))
     } finally {
       setIsSubmitting(false)
     }
+  }
+
+  const reloadCnyBudget = async () => {
+    const latest = await cnyBudget.refetch()
+    if (!latest.isSuccess || !latest.data?.data) return
+    const budget = latest.data.data
+    form.resetField('cny_budget', {
+      defaultValue: {
+        enabled: budget.enabled,
+        remain_quota: budget.remain_quota,
+        unlimited_quota: budget.unlimited_quota,
+        expected_version: budget.version,
+      },
+    })
+    setCnySaveFailed(false)
   }
 
   const onInvalid: SubmitErrorHandler<ApiKeyFormValues> = () => {
@@ -662,19 +741,17 @@ export function ApiKeysMutateDrawer({
                   </FormItem>
                 )}
               />
-              {currentRowId !== undefined ? (
-                <TokenCurrencyBudget
-                  key={currentRowId}
-                  tokenId={currentRowId}
-                  open={open}
-                />
-              ) : (
-                <p className='text-muted-foreground text-xs'>
-                  {t(
-                    'Create the API key first, then enable its CNY budget from Edit.'
-                  )}
-                </p>
-              )}
+              <TokenCurrencyBudget
+                form={form}
+                budget={isUpdate ? cnyBudget.data?.data : undefined}
+                loading={
+                  isUpdate && (!cnyBudget.data?.data || !isFormInitialized)
+                }
+                loadFailed={isUpdate && cnyBudget.isError}
+                saveFailed={cnySaveFailed}
+                disabled={isSubmitting || (isUpdate && cnyBudget.isFetching)}
+                onReload={isUpdate ? reloadCnyBudget : undefined}
+              />
             </SideDrawerSection>
 
             <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
@@ -796,7 +873,15 @@ export function ApiKeysMutateDrawer({
           <Button
             type='button'
             onClick={form.handleSubmit(onSubmit, onInvalid)}
-            disabled={!isFormInitialized || isSubmitting}
+            disabled={
+              !isFormInitialized ||
+              isSubmitting ||
+              cnySaveFailed ||
+              (isUpdate &&
+                (cnyBudget.isError ||
+                  cnyBudget.isFetching ||
+                  !cnyBudget.data?.data))
+            }
             className='w-full sm:w-auto'
           >
             {isSubmitting ? t('Saving...') : t('Save changes')}

@@ -470,3 +470,17 @@ it('allows correcting an invalid existing static rate instead of crashing the fo
   await userEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
   await waitFor(() => expect(api.put).toHaveBeenCalledTimes(1))
 })
+
+it('keeps both currency cards in a non-shrinking flow when wallet settings expand', async () => {
+  settings.policy.dynamic_enabled = true
+  await renderSettings(ROLE.SUPER_ADMIN)
+  await screen.findByRole('spinbutton', { name: 'Update interval (hours)' })
+  const content = screen.getByRole('region', { name: 'Currency & Display' })
+  expect(content).toHaveClass('shrink-0')
+  expect(
+    within(content).getByRole('form', { name: 'Pricing & Display' })
+  ).toBeVisible()
+  expect(
+    within(content).getByRole('region', { name: 'Wallet currency billing' })
+  ).toBeVisible()
+})

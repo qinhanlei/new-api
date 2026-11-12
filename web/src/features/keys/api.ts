@@ -26,6 +26,7 @@ import type {
   SearchApiKeysParams,
   ApiKeyFormData,
   TokenAutoGroupsConfig,
+  CNYTokenBudget,
 } from './types'
 
 // ============================================================================
@@ -80,8 +81,15 @@ export async function createApiKey(
 // Update an existing API key
 export async function updateApiKey(
   data: ApiKeyFormData & { id: number }
-): Promise<ApiResponse<ApiKey>> {
+): Promise<ApiResponse<ApiKey & { cny_budget?: CNYTokenBudget }>> {
   const res = await api.put('/api/token/', data)
+  return res.data
+}
+
+export async function getApiKeyCNYBudget(
+  id: number
+): Promise<ApiResponse<CNYTokenBudget>> {
+  const res = await api.get(`/api/token/${id}/currency/CNY`)
   return res.data
 }
 

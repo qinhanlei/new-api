@@ -146,7 +146,10 @@ export function PricingSection({ defaultValues }: PricingSectionProps) {
   const showDisplayInCurrencyOption = displayInCurrencyEnabled === false
 
   return (
-    <>
+    <section
+      aria-label={t('Currency & Display')}
+      className='flex shrink-0 flex-col gap-4'
+    >
       <CurrencyBillingSection />
       <FormNavigationGuard when={isDirty} />
 
@@ -377,6 +380,6 @@ export function PricingSection({ defaultValues }: PricingSectionProps) {
           </SettingsForm>
         </Form>
       </SettingsCard>
-    </>
+    </section>
   )
 }

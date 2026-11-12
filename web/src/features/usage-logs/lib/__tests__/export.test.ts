@@ -96,6 +96,31 @@ async function chineseTranslator() {
 }
 
 describe('usage log CSV export', () => {
+  test('exports USD fallback debt in its frozen currency for CNY consumption', () => {
+    const t = (key: string) => key
+    const header = getLogCsvHeader(false, t)
+    const row = getLogCsvRow(
+      {
+        ...consumeLog,
+        other: JSON.stringify({
+          wallet_funding: {
+            ...walletFunding,
+            usd_quota: 500000,
+            cny_quota: 0,
+            debt_quota: 125000,
+            debt_currency: 'USD',
+          },
+        }),
+      },
+      false,
+      t
+    )
+    expect(row[header.indexOf('USD wallet amount')]).toBe('$2')
+    expect(row[header.indexOf('CNY wallet amount')]).toBe('¥0')
+    expect(row[header.indexOf('Outstanding debt')]).toBe('$0.5')
+    expect(row[header.indexOf('Debt currency')]).toBe('USD')
+  })
+
   test('wallet funding preserves the existing log precision for tiny charges', () => {
     const t = (key: string) => key
     const header = getLogCsvHeader(false, t)

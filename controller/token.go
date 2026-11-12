@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -36,12 +37,14 @@ type tokenRequest struct {
 	model.Token
 	AutoGroups tokenAutoGroupsInput `json:"auto_groups"`
 	// 指针区分“未传”和显式 false：新建时未传即开启，更新时未传则保留原值。
-	AllowUserQuotaQuery *bool `json:"allow_user_quota_query"`
+	AllowUserQuotaQuery *bool                       `json:"allow_user_quota_query"`
+	CNYBudget           *tokenCurrencyBudgetRequest `json:"cny_budget"`
 }
 
 type tokenResponse struct {
 	*model.Token
-	AutoGroups []string `json:"auto_groups"`
+	AutoGroups []string              `json:"auto_groups"`
+	CNYBudget  *model.CNYTokenBudget `json:"cny_budget,omitempty"`
 }
 
 func maxTokenQuota() int {
@@ -364,9 +367,21 @@ func AddToken(c *gin.Context) {
 		AutoGroups:         token.AutoGroups,
 	}
 	cleanToken.AllowUserQuotaQuery = request.AllowUserQuotaQuery == nil || *request.AllowUserQuotaQuery
-	err = cleanToken.Insert()
+	budgetChange := model.CNYTokenBudgetChange{Enabled: true, UnlimitedQuota: true}
+	if request.CNYBudget != nil {
+		budgetChange, err = request.CNYBudget.change()
+		if err != nil {
+			respondCurrencyBillingError(c, err)
+			return
+		}
+	}
+	_, err = cleanToken.InsertWithCNYBudget(budgetChange)
 	if err != nil {
-		common.ApiError(c, err)
+		if errors.Is(err, model.ErrCNYInvalid) || errors.Is(err, model.ErrCNYVersion) {
+			respondCurrencyBillingError(c, err)
+		} else {
+			common.ApiErrorT(c, "Failed to process CNY billing")
+		}
 		return
 	}
 	params["id"] = cleanToken.Id
@@ -470,7 +485,21 @@ func UpdateToken(c *gin.Context) {
 			}
 		}
 	}
-	err = cleanToken.Update()
+	var budget *model.CNYTokenBudget
+	if statusOnly == "" && request.CNYBudget != nil {
+		change, changeErr := request.CNYBudget.change()
+		if changeErr != nil {
+			respondCurrencyBillingError(c, changeErr)
+			return
+		}
+		budget, err = cleanToken.UpdateWithCNYBudget(change)
+		if err != nil {
+			respondCurrencyBillingError(c, err)
+			return
+		}
+	} else {
+		err = cleanToken.Update()
+	}
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -496,6 +525,7 @@ func UpdateToken(c *gin.Context) {
 			{"group", previous.Group != cleanToken.Group},
 			{"cross_group_retry", previous.CrossGroupRetry != cleanToken.CrossGroupRetry},
 			{"auto_groups", previous.AutoGroups != cleanToken.AutoGroups},
+			{"cny_budget", budget != nil},
 		} {
 			if field.changed {
 				changedFields = append(changedFields, field.name)
@@ -504,10 +534,12 @@ func UpdateToken(c *gin.Context) {
 		params["changed_fields"] = changedFields
 	}
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
+	response := buildMaskedTokenResponse(cleanToken)
+	response.CNYBudget = budget
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    buildMaskedTokenResponse(cleanToken),
+		"data":    response,
 	})
 }
 

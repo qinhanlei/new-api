@@ -164,6 +164,21 @@ func GetTokenCurrencyBudget(c *gin.Context) {
 	common.ApiSuccess(c, budget)
 }
 
+type tokenCurrencyBudgetRequest struct {
+	Enabled         *bool  `json:"enabled"`
+	RemainQuota     *int   `json:"remain_quota"`
+	UnlimitedQuota  *bool  `json:"unlimited_quota"`
+	ExpectedVersion *int64 `json:"expected_version"`
+}
+
+func (request tokenCurrencyBudgetRequest) change() (model.CNYTokenBudgetChange, error) {
+	if request.Enabled == nil || request.RemainQuota == nil || request.UnlimitedQuota == nil || request.ExpectedVersion == nil {
+		return model.CNYTokenBudgetChange{}, model.ErrCNYInvalid
+	}
+	return model.CNYTokenBudgetChange{Enabled: *request.Enabled, RemainQuota: *request.RemainQuota,
+		UnlimitedQuota: *request.UnlimitedQuota, ExpectedVersion: *request.ExpectedVersion}, nil
+}
+
 func UpdateTokenCurrencyBudget(c *gin.Context) {
 	if !requireCNYCurrency(c) {
 		return
@@ -172,12 +187,7 @@ func UpdateTokenCurrencyBudget(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var request struct {
-		Enabled         *bool  `json:"enabled"`
-		RemainQuota     *int   `json:"remain_quota"`
-		UnlimitedQuota  *bool  `json:"unlimited_quota"`
-		ExpectedVersion *int64 `json:"expected_version"`
-	}
+	var request tokenCurrencyBudgetRequest
 	params := model.AuditFields{"id": id, "currency": "CNY", "quota_per_unit": model.CNYQuotaPerUnit}
 	success := false
 	defer func() {
@@ -185,12 +195,16 @@ func UpdateTokenCurrencyBudget(c *gin.Context) {
 			&model.AuditRequestInfo{Method: c.Request.Method, Route: c.FullPath(), Status: c.Writer.Status(), Success: success}, c)
 		markAuditLogged(c)
 	}()
-	if err := c.ShouldBindJSON(&request); err != nil || request.Enabled == nil || request.RemainQuota == nil || request.UnlimitedQuota == nil || request.ExpectedVersion == nil {
+	if err := c.ShouldBindJSON(&request); err != nil {
 		respondCurrencyBillingError(c, model.ErrCNYInvalid)
 		return
 	}
-	budget, err := model.UpdateCNYTokenBudget(id, c.GetInt("id"), model.CNYTokenBudgetChange{Enabled: *request.Enabled, RemainQuota: *request.RemainQuota,
-		UnlimitedQuota: *request.UnlimitedQuota, ExpectedVersion: *request.ExpectedVersion})
+	change, err := request.change()
+	if err != nil {
+		respondCurrencyBillingError(c, err)
+		return
+	}
+	budget, err := model.UpdateCNYTokenBudget(id, c.GetInt("id"), change)
 	if err != nil {
 		respondCurrencyBillingError(c, err)
 		return

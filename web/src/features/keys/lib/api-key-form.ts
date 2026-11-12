@@ -22,7 +22,7 @@ import { z } from 'zod'
 import { billingAmountToQuota, billingQuotaToAmount } from '@/lib/currency'
 
 import { DEFAULT_GROUP } from '../constants'
-import type { ApiKey, ApiKeyFormData } from '../types'
+import type { ApiKey, ApiKeyFormData, CNYTokenBudget } from '../types'
 
 // ============================================================================
 // Form Schema
@@ -46,6 +46,17 @@ export function getApiKeyFormSchema(t: TFunction, maxAutoGroups = 5) {
       auto_groups: z.array(z.string()),
       cross_group_retry: z.boolean().optional(),
       tokenCount: z.number().min(1).optional(),
+      cny_budget: z.object({
+        enabled: z.boolean(),
+        unlimited_quota: z.boolean(),
+        remain_quota: z
+          .number({ error: t('Invalid CNY billing parameters') })
+          .refine(
+            (value) => Number.isSafeInteger(value),
+            t('Invalid CNY billing parameters')
+          ),
+        expected_version: z.number().int().nonnegative(),
+      }),
     })
     .superRefine((data, ctx) => {
       if (data.group === 'auto') {
@@ -117,6 +128,12 @@ export const API_KEY_FORM_DEFAULT_VALUES: ApiKeyFormValues = {
   auto_groups: [],
   cross_group_retry: true,
   tokenCount: 1,
+  cny_budget: {
+    enabled: true,
+    unlimited_quota: true,
+    remain_quota: 0,
+    expected_version: 0,
+  },
 }
 
 export function getApiKeyFormDefaultValues(
@@ -127,6 +144,7 @@ export function getApiKeyFormDefaultValues(
     group: defaultUseAutoGroup ? 'auto' : DEFAULT_GROUP,
     auto_groups_mode: 'inherit',
     auto_groups: [],
+    cny_budget: { ...API_KEY_FORM_DEFAULT_VALUES.cny_budget },
     cross_group_retry: defaultUseAutoGroup,
   }
 }
@@ -160,6 +178,7 @@ export function transformFormDataToPayload(
         ? data.auto_groups
         : [],
     cross_group_retry: data.group === 'auto' ? !!data.cross_group_retry : false,
+    cny_budget: { ...data.cny_budget },
   }
 }
 
@@ -169,7 +188,8 @@ export function transformFormDataToPayload(
 export function transformApiKeyToFormDefaults(
   apiKey: ApiKey,
   availableAutoGroups: string[] = [],
-  maxAutoGroups = 5
+  maxAutoGroups = 5,
+  cnyBudget?: CNYTokenBudget
 ): ApiKeyFormValues {
   const availableSet = new Set(availableAutoGroups)
   const storedAutoGroups = apiKey.auto_groups ?? []
@@ -196,5 +216,11 @@ export function transformApiKeyToFormDefaults(
     auto_groups: autoGroups,
     cross_group_retry: !!apiKey.cross_group_retry,
     tokenCount: 1,
+    cny_budget: {
+      enabled: cnyBudget?.enabled ?? false,
+      unlimited_quota: cnyBudget?.unlimited_quota ?? false,
+      remain_quota: cnyBudget?.remain_quota ?? 0,
+      expected_version: cnyBudget?.version ?? 0,
+    },
   }
 }
