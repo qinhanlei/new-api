@@ -27,7 +27,6 @@ import {
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, it, vi } from 'vitest'
 
-import { TokenCurrencyBudget } from '@/features/keys/components/token-currency-budget'
 import { ModelPriceCell } from '@/features/pricing/components/model-price-cell'
 import { SORT_OPTIONS } from '@/features/pricing/constants'
 import {
@@ -302,57 +301,6 @@ it('edits task prices in native CNY and retains the currency prefix', () => {
   expect(change.mock.lastCall?.[0]).toBe(
     'v2:CNY:tier("base", u("seconds") * 0.8)'
   )
-})
-
-it('keeps the token budget version and requires a reload after a concurrent-change error', async () => {
-  const get = vi.spyOn(api, 'get').mockResolvedValue({
-    data: {
-      success: true,
-      data: {
-        enabled: false,
-        remain_quota: 500000,
-        unlimited_quota: false,
-        used_quota: 0,
-        version: 4,
-        quota_per_unit: 500000,
-      },
-    },
-  })
-  const put = vi.spyOn(api, 'put').mockResolvedValue({
-    data: { success: false, message: 'Concurrent change' },
-  })
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  })
-  render(
-    <QueryClientProvider client={client}>
-      <TokenCurrencyBudget tokenId={42} open />
-    </QueryClientProvider>
-  )
-  const user = userEvent.setup()
-  await user.click(
-    await screen.findByRole('switch', { name: 'Enable CNY billing' })
-  )
-  await user.click(screen.getByRole('button', { name: 'Save CNY budget' }))
-  await waitFor(() =>
-    expect(put).toHaveBeenCalledWith('/api/token/42/currency/CNY', {
-      enabled: true,
-      remain_quota: 500000,
-      unlimited_quota: false,
-      expected_version: 4,
-    })
-  )
-  await waitFor(() =>
-    expect(
-      screen.getByRole('button', { name: 'Save CNY budget' })
-    ).toBeDisabled()
-  )
-  await user.click(screen.getByRole('button', { name: 'Reload balance' }))
-  await waitFor(() => expect(get).toHaveBeenCalledTimes(2))
-  expect(
-    screen.getByRole('switch', { name: 'Enable CNY billing' })
-  ).not.toBeChecked()
-  client.clear()
 })
 
 it('reuses the adjustment operation ID after a lost response and sends native CNY quota', async () => {

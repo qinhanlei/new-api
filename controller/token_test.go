@@ -107,7 +107,7 @@ func openTokenControllerTestDB(t *testing.T) *gorm.DB {
 func migrateTokenControllerTestDB(t *testing.T, db *gorm.DB) {
 	t.Helper()
 
-	if err := db.AutoMigrate(&model.Token{}); err != nil {
+	if err := db.AutoMigrate(&model.Token{}, &model.CNYWallet{}, &model.CNYTokenBudget{}); err != nil {
 		t.Fatalf("failed to migrate token table: %v", err)
 	}
 }
@@ -736,7 +736,8 @@ func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
 				db, _ := newAuditTestDatabase(t, database.name, dsn)
 				model.DB = db
 				common.SetDatabaseTypes(database.typ, database.typ)
-				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}))
+				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}, &model.CNYWallet{}, &model.CNYTokenBudget{}, &model.Option{}))
+				require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
 				// Initialize production column quoting as well as the existing audit table.
 				require.NoError(t, model.InitLogDB())
 				if separateLog {
@@ -752,6 +753,7 @@ func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
 				require.NoError(t, db.Raw(versionSQL).Scan(&version).Error)
 				t.Logf("database version: %s", version)
 				verifyAPITokenAudit(t)
+				verifyTokenCurrencyConfiguration(t)
 				if separateLog {
 					var count int64
 					require.NoError(t, db.Model(&model.AuditLog{}).Count(&count).Error)
@@ -760,6 +762,143 @@ func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
 			})
 		}
 	}
+}
+
+func verifyTokenCurrencyConfiguration(t *testing.T) {
+	t.Helper()
+	t.Run("new token currency defaults and explicit choices", func(t *testing.T) {
+		for _, tc := range []struct {
+			name               string
+			budget             any
+			enabled, unlimited bool
+			quota              int
+		}{
+			{name: "default", enabled: true, unlimited: true},
+			{name: "disabled", budget: map[string]any{"enabled": false, "unlimited_quota": false, "remain_quota": 0, "expected_version": 0}},
+			{name: "limited", enabled: true, quota: 500000, budget: map[string]any{"enabled": true, "unlimited_quota": false, "remain_quota": 500000, "expected_version": 0}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				body := map[string]any{"name": "cny-create-" + tc.name, "unlimited_quota": true, "expired_time": -1}
+				if tc.budget != nil {
+					body["cny_budget"] = tc.budget
+				}
+				ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+				AddToken(ctx)
+				response := decodeAPIResponse(t, recorder)
+				require.True(t, response.Success, response.Message)
+				var token model.Token
+				require.NoError(t, model.DB.Where("name = ?", body["name"]).First(&token).Error)
+				var budget model.CNYTokenBudget
+				require.NoError(t, model.DB.First(&budget, "token_id = ?", token.Id).Error)
+				assert.Equal(t, tc.enabled, budget.Enabled)
+				assert.Equal(t, tc.unlimited, budget.UnlimitedQuota)
+				assert.Equal(t, tc.quota, budget.RemainQuota)
+				assert.Equal(t, int64(1), budget.Version)
+				assert.NotContains(t, recorder.Body.String(), token.Key)
+			})
+		}
+	})
+	t.Run("combined update is atomic and legacy updates preserve currency", func(t *testing.T) {
+		token := seedToken(t, model.DB, 1, "cny-original", "cny-update-secret")
+		budget, err := model.UpdateCNYTokenBudget(token.Id, 1, model.CNYTokenBudgetChange{Enabled: true, RemainQuota: 500000})
+		require.NoError(t, err)
+		body := map[string]any{"id": token.Id, "name": "cny-renamed", "unlimited_quota": true, "expired_time": -1,
+			"cny_budget": map[string]any{"enabled": true, "unlimited_quota": false, "remain_quota": 1000000, "expected_version": budget.Version}}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+		require.True(t, decodeAPIResponse(t, recorder).Success, recorder.Body.String())
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, "cny-renamed", token.Name)
+		require.NoError(t, model.DB.First(budget, "token_id = ?", token.Id).Error)
+		assert.Equal(t, 1000000, budget.RemainQuota)
+		assert.Equal(t, int64(2), budget.Version)
+		assert.NotContains(t, recorder.Body.String(), token.Key)
+		body["name"] = "must-rollback"
+		ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+		assert.Equal(t, http.StatusConflict, recorder.Code)
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, "cny-renamed", token.Name)
+		delete(body, "cny_budget")
+		body["name"] = "legacy-update"
+		ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+		require.True(t, decodeAPIResponse(t, recorder).Success)
+		require.NoError(t, model.DB.First(budget, "token_id = ?", token.Id).Error)
+		assert.Equal(t, 1000000, budget.RemainQuota)
+		assert.Equal(t, int64(2), budget.Version)
+	})
+	t.Run("budget failure rolls back token creation", func(t *testing.T) {
+		name := "token-cny:fail-budget"
+		require.NoError(t, model.DB.Callback().Create().Before("gorm:create").Register(name, func(tx *gorm.DB) {
+			if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "CNYTokenBudget" {
+				tx.AddError(errors.New("budget write failed"))
+			}
+		}))
+		t.Cleanup(func() { require.NoError(t, model.DB.Callback().Create().Remove(name)) })
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", map[string]any{"name": "cny-rollback-create", "unlimited_quota": true}, 1)
+		AddToken(ctx)
+		assert.False(t, decodeAPIResponse(t, recorder).Success)
+		var count int64
+		require.NoError(t, model.DB.Model(&model.Token{}).Where("name = ?", "cny-rollback-create").Count(&count).Error)
+		assert.Zero(t, count)
+	})
+	t.Run("invalid currency requests cannot create a token", func(t *testing.T) {
+		for index, budget := range []map[string]any{
+			{},
+			{"enabled": true, "unlimited_quota": true, "remain_quota": -1, "expected_version": 0},
+			{"enabled": true, "unlimited_quota": true, "remain_quota": common.MaxWalletQuota + 1, "expected_version": 0},
+			{"enabled": true, "unlimited_quota": true, "remain_quota": 0, "expected_version": 1},
+		} {
+			name := fmt.Sprintf("invalid-cny-%d", index)
+			ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", map[string]any{"name": name, "unlimited_quota": true, "cny_budget": budget}, 1)
+			AddToken(ctx)
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+			var count int64
+			require.NoError(t, model.DB.Model(&model.Token{}).Where("name = ?", name).Count(&count).Error)
+			assert.Zero(t, count)
+		}
+	})
+	t.Run("legacy and status-only updates never opt an old key into CNY", func(t *testing.T) {
+		token := seedToken(t, model.DB, 1, "legacy-no-budget", "legacy-no-budget-secret")
+		for _, path := range []string{"/api/token/", "/api/token/?status_only=true"} {
+			body := map[string]any{"id": token.Id, "name": token.Name, "status": common.TokenStatusDisabled, "unlimited_quota": true}
+			if strings.Contains(path, "status_only") {
+				body["cny_budget"] = map[string]any{"enabled": true, "unlimited_quota": true, "remain_quota": 0, "expected_version": 0}
+			}
+			ctx, recorder := newAuthenticatedContext(t, http.MethodPut, path, body, 1)
+			UpdateToken(ctx)
+			require.True(t, decodeAPIResponse(t, recorder).Success, recorder.Body.String())
+		}
+		budget, err := model.GetCNYTokenBudget(token.Id, 1)
+		require.NoError(t, err)
+		assert.False(t, budget.Enabled)
+		assert.False(t, budget.UnlimitedQuota)
+		assert.Zero(t, budget.Version)
+	})
+	t.Run("budget write failure rolls back ordinary fields", func(t *testing.T) {
+		token := seedToken(t, model.DB, 1, "atomic-update", "atomic-update-secret")
+		budget, err := model.UpdateCNYTokenBudget(token.Id, 1, model.CNYTokenBudgetChange{Enabled: true, RemainQuota: 500000})
+		require.NoError(t, err)
+		callback := "token-cny:fail-budget-update"
+		require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+			if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "CNYTokenBudget" {
+				tx.AddError(errors.New("budget write failed"))
+			}
+		}))
+		t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove(callback)) })
+		body := map[string]any{"id": token.Id, "name": "failed-update", "unlimited_quota": false, "remain_quota": 100000,
+			"cny_budget": map[string]any{"enabled": false, "unlimited_quota": false, "remain_quota": 0, "expected_version": budget.Version}}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+		assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+		require.NoError(t, model.DB.First(token, token.Id).Error)
+		assert.Equal(t, "atomic-update", token.Name)
+		require.NoError(t, model.DB.First(budget, "token_id = ?", token.Id).Error)
+		assert.True(t, budget.Enabled)
+		assert.Equal(t, 500000, budget.RemainQuota)
+		assert.Equal(t, int64(1), budget.Version)
+	})
 }
 
 func verifyAPITokenAudit(t *testing.T) {
@@ -809,6 +948,8 @@ func verifyAPITokenAudit(t *testing.T) {
 		{name: "configuration values stay private", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":42,"remain_quota":100,"unlimited_quota":false,"model_limits_enabled":true,"model_limits":"private-model-configuration","allow_ips":"203.0.113.57","group":"auto","cross_group_retry":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["expired_time","unlimited_quota","model_limits_enabled","model_limits","allow_ips"]}`},
 		{name: "unchanged update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":[]}`},
 		{name: "user quota query update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","allow_user_quota_query":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["allow_user_quota_query"]}`},
+		{name: "combined currency update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","cny_budget":{"enabled":true,"unlimited_quota":true,"remain_quota":0,"expected_version":0}}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["cny_budget"]}`},
+		{name: "foreign currency update", method: "PUT", path: "/", body: `{"id":$other,"name":"forged-name","unlimited_quota":true,"cny_budget":{"enabled":true,"unlimited_quota":true,"remain_quota":0,"expected_version":0}}`, action: "token.update", params: `{"id":$other}`},
 		{name: "successful response exceeds audit buffer", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","model_limits":"` + strings.Repeat("m", 64*1024-128) + `"}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["model_limits"]}`},
 		{name: "update storage failure", method: "PUT", path: "/", body: `{"id":$id,"name":"failed-rename","unlimited_quota":true}`, action: "token.update", params: `{"id":$id,"name":"owned"}`, failWrite: true},
 		{name: "foreign update", method: "PUT", path: "/", body: `{"id":$other,"name":"forged-name","unlimited_quota":true}`, action: "token.update", params: `{"id":$other}`},

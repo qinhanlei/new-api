@@ -279,10 +279,13 @@ func GetCNYTokenBudget(tokenID, userID int) (*CNYTokenBudget, error) {
 }
 
 func UpdateCNYTokenBudget(tokenID, userID int, change CNYTokenBudgetChange) (*CNYTokenBudget, error) {
-	if tokenID <= 0 || userID <= 0 || change.RemainQuota < 0 || change.RemainQuota > common.MaxWalletQuota || change.ExpectedVersion < 0 {
+	if tokenID <= 0 || userID <= 0 {
 		return nil, ErrCNYInvalid
 	}
-	var budget CNYTokenBudget
+	var budget *CNYTokenBudget
+	if err := change.validate(); err != nil {
+		return nil, err
+	}
 	var restoredTokenKey string
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		if _, err := lockCNYWallet(tx, userID); err != nil {
@@ -292,28 +295,13 @@ func UpdateCNYTokenBudget(tokenID, userID int, change CNYTokenBudgetChange) (*CN
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", tokenID, userID).First(&token).Error; err != nil {
 			return err
 		}
-		err := lockForUpdate(tx).Where("token_id = ? AND user_id = ?", tokenID, userID).First(&budget).Error
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			budget = CNYTokenBudget{TokenID: tokenID, UserID: userID, Currency: "CNY", QuotaPerUnit: CNYQuotaPerUnit}
-		} else if err != nil {
-			return err
-		}
-		if budget.Version != change.ExpectedVersion {
-			return ErrCNYVersion
-		}
-		budget.Enabled, budget.RemainQuota, budget.UnlimitedQuota = change.Enabled, change.RemainQuota, change.UnlimitedQuota
-		budget.Version++
-		if err = tx.Save(&budget).Error; err != nil {
-			return err
-		}
-		if change.Enabled && (change.UnlimitedQuota || change.RemainQuota > 0) && token.Status == common.TokenStatusExhausted && (token.ExpiredTime == -1 || token.ExpiredTime >= common.GetTimestamp()) {
+		previousStatus := token.Status
+		var err error
+		budget, err = updateCNYTokenBudget(tx, &token, change)
+		if err == nil && previousStatus != token.Status {
 			restoredTokenKey = token.Key
-			if err = invalidateTokenCacheForMutation(token.Key); err != nil {
-				common.SysLog(common.LogText("failed to invalidate token cache before status update: %s", err.Error()))
-			}
-			return tx.Model(&Token{}).Where("id = ? AND status = ?", tokenID, common.TokenStatusExhausted).UpdateColumn("status", common.TokenStatusEnabled).Error
 		}
-		return nil
+		return err
 	})
 	// Renew the fence after commit as well: even a slow transaction must not
 	// leave metadata published by a reader that saw the old exhausted state.
@@ -322,7 +310,47 @@ func UpdateCNYTokenBudget(tokenID, userID int, change CNYTokenBudgetChange) (*CN
 			common.SysLog(common.LogText("failed to invalidate token cache before status update: %s", cacheErr.Error()))
 		}
 	}
-	return &budget, err
+	return budget, err
+}
+
+// The caller holds the wallet and token locks, in that order. Both token
+// configuration saves and the standalone budget endpoint use this version gate.
+func updateCNYTokenBudget(tx *gorm.DB, token *Token, change CNYTokenBudgetChange) (*CNYTokenBudget, error) {
+	if err := change.validate(); err != nil {
+		return nil, err
+	}
+	var budget CNYTokenBudget
+	err := lockForUpdate(tx).Where("token_id = ? AND user_id = ?", token.Id, token.UserId).First(&budget).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		budget = CNYTokenBudget{TokenID: token.Id, UserID: token.UserId, Currency: "CNY", QuotaPerUnit: CNYQuotaPerUnit}
+	} else if err != nil {
+		return nil, err
+	}
+	if budget.Version != change.ExpectedVersion {
+		return nil, ErrCNYVersion
+	}
+	budget.Enabled, budget.RemainQuota, budget.UnlimitedQuota = change.Enabled, change.RemainQuota, change.UnlimitedQuota
+	budget.Version++
+	if err = tx.Save(&budget).Error; err != nil {
+		return nil, err
+	}
+	if change.Enabled && (change.UnlimitedQuota || change.RemainQuota > 0) && token.Status == common.TokenStatusExhausted && (token.ExpiredTime == -1 || token.ExpiredTime >= common.GetTimestamp()) {
+		if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
+			common.SysLog(common.LogText("failed to invalidate token cache before status update: %s", cacheErr.Error()))
+		}
+		if err = tx.Model(&Token{}).Where("id = ? AND status = ?", token.Id, common.TokenStatusExhausted).UpdateColumn("status", common.TokenStatusEnabled).Error; err != nil {
+			return nil, err
+		}
+		token.Status = common.TokenStatusEnabled
+	}
+	return &budget, nil
+}
+
+func (change CNYTokenBudgetChange) validate() error {
+	if change.RemainQuota < 0 || change.RemainQuota > common.MaxWalletQuota || change.ExpectedVersion < 0 {
+		return ErrCNYInvalid
+	}
+	return nil
 }
 
 func HasCNYTokenQuota(tokenID int) (bool, error) {
@@ -369,14 +397,6 @@ func ReserveCNYBilling(params CNYBillingParams, targetQuota int) (*CNYBillingRec
 			if (token.Status != common.TokenStatusEnabled && token.Status != common.TokenStatusExhausted) || (token.ExpiredTime != -1 && token.ExpiredTime < common.GetTimestamp()) {
 				return ErrTokenInvalid
 			}
-			if err = tx.Where("token_id = ? AND user_id = ?", params.TokenID, params.UserID).First(&budget).Error; errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrCNYTokenQuota
-			} else if err != nil {
-				return err
-			}
-			if !budget.Enabled {
-				return ErrCNYTokenQuota
-			}
 		}
 		err = tx.Where("kind = ? AND request_id = ?", CNYBillingRequest, params.RequestID).First(&record).Error
 		if err == nil {
@@ -389,9 +409,50 @@ func ReserveCNYBilling(params CNYBillingParams, targetQuota int) (*CNYBillingRec
 		} else if errors.Is(err, gorm.ErrRecordNotFound) {
 			record = CNYBillingRecord{Kind: CNYBillingRequest, RequestID: params.RequestID, Currency: "CNY", QuotaPerUnit: CNYQuotaPerUnit,
 				UserID: params.UserID, TokenID: params.TokenID, Username: user.Username, TokenName: token.Name, ModelName: params.ModelName,
-				Status: CNYBillingReserved, FundingVersion: 1, TokenLimited: params.TokenID > 0 && !budget.UnlimitedQuota, CreatedAt: common.GetTimestamp()}
+				Status: CNYBillingReserved, FundingVersion: 1, CreatedAt: common.GetTimestamp()}
 		} else {
 			return err
+		}
+		tokenCurrency := "CNY"
+		var exchangeSnapshot *WalletExchangeSnapshot
+		if record.FundingVersion == 1 {
+			var funding WalletFundingRecord
+			err = tx.Where("request_id = ?", params.RequestID).First(&funding).Error
+			if err == nil {
+				if record.ID == 0 || funding.UserID != params.UserID || funding.TokenID != params.TokenID || funding.Currency != "CNY" {
+					return ErrCNYConflict
+				}
+				tokenCurrency = funding.tokenBudgetCurrency()
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) || record.ID > 0 {
+				return err
+			}
+		}
+		if params.TokenID > 0 && tokenCurrency == "CNY" {
+			err = lockForUpdate(tx).Where("token_id = ? AND user_id = ?", params.TokenID, params.UserID).First(&budget).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if record.ID == 0 {
+				// Select one budget for the whole request. Existing reservations
+				// retain their choice even after either budget or policy changes.
+				if !budget.Enabled || (!budget.UnlimitedQuota && (budget.RemainQuota < targetQuota || (!params.Free && budget.RemainQuota <= 0))) {
+					snapshot, snapshotErr := GetWalletExchangeSnapshot(tx, common.GetTimestamp())
+					if snapshotErr != nil && !errors.Is(snapshotErr, ErrExchangeRateUnavailable) {
+						return snapshotErr
+					}
+					if snapshotErr != nil {
+						snapshot.Rate = ""
+					}
+					exchangeSnapshot = &snapshot
+					if snapshot.Enabled {
+						tokenCurrency = "USD"
+					}
+				}
+				record.TokenLimited = tokenCurrency == "CNY" && !budget.UnlimitedQuota
+			}
+			if tokenCurrency == "CNY" && !budget.Enabled {
+				return ErrCNYTokenQuota
+			}
 		}
 		// A zero estimate (for example output-only pricing) does not authorize
 		// spending an exhausted wallet or budget. Existing funded reservations
@@ -406,7 +467,7 @@ func ReserveCNYBilling(params CNYBillingParams, targetQuota int) (*CNYBillingRec
 			return ErrCNYQuota
 		}
 		if record.FundingVersion == 1 {
-			_, err = reserveWalletFunding(tx, wallet, &user, WalletFundingParams{RequestID: params.RequestID, UserID: params.UserID, TokenID: params.TokenID, Currency: "CNY", Free: params.Free}, targetQuota)
+			_, err = reserveWalletFunding(tx, wallet, &user, WalletFundingParams{RequestID: params.RequestID, UserID: params.UserID, TokenID: params.TokenID, Currency: "CNY", TokenCurrency: tokenCurrency, exchangeSnapshot: exchangeSnapshot, Free: params.Free}, targetQuota)
 			if errors.Is(err, ErrWalletFundingInsufficient) {
 				return ErrCNYQuota
 			}
@@ -427,7 +488,7 @@ func ReserveCNYBilling(params CNYBillingParams, targetQuota int) (*CNYBillingRec
 				return err
 			}
 		}
-		if params.TokenID > 0 {
+		if params.TokenID > 0 && tokenCurrency == "CNY" {
 			if record.TokenLimited && (budget.RemainQuota < delta || (!params.Free && record.ReservedQuota == 0 && budget.RemainQuota <= 0)) {
 				return ErrCNYTokenQuota
 			}
@@ -449,7 +510,7 @@ func ReserveCNYBilling(params CNYBillingParams, targetQuota int) (*CNYBillingRec
 		return tx.Save(&record).Error
 	})
 	if err == nil {
-		InvalidateUserQuotaCache(params.UserID)
+		invalidateCNYBillingQuotaCache(&record)
 	}
 	return &record, err
 }
@@ -473,7 +534,7 @@ func SettleCNYBilling(requestID string, actualQuota int, usage CNYBillingUsage) 
 		return finalizeCNYBilling(tx, wallet, record, actualQuota, false, usage, "")
 	})
 	if err == nil {
-		InvalidateUserQuotaCache(record.UserID)
+		invalidateCNYBillingQuotaCache(record)
 	}
 	return record, err
 }
@@ -497,7 +558,7 @@ func RefundCNYBilling(requestID, reason string) (*CNYBillingRecord, error) {
 		return finalizeCNYBilling(tx, wallet, record, 0, true, CNYBillingUsage{}, reason)
 	})
 	if err == nil {
-		InvalidateUserQuotaCache(record.UserID)
+		invalidateCNYBillingQuotaCache(record)
 	}
 	return record, err
 }
@@ -538,6 +599,7 @@ func finalizeCNYBilling(tx *gorm.DB, wallet *CNYWallet, record *CNYBillingRecord
 		}
 	}
 	var err error
+	cnyTokenBudget := record.TokenID > 0
 	if record.FundingVersion == 1 {
 		var user User
 		if err = lockForUpdate(tx.Unscoped()).First(&user, record.UserID).Error; err != nil {
@@ -550,6 +612,7 @@ func finalizeCNYBilling(tx *gorm.DB, wallet *CNYWallet, record *CNYBillingRecord
 		if err = finalizeWalletFunding(tx, wallet, &user, &funding, actualQuota, refund); err != nil {
 			return err
 		}
+		cnyTokenBudget = cnyTokenBudget && funding.tokenBudgetCurrency() == "CNY"
 		walletDelta, reservedDelta = 0, 0
 	}
 	wallet.Quota, err = cnyBalanceAfter(wallet.Quota, walletDelta)
@@ -568,7 +631,7 @@ func finalizeCNYBilling(tx *gorm.DB, wallet *CNYWallet, record *CNYBillingRecord
 	if err = tx.Save(wallet).Error; err != nil {
 		return err
 	}
-	if record.TokenID > 0 {
+	if cnyTokenBudget {
 		var budget CNYTokenBudget
 		if err = tx.Where("token_id = ? AND user_id = ?", record.TokenID, record.UserID).First(&budget).Error; err != nil {
 			return err
@@ -601,4 +664,14 @@ func finalizeCNYBilling(tx *gorm.DB, wallet *CNYWallet, record *CNYBillingRecord
 		record.SettledAt = record.UpdatedAt
 	}
 	return tx.Save(record).Error
+}
+
+func invalidateCNYBillingQuotaCache(record *CNYBillingRecord) {
+	InvalidateUserQuotaCache(record.UserID)
+	if record.TokenID > 0 {
+		var token Token
+		if DB.Unscoped().Select("key").First(&token, record.TokenID).Error == nil {
+			InvalidateTokenQuotaCache(token.Key)
+		}
+	}
 }

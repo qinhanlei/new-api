@@ -121,7 +121,7 @@ func InsertCNYTask(ctx context.Context, task *Task, final *CNYTaskSettlement, om
 	})
 	if err == nil {
 		*task = candidate
-		InvalidateUserQuotaCache(record.UserID)
+		invalidateCNYBillingQuotaCache(record)
 	}
 	return err
 }
@@ -171,7 +171,7 @@ func FinalizeCNYTask(task *Task, fromStatus TaskStatus, final CNYTaskSettlement)
 	if updated && err == nil {
 		candidate.Currency = "CNY"
 		*task = candidate
-		InvalidateUserQuotaCache(record.UserID)
+		invalidateCNYBillingQuotaCache(record)
 	}
 	return updated && err == nil, err
 }

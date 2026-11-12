@@ -603,10 +603,11 @@ persisted asynchronous tasks to finish.
    replaces the available CNY balance without changing reservations or consumed
    quota. The server supplies an audit reason when none is provided; retries
    reuse the operation ID to prevent a duplicate adjustment.
-3. Create the API key, then open **Edit**, enable **CNY billing**, set its separate
-   CNY budget (or unlimited budget), and select **Save CNY budget**. CNY access is
-   disabled by default; enabling it does not fund the user's wallet. Unlimited
-   CNY quota removes the key's budget cap; the wallet still needs funds.
+3. New API keys default to enabled, unlimited **CNY billing**. Existing keys
+   retain their saved CNY settings. Create and Edit save the key's ordinary
+   settings and CNY budget together; a conflicting budget version leaves both
+   unchanged. Enabling CNY does not fund the user's wallet. Unlimited CNY quota
+   removes the key's budget cap; the wallet still needs funds.
 4. Select **CNY** in the usage-log currency filter. Lists, statistics, and exports
    use that currency; API callers pass `currency=CNY` to the existing log APIs.
 
@@ -655,11 +656,18 @@ Legacy display/payment settings remain root-only and are saved separately.
   `shortfall ÷ R` USD. There is no exchange fee, balance transfer, or synthetic
   top-up. Existing integer quota scales and rounding are retained; conversion
   is rounded on the cumulative amount, not on each incremental reservation.
-- API-key limits remain in the model's pricing currency. A CNY-priced request
-  still requires CNY access and sufficient CNY key budget (or unlimited CNY
-  budget), even when the USD wallet pays. It does not also consume the USD key
-  budget. USD requests follow the corresponding USD budget. Subscription
-  selection retains the user's existing billing preference.
+- API-key limits normally use the model's pricing currency. When cross-currency
+  funding is enabled and a CNY-priced request's key has no enabled CNY budget
+  or cannot cover its initial reservation, the whole request instead uses the
+  USD wallet and USD key budget at the frozen exchange rate. Its CNY wallet and
+  key budget are untouched; the two key budgets are never combined. Insufficient
+  USD funds or key budget still reject admission. A non-free request with a zero
+  estimate also requires positive USD funds, an available USD key budget, and a
+  valid rate. The budget currency and limited/unlimited policy freeze at the
+  first successful reservation; retries and later increases do not select a new
+  budget. Cross-currency funding off retains the CNY budget requirement. USD
+  requests continue using their USD key budget. Subscription selection retains
+  the user's existing billing preference.
 - **Dynamic exchange rates** default to off. Static mode uses the administrator's
   explicit `1 USD = R CNY` rate. The initial static value copies the existing
   display rate; subsequent wallet policy saves are independent of display and
@@ -686,14 +694,17 @@ Legacy display/payment settings remain root-only and are saved separately.
   under an older policy version cannot overwrite an administrator's new choice.
 
 Every new wallet-funded request stores a `WalletFundingRecord` in the main
-database before an upstream send. It freezes the pricing currency, both quota
+database before an upstream send. It freezes the pricing and key-budget currencies, both quota
 scales, funding policy version, rate and source date, and allocation between the
-wallets. Reservation, native API-key budget, final settlement and refund use
+wallets. Reservation, the selected API-key budget, final settlement and refund use
 transactions. Retries and asynchronous completion use that original record,
 even after exchange-rate changes or restarts. Refunds return the original
 currencies and amounts. An unexpected final cost can consume additional funds
-at the frozen rate; a remaining shortfall becomes debt in the pricing currency,
-never a free successful request or a newly selected rate.
+at the frozen rate; a remaining shortfall becomes debt in the pricing currency.
+For a CNY request using the USD key fallback, all final charges and any debt stay
+in USD instead, without spending the CNY wallet. Confirmed usage is recorded even
+when it exceeds the key's reservation. Neither debt path makes a successful
+request free or selects a new exchange rate.
 
 Ordinary submissions cannot retry an unresolved paid attempt. A live Realtime
 connection can reserve a new input batch while an earlier response is pending,
@@ -708,13 +719,17 @@ Model-consumption statistics stay in their original pricing currency. Existing
 USD `used_quota` also includes subscription usage and must not be described as
 actual USD-wallet payments. New logs include a separate wallet funding receipt
 with the actual USD/CNY amounts, status, frozen scales, exchange rate when used,
-and native debt. The detail view and CSV export expose that receipt. Historical
+and debt. Receipts for the USD key fallback explicitly identify USD as the debt
+currency; older receipts without this field retain their pricing currency. The
+detail view and CSV export expose that receipt. Historical
 logs without a funding record remain unchanged; payment sources are not guessed
 or backfilled. The main-database funding record is durable; the existing consume
 log remains a separate best-effort write, not an exactly-once payment ledger.
 
 Existing CNY records with `FundingVersion = 0`, USD tasks without a funding
 reference, and legacy Midjourney tasks retain their original settlement path.
+Funding records without a saved `TokenCurrency` retain the original key budget
+in their pricing currency; upgrading never switches an existing reservation.
 Do not mix old binaries with the new wallet writers, or downgrade while new
 funding records are active. The database-authority cutover procedure above is
 required independently of whether cross-currency funding is enabled.

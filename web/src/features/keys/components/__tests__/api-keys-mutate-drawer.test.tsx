@@ -19,13 +19,14 @@ For commercial licensing, please contact support@quantumnous.com
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
-import type { ApiKey } from '../../types'
+import type { ApiKey, CNYTokenBudget } from '../../types'
 
 const { createInstance } = await import('i18next')
 const { I18nextProvider, initReactI18next } = await import('react-i18next')
 const { QueryClient, QueryClientProvider } =
   await import('@tanstack/react-query')
 const { api } = await import('@/lib/api')
+const { toast } = await import('sonner')
 const { ApiKeysProvider } = await import('../api-keys-provider')
 const { ApiKeysMutateDrawer } = await import('../api-keys-mutate-drawer')
 
@@ -75,6 +76,21 @@ function installApiFixtures(createdPayloads: Array<Record<string, unknown>>) {
           },
         }
       default:
+        if (/^\/api\/token\/\d+\/currency\/CNY$/.test(url)) {
+          return {
+            data: {
+              success: true,
+              data: {
+                enabled: false,
+                unlimited_quota: false,
+                remain_quota: 0,
+                used_quota: 0,
+                version: 0,
+                quota_per_unit: 500000,
+              },
+            },
+          }
+        }
         throw new Error(`Unexpected GET ${url}`)
     }
   }
@@ -86,7 +102,9 @@ function installApiFixtures(createdPayloads: Array<Record<string, unknown>>) {
   }
 }
 
-async function renderCreateDrawer(): Promise<void> {
+async function renderCreateDrawer(
+  onOpenChange = (_open: boolean) => undefined
+): Promise<void> {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -127,7 +145,7 @@ async function renderCreateDrawer(): Promise<void> {
     <QueryClientProvider client={queryClient}>
       <I18nextProvider i18n={i18n}>
         <ApiKeysProvider>
-          <ApiKeysMutateDrawer open onOpenChange={() => undefined} />
+          <ApiKeysMutateDrawer open onOpenChange={onOpenChange} />
         </ApiKeysProvider>
       </I18nextProvider>
     </QueryClientProvider>
@@ -196,6 +214,7 @@ function selectComboboxOption(
 }
 
 afterEach(() => {
+  vi.restoreAllMocks()
   apiClient.get = originalGet
   apiClient.post = originalPost
   localStorage.clear()
@@ -204,6 +223,70 @@ afterEach(() => {
     renderedDrawer = null
   }
 })
+
+function renderCurrencyEditDrawer(budgets: Array<CNYTokenBudget | Error>) {
+  installApiFixtures([])
+  const currentRow: ApiKey = {
+    id: 42,
+    name: 'currency-key',
+    key: '',
+    status: 1,
+    remain_quota: 0,
+    used_quota: 0,
+    unlimited_quota: true,
+    expired_time: -1,
+    created_time: 1,
+    accessed_time: 0,
+    group: 'default',
+    auto_groups: [],
+    cross_group_retry: false,
+    model_limits_enabled: false,
+    model_limits: '',
+    allow_ips: '',
+    allow_user_quota_query: true,
+  }
+  const getFixture = apiClient.get
+  let budgetIndex = 0
+  vi.spyOn(apiClient, 'get').mockImplementation(async (url) => {
+    if (url === '/api/token/42') {
+      return { data: { success: true, data: currentRow } }
+    }
+    if (url === '/api/token/42/currency/CNY') {
+      const budget = budgets[Math.min(budgetIndex++, budgets.length - 1)]
+      if (budget instanceof Error) throw budget
+      return { data: { success: true, data: budget } }
+    }
+    return getFixture(url)
+  })
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  renderedDrawer = { queryClient }
+  const close = vi.fn()
+  render(
+    <QueryClientProvider client={queryClient}>
+      <I18nextProvider i18n={i18n}>
+        <ApiKeysProvider>
+          <ApiKeysMutateDrawer
+            open
+            currentRow={currentRow}
+            onOpenChange={close}
+          />
+        </ApiKeysProvider>
+      </I18nextProvider>
+    </QueryClientProvider>
+  )
+  return close
+}
+
+const limitedCnyBudget: CNYTokenBudget = {
+  enabled: true,
+  unlimited_quota: false,
+  remain_quota: 500000,
+  used_quota: 250000,
+  version: 4,
+  quota_per_unit: 500000,
+}
 
 describe('API keys mutate drawer Auto group integration', () => {
   test('inherits the root Auto order and sends an empty override for every batch-created key', async () => {
@@ -426,14 +509,171 @@ describe('API keys mutate drawer user quota query switch', () => {
 })
 
 describe('API key currency controls', () => {
-  test('keeps the new-key CNY hint after the USD unlimited control', async () => {
-    installApiFixtures([])
+  test('rejects a newly entered negative CNY budget without sending a request', async () => {
+    renderCurrencyEditDrawer([limitedCnyBudget])
+    const put = vi.spyOn(api, 'put')
+    await waitFor(() => expect(findButton('Save changes', true)).toBeEnabled())
+    fireEvent.change(
+      screen.getByRole('spinbutton', { name: 'Remaining CNY quota' }),
+      { target: { value: '-1' } }
+    )
+    fireEvent.click(findButton('Save changes', true))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Quota must be zero or greater'
+    )
+    expect(put).not.toHaveBeenCalled()
+  })
+
+  test('keeps ordinary and CNY drafts after a failed save and reloads only the CNY balance', async () => {
+    const close = renderCurrencyEditDrawer([
+      limitedCnyBudget,
+      { ...limitedCnyBudget, remain_quota: 250000, version: 5 },
+    ])
+    const put = vi
+      .spyOn(api, 'put')
+      .mockResolvedValueOnce({
+        data: {
+          success: false,
+          message: 'CNY token budget has changed; reload before saving',
+        },
+      })
+      .mockResolvedValue({ data: { success: true } })
+    await waitFor(() => expect(findButton('Save changes', true)).toBeEnabled())
+    fireEvent.change(getControlByLabel('Name'), {
+      target: { value: 'unsaved-name' },
+    })
+    fireEvent.change(
+      screen.getByRole('spinbutton', { name: 'Remaining CNY quota' }),
+      { target: { value: '4' } }
+    )
+    fireEvent.click(findButton('Save changes', true))
+    await screen.findByRole('alert')
+    expect(close).not.toHaveBeenCalled()
+    expect(getControlByLabel('Name')).toHaveValue('unsaved-name')
+    expect(
+      screen.getByRole('spinbutton', { name: 'Remaining CNY quota' })
+    ).toHaveValue(4)
+    expect(findButton('Save changes', true)).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Reload balance' }))
+    await waitFor(() => expect(findButton('Save changes', true)).toBeEnabled())
+    expect(getControlByLabel('Name')).toHaveValue('unsaved-name')
+    expect(
+      screen.getByRole('spinbutton', { name: 'Remaining CNY quota' })
+    ).toHaveValue(0.5)
+    fireEvent.change(
+      screen.getByRole('spinbutton', { name: 'Remaining CNY quota' }),
+      { target: { value: '2' } }
+    )
+    fireEvent.click(findButton('Save changes', true))
+    await waitFor(() => expect(close).toHaveBeenCalledWith(false))
+    expect(put).toHaveBeenLastCalledWith(
+      '/api/token/',
+      expect.objectContaining({
+        name: 'unsaved-name',
+        cny_budget: {
+          enabled: true,
+          unlimited_quota: false,
+          remain_quota: 1000000,
+          expected_version: 5,
+        },
+      })
+    )
+  })
+
+  test('blocks saving when the CNY budget cannot load and keeps retry accessible', async () => {
+    renderCurrencyEditDrawer([new Error('offline'), limitedCnyBudget])
+    const retry = await screen.findByRole('button', { name: 'Retry' })
+    await waitFor(() => expect(retry.closest('[inert]')).toBeNull())
+    expect(findButton('Save changes', true)).toBeDisabled()
+    fireEvent.change(getControlByLabel('Name'), {
+      target: { value: 'draft-while-offline' },
+    })
+    fireEvent.click(retry)
+    await waitFor(() => expect(findButton('Save changes', true)).toBeEnabled())
+    expect(getControlByLabel('Name')).toHaveValue('draft-while-offline')
+    expect(
+      screen.getByRole('spinbutton', { name: 'Remaining CNY quota' })
+    ).toHaveValue(1)
+  })
+
+  test.each([0, -500000])(
+    'does not submit an unchanged legacy CNY budget with balance %s and ordinary fields',
+    async (remainQuota) => {
+      renderCurrencyEditDrawer([
+        {
+          ...limitedCnyBudget,
+          enabled: false,
+          version: 0,
+          remain_quota: remainQuota,
+        },
+      ])
+      const put = vi
+        .spyOn(api, 'put')
+        .mockResolvedValue({ data: { success: true } })
+      await waitFor(() =>
+        expect(findButton('Save changes', true)).toBeEnabled()
+      )
+      expect(
+        screen.getByRole('switch', { name: 'Enable CNY billing' })
+      ).not.toBeChecked()
+      fireEvent.change(getControlByLabel('Name'), {
+        target: { value: 'renamed' },
+      })
+      fireEvent.click(findButton('Save changes', true))
+      await waitFor(() => expect(put).toHaveBeenCalled())
+      expect(put.mock.calls[0][1]).not.toHaveProperty('cny_budget')
+    }
+  )
+
+  test.each(['business', 'network'] as const)(
+    'reports completed keys when a batch stops on a %s failure',
+    async (failure) => {
+      const payloads: Array<Record<string, unknown>> = []
+      installApiFixtures(payloads)
+      const postFixture = apiClient.post
+      const post = vi
+        .spyOn(apiClient, 'post')
+        .mockImplementation(async (url, payload) => {
+          if (payloads.length > 0) {
+            if (failure === 'network') throw new Error('offline')
+            return { data: { success: false, message: 'limit reached' } }
+          }
+          return postFixture(url, payload)
+        })
+      const success = vi.spyOn(toast, 'success')
+      const close = vi.fn()
+      await renderCreateDrawer(close)
+      changeInput(getControlByLabel('Name'), 'limited-batch')
+      changeInput(getControlByLabel('Quantity'), '3')
+      fireEvent.click(
+        screen.getByRole('switch', { name: 'Enable CNY billing' })
+      )
+      fireEvent.click(findButton('Save changes', true))
+      await waitFor(() => expect(close).toHaveBeenCalledWith(false))
+      expect(post).toHaveBeenCalledTimes(2)
+      expect(success).toHaveBeenCalledWith('Successfully created 1 API Key(s)')
+      expect(payloads[0].cny_budget).toEqual({
+        enabled: false,
+        unlimited_quota: true,
+        remain_quota: 0,
+        expected_version: 0,
+      })
+    }
+  )
+
+  test('creates a key with CNY enabled and unlimited through the main save', async () => {
+    const payloads: Array<Record<string, unknown>> = []
+    installApiFixtures(payloads)
     await renderCreateDrawer()
     const unlimited = screen.getByRole('switch', { name: 'Unlimited Quota' })
-    const hint = screen.getByText(
-      'Create the API key first, then enable its CNY budget from Edit.'
-    )
-    expect(unlimited.compareDocumentPosition(hint)).toBe(
+    const cnyEnabled = screen.getByRole('switch', {
+      name: 'Enable CNY billing',
+    })
+    expect(cnyEnabled).toBeChecked()
+    expect(
+      screen.getByRole('switch', { name: 'Unlimited CNY quota for this key' })
+    ).toBeChecked()
+    expect(unlimited.compareDocumentPosition(cnyEnabled)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING
     )
     fireEvent.click(unlimited)
@@ -441,6 +681,15 @@ describe('API key currency controls', () => {
     expect(amount.compareDocumentPosition(unlimited)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING
     )
+    changeInput(getControlByLabel('Name'), 'cny-default')
+    fireEvent.click(findButton('Save changes', true))
+    await waitFor(() => expect(payloads).toHaveLength(1))
+    expect(payloads[0].cny_budget).toEqual({
+      enabled: true,
+      unlimited_quota: true,
+      remain_quota: 0,
+      expected_version: 0,
+    })
   })
 
   test('keeps CNY controls after USD controls and preserves its draft when USD unlimited changes', async () => {
@@ -520,14 +769,21 @@ describe('API key currency controls', () => {
       10
     )
     expect(cnyAmount).toHaveValue(4)
-    fireEvent.click(screen.getByRole('button', { name: 'Save CNY budget' }))
+    expect(screen.queryByRole('button', { name: 'Save CNY budget' })).toBeNull()
+    fireEvent.click(findButton('Save changes', true))
     await waitFor(() =>
-      expect(put).toHaveBeenCalledWith('/api/token/42/currency/CNY', {
-        enabled: true,
-        remain_quota: 2000000,
-        unlimited_quota: false,
-        expected_version: 2,
-      })
+      expect(put).toHaveBeenCalledWith(
+        '/api/token/',
+        expect.objectContaining({
+          id: 42,
+          cny_budget: {
+            enabled: true,
+            remain_quota: 2000000,
+            unlimited_quota: false,
+            expected_version: 2,
+          },
+        })
+      )
     )
   })
 })

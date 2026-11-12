@@ -171,12 +171,13 @@ export function parseLogOther(other: string): LogOtherData | null {
   }
 }
 
-/** Recorded wallet movements use their own scales, including any native debt. */
+/** Recorded wallet movements and debt use their own frozen currencies and scales. */
 export function getWalletFundingDisplay(
   funding: WalletFundingLog | undefined,
   t: (key: string) => string
 ) {
   if (!funding) return null
+  const debtCurrency = funding.debt_currency ?? funding.currency
   const usesAlternateWallet =
     funding.currency === 'CNY' ? funding.usd_quota > 0 : funding.cny_quota > 0
   const exchangeRate =
@@ -215,12 +216,12 @@ export function getWalletFundingDisplay(
     hasDebt: funding.debt_quota > 0,
     debtAmount: formatLogQuota(
       funding.debt_quota,
-      funding.currency,
-      funding.currency === 'CNY'
+      debtCurrency,
+      debtCurrency === 'CNY'
         ? funding.cny_quota_per_unit
         : funding.usd_quota_per_unit
     ),
-    debtCurrency: funding.currency,
+    debtCurrency,
   }
 }
 

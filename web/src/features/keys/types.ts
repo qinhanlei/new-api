@@ -96,6 +96,23 @@ export interface ApiKeyFormData {
   group: string
   auto_groups: string[]
   cross_group_retry: boolean
+  cny_budget?: CNYTokenBudgetChange
+}
+
+export interface CNYTokenBudgetChange {
+  enabled: boolean
+  remain_quota: number
+  unlimited_quota: boolean
+  expected_version: number
+}
+
+export interface CNYTokenBudget {
+  enabled: boolean
+  remain_quota: number
+  unlimited_quota: boolean
+  used_quota: number
+  version: number
+  quota_per_unit: number
 }
 
 export interface TokenAutoGroupsConfig {

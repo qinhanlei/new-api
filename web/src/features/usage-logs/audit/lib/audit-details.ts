@@ -106,6 +106,8 @@ export function auditFieldLabel(key: string, t: TFunction): string {
       return t('Expiration Time')
     case 'remain_quota':
       return t('Remaining quota')
+    case 'cny_budget':
+      return t('CNY token budget')
     case 'unlimited_quota':
       return t('Unlimited Quota')
     case 'model_limits_enabled':

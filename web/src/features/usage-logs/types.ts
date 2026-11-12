@@ -123,6 +123,7 @@ export interface WalletFundingLog {
   usd_quota_per_unit: number
   cny_quota_per_unit: number
   debt_quota: number
+  debt_currency?: 'USD' | 'CNY'
   exchange: {
     enabled: boolean
     rate_id?: number
