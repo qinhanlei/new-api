@@ -138,6 +138,7 @@ function AssetSecretInputControl(props: {
     <div onSubmit={(event) => event.stopPropagation()}>
       <PasswordInput
         {...props.inputProps}
+        visibilityLabels={{ show: t('Show input'), hide: t('Hide input') }}
         visibilityAction={
           props.canReveal && !props.inputProps.value
             ? {

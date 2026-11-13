@@ -30,6 +30,7 @@ type PasswordInputProps = Omit<
   'type'
 > & {
   ref?: React.Ref<HTMLInputElement>
+  visibilityLabels?: { show: string; hide: string }
   visibilityAction?: {
     label: string
     onClick: React.MouseEventHandler<HTMLButtonElement>
@@ -42,13 +43,17 @@ export function PasswordInput({
   disabled,
   ref,
   visibilityAction,
+  visibilityLabels,
   ...props
 }: PasswordInputProps) {
   const { t } = useTranslation()
   const [showPassword, setShowPassword] = React.useState(false)
   const visible = showPassword && !visibilityAction
   const visibilityLabel =
-    visibilityAction?.label ?? (visible ? t('Hide input') : t('Show input'))
+    visibilityAction?.label ??
+    (visible
+      ? (visibilityLabels?.hide ?? t('Hide password'))
+      : (visibilityLabels?.show ?? t('Show password')))
 
   return (
     <div className={cn('relative rounded-md', className)}>

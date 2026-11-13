@@ -61,6 +61,8 @@ export type PricingModel = {
   billing_model_name?: string
   effective_rates?: Record<string, BillingRateSnapshot>
   billing_plugin_variants?: BillingPluginVariant[]
+  // Requests outside the plugin variants still pay the model-level price.
+  ordinary_pricing?: boolean
   id: number
   model_name: string
   description?: string

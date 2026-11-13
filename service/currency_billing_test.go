@@ -151,7 +151,21 @@ func TestCNYServiceDatabaseMatrix(t *testing.T) {
 
 			c, info = cnyServiceRequest("unknown", "v2:CNY:p * 10", 500)
 			require.Nil(t, PreConsumeBilling(c, 500, info))
-			MarkCNYUpstreamPending(info, true)
+			for _, pending := range []bool{false, true} {
+				require.NoError(t, MarkCNYUpstreamPending(info, pending))
+				for _, guard := range []string{"unsupported-mode", "paid-tools"} {
+					if guard == "unsupported-mode" {
+						info.RelayMode = relayconstant.RelayModeImagesGenerations
+					}
+					request := httptest.NewRequest(http.MethodPost, "http://upstream.invalid", strings.NewReader(`{"tools":[{"type":"web_search"}]}`))
+					require.Error(t, PrepareCNYHTTPRequest(c, info, request), guard)
+					info.RelayMode = relayconstant.RelayModeChatCompletions
+					assert.Equal(t, pending, CNYUpstreamPending(info), "local rejection cannot clear earlier accepted work")
+					funding, err := model.GetWalletFundingRecord(info.RequestId)
+					require.NoError(t, err)
+					assert.Equal(t, pending, funding.UpstreamPending)
+				}
+			}
 			info.BillingUsageUnknown = true
 			PostTextConsumeQuota(c, info, &dto.Usage{PromptTokens: 100, CompletionTokens: 100, TotalTokens: 200}, nil)
 			info.Billing.Refund(c)

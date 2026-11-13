@@ -679,10 +679,24 @@ func TestAssetFailedReplicaAndConfigurationContracts(t *testing.T) {
 	assert.Error(t, model.UpdateOptionsBulk(map[string]string{model.AssetChannelOptionKey(1): "{}"}))
 	channel, err := model.GetChannelById(1, true)
 	require.NoError(t, err)
+	originalKey := channel.Key
 	channel.Key = "other-account"
 	assert.ErrorIs(t, model.DB.Transaction(func(tx *gorm.DB) error { return model.GuardAssetChannelMutation(tx, channel, nil) }), model.ErrAssetInUse)
-	channel.Key = ""
-	assert.ErrorIs(t, channel.Save(), model.ErrAssetInUse)
+	for _, key := range []string{"other-account", ""} {
+		_, err := model.UpdateChannelLocked(channel.Id, func(stored *model.Channel) error {
+			stored.Key = key
+			return nil
+		})
+		assert.ErrorIs(t, err, model.ErrAssetInUse)
+		_, err = model.UpdateScheduledChannelLocked(ctx, channel.Id, func(stored *model.Channel) error {
+			stored.Key = key
+			return nil
+		})
+		assert.ErrorIs(t, err, model.ErrAssetInUse)
+	}
+	stored, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	assert.Equal(t, originalKey, stored.Key)
 	assert.ErrorIs(t, channel.Delete(), model.ErrAssetInUse)
 	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", 2).Update("status", common.ChannelStatusManuallyDisabled).Error)
 	deleted, err := model.DeleteDisabledChannel()

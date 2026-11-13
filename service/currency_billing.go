@@ -300,7 +300,6 @@ func PrepareCNYHTTPRequest(c *gin.Context, info *relaycommon.RelayInfo, req *htt
 		return nil
 	}
 	if apiErr := ValidateBillingCurrency(c, info); apiErr != nil {
-		MarkCNYUpstreamPending(info, false)
 		return apiErr
 	}
 	if info.TieredBillingSnapshot.TaskUsageBilling {
@@ -328,7 +327,6 @@ func PrepareCNYHTTPRequest(c *gin.Context, info *relaycommon.RelayInfo, req *htt
 		req.Body = io.NopCloser(bytes.NewReader(data))
 	}
 	if CNYBodyHasPaidTools(data) {
-		MarkCNYUpstreamPending(info, false)
 		return types.NewErrorWithStatusCode(fmt.Errorf("%s", i18n.T(c, i18n.MsgBillingCNYPaidToolsUnsupported)), types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
 	return nil

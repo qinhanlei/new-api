@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relay/requestplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
@@ -69,6 +70,19 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	clientCommits := 0
 	inFlight, hasUsage, untrackedResponse := false, false, false
 	var relayErr error
+	reportedQuota := 0
+	plugins := requestplugin.NewRealtime(c, info, func(message []byte) {
+		if err := helper.WssString(c, info.ClientWs, string(message)); err != nil {
+			relayErr = err
+		}
+	}, func(message []byte) {
+		if err := helper.WssString(c, info.TargetWs, string(message)); err != nil {
+			relayErr = err
+		}
+	})
+	if plugins != nil {
+		defer plugins.Close(info)
+	}
 loop:
 	for {
 		select {
@@ -88,6 +102,22 @@ loop:
 				break loop
 			}
 			if frame.client {
+				if plugins != nil {
+					patched, dropped := plugins.ClientEvent(event.Type, frame.body)
+					if relayErr != nil {
+						break loop
+					}
+					if dropped {
+						continue
+					}
+					if patched != nil {
+						frame.body, event = patched, dto.RealtimeEvent{}
+						if err := common.Unmarshal(frame.body, &event); err != nil {
+							relayErr = err
+							break loop
+						}
+					}
+				}
 				paid := event.Type == dto.RealtimeEventTypeResponseCreate || event.Type == dto.RealtimeEventInputAudioBufferAppend || event.Type == dto.RealtimeEventTypeConversationCreate
 				if paid {
 					// Audio chunks share one input batch. response.create cannot
@@ -197,6 +227,7 @@ loop:
 					break loop
 				}
 			}
+			quota := 0
 			switch event.Type {
 			case "error":
 				if envelope.Error != nil && envelope.Error.Type == "invalid_request_error" && envelope.Error.EventID != "" {
@@ -262,6 +293,8 @@ loop:
 					relayErr = err
 					break loop
 				}
+				cumulativeQuota := service.RealtimeQuota(info, total)
+				quota, reportedQuota = cumulativeQuota-reportedQuota, cumulativeQuota
 				hasUsage = true
 				if !active[responseID] {
 					if pendingAutoBatches > 0 {
@@ -300,8 +333,16 @@ loop:
 					break loop
 				}
 			}
-			if err := helper.WssString(c, info.ClientWs, string(frame.body)); err != nil {
+			if plugins != nil {
+				var responseUsage *dto.RealtimeUsage
+				if event.Type == dto.RealtimeEventTypeResponseDone && event.Response != nil {
+					responseUsage = event.Response.Usage
+				}
+				plugins.ServerEvent(event.Type, frame.body, responseUsage, quota)
+			} else if err := helper.WssString(c, info.ClientWs, string(frame.body)); err != nil {
 				relayErr = err
+			}
+			if relayErr != nil {
 				break loop
 			}
 		}

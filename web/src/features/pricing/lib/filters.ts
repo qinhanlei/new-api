@@ -37,6 +37,7 @@ import {
   isUnconfiguredTaskUsageModel,
 } from './dynamic-price'
 import { getDisplayGroupRatio, isTokenBasedModel } from './model-helpers'
+import { withBasePricing } from './plugin-pricing'
 import { calculateTokenPrice } from './price'
 
 // ----------------------------------------------------------------------------
@@ -86,8 +87,9 @@ export function filterByGroup(
 
 /** Pricing category of the active configuration, shared by filters and counts. */
 export function getModelQuotaType(
-  model: PricingModel
+  listedModel: PricingModel
 ): Exclude<QuotaTypeOption, 'all'> | undefined {
+  const model = withBasePricing(listedModel)
   // Task-usage models retain their own category.
   if (hasTaskUsageSchema(model)) return QUOTA_TYPES.TASK
 
@@ -154,7 +156,8 @@ const PRICE_SORTS: Partial<
   [SORT_OPTIONS.REQUEST_PRICE_HIGH]: { kind: 'request', dir: -1 },
 }
 
-function getModelPricingCurrencies(model: PricingModel): string {
+function getModelPricingCurrencies(listedModel: PricingModel): string {
+  const model = withBasePricing(listedModel)
   const expressions = model.billing_plugin_variants?.length
     ? model.billing_plugin_variants.map((variant) => variant.billing_expr)
     : [model.billing_expr]
@@ -169,9 +172,10 @@ function getModelPricingCurrencies(model: PricingModel): string {
  * model has no price of that kind or mixes billing currencies.
  */
 function getBaseSortPrice(
-  model: PricingModel,
+  listedModel: PricingModel,
   kind: SortPriceKind
 ): number | undefined {
+  const model = withBasePricing(listedModel)
   if (getModelPricingCurrencies(model).includes(',')) return undefined
   if (kind === 'request') {
     const example = getCardExamplePrice(model, { tokenUnit: 'M' })

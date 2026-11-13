@@ -720,12 +720,16 @@ func TestAssetValidationBearerRejectsCredentialChanges(t *testing.T) {
 			row, err := model.GetAssetValidationSession(t.Context(), 1, 1, created.BytedToken, "default")
 			require.NoError(t, err)
 			if change == "channel key" {
+				_, err := model.UpdateChannelLocked(1, func(channel *model.Channel) error {
+					channel.Key = "rotated-channel-key"
+					return nil
+				})
+				assert.ErrorIs(t, err, model.ErrAssetInUse)
 				channel, err := model.GetChannelById(1, true)
 				require.NoError(t, err)
-				channel.Key = "rotated-channel-key"
-				assert.ErrorIs(t, channel.Update(), model.ErrAssetInUse)
+				assert.Equal(t, "channel-key", channel.Key)
 				// Simulate an out-of-band credential change to exercise revalidation.
-				require.NoError(t, model.DB.Model(channel).Update("key", channel.Key).Error)
+				require.NoError(t, model.DB.Model(channel).Update("key", "rotated-channel-key").Error)
 			} else {
 				config, err := model.LoadAssetChannelConfig(t.Context(), 1)
 				require.NoError(t, err)
